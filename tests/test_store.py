@@ -49,6 +49,21 @@ def builtin_pet(store):
     return 'builtin-cat'
 
 
+@pytest.fixture()
+def user_pet(store):
+    """一只**用户自建**的宠物。
+
+    单动作覆盖只对用户形象开放（内置形象严格只读），因此凡是测覆盖行为的用例
+    都必须用这个夹具，而不是 `builtin_pet`。
+    """
+    write_pack(
+        store.user_pets_dir(), 'my-cat',
+        payload=pack(id='my-cat', name='我的猫'),
+        sheets={'idle.png': 4, 'walk.png': 6, 'fall.png': 2, 'drag.png': 2},
+    )
+    return 'my-cat'
+
+
 def zip_pack(files: dict) -> bytes:
     """把 `{相对路径: bytes}` 打成 zip。"""
     buffer = io.BytesIO()
@@ -229,10 +244,10 @@ def test_resolve_frame_path_from_builtin(store, builtin_pet):
     assert path.endswith('idle.png')
 
 
-def test_resolve_frame_path_override_beats_pack(store, builtin_pet):
+def test_resolve_frame_path_override_beats_pack(store, user_pet):
     """两层覆盖：用户覆盖 > 包内（§3.2）。"""
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64), color=(0, 0, 255, 255)))
-    path, source = store.resolve_frame_path(builtin_pet, 'idle')
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64), color=(0, 0, 255, 255)))
+    path, source = store.resolve_frame_path(user_pet, 'idle')
     assert source == 'override'
     assert OVERRIDES_DIRNAME in path
 
@@ -306,11 +321,11 @@ def test_runtime_pack_reports_missing_sheet_file(store):
     assert idle['url'] == ''
 
 
-def test_frame_url_changes_with_content(store, builtin_pet):
+def test_frame_url_changes_with_content(store, user_pet):
     """内容变化 → URL 变化（否则强缓存会一直给旧图）。"""
-    first = store.runtime_pack(builtin_pet)['actions']['idle']['url']
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64), color=(9, 9, 9, 255)))
-    second = store.runtime_pack(builtin_pet)['actions']['idle']['url']
+    first = store.runtime_pack(user_pet)['actions']['idle']['url']
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64), color=(9, 9, 9, 255)))
+    second = store.runtime_pack(user_pet)['actions']['idle']['url']
     assert first != second
 
 
@@ -587,45 +602,45 @@ def test_concurrent_imports_do_not_collide(store):
 # ------------------------------------------------------------------ 单动作覆盖
 
 
-def test_save_action_image_creates_override(store, builtin_pet):
+def test_save_action_image_creates_override(store, user_pet):
     payload = store.save_action_image(
-        builtin_pet, 'idle', make_image_bytes(size=(80, 80), color=(0, 128, 0, 255)),
+        user_pet, 'idle', make_image_bytes(size=(80, 80), color=(0, 128, 0, 255)),
     )
     assert payload['action'] == 'idle'
     assert payload['url']
-    override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
+    override_dir = os.path.join(store.user_pet_dir(user_pet), OVERRIDES_DIRNAME)
     assert os.path.isfile(os.path.join(override_dir, 'idle.png'))
 
 
-def test_save_action_image_does_not_touch_pack_file(store, builtin_pet):
-    """覆盖**不改动**包内原图——内置资源永远只读。"""
-    original = os.path.join(store.builtin_pet_dir(builtin_pet), 'idle.png')
+def test_save_action_image_does_not_touch_pack_file(store, user_pet):
+    """覆盖**不改动**包内原图——覆盖文件永远另存，包本身保持原样。"""
+    original = os.path.join(store.user_pet_dir(user_pet), 'idle.png')
     with open(original, 'rb') as handle:
         before = handle.read()
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(80, 80), color=(7, 7, 7, 255)))
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(80, 80), color=(7, 7, 7, 255)))
     with open(original, 'rb') as handle:
         assert handle.read() == before
 
 
-def test_save_action_image_resizes_to_pack_frame_size(store, builtin_pet):
+def test_save_action_image_resizes_to_pack_frame_size(store, user_pet):
     payload = store.save_action_image(
-        builtin_pet, 'idle', make_image_bytes(size=(500, 200), color=(0, 0, 0, 255)),
+        user_pet, 'idle', make_image_bytes(size=(500, 200), color=(0, 0, 0, 255)),
     )
     assert payload['size'] == [64, 64]
 
 
-def test_save_action_image_replaces_previous_override(store, builtin_pet):
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64)))
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64)), output_format='webp')
-    override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
+def test_save_action_image_replaces_previous_override(store, user_pet):
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64)))
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64)), output_format='webp')
+    override_dir = os.path.join(store.user_pet_dir(user_pet), OVERRIDES_DIRNAME)
     files = sorted(os.listdir(override_dir))
     assert files == ['idle.webp'], f'同一动作应只有一张覆盖图，实际: {files}'
 
 
-def test_save_action_image_rejects_bad_action(store, builtin_pet):
+def test_save_action_image_rejects_bad_action(store, user_pet):
     for action in ['../evil', '', 'a/b']:
         with pytest.raises(PetError):
-            store.save_action_image(builtin_pet, action, make_image_bytes())
+            store.save_action_image(user_pet, action, make_image_bytes())
 
 
 def test_save_action_image_rejects_unknown_pet(store):
@@ -634,78 +649,155 @@ def test_save_action_image_rejects_unknown_pet(store):
     assert info.value.code == CODE_PACK_NOT_FOUND
 
 
-def test_save_action_image_rejects_non_image(store, builtin_pet):
+def test_save_action_image_rejects_non_image(store, user_pet):
     with pytest.raises(PetError):
-        store.save_action_image(builtin_pet, 'idle', b'%PDF-1.4 fake')
+        store.save_action_image(user_pet, 'idle', b'%PDF-1.4 fake')
 
 
-def test_delete_action_override_reverts_to_pack(store, builtin_pet):
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64), color=(0, 0, 255, 255)))
-    assert store.resolve_frame_path(builtin_pet, 'idle')[1] == 'override'
+def test_delete_action_override_reverts_to_pack(store, user_pet):
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64), color=(0, 0, 255, 255)))
+    assert store.resolve_frame_path(user_pet, 'idle')[1] == 'override'
 
-    assert store.delete_action_override(builtin_pet, 'idle') is True
-    assert store.resolve_frame_path(builtin_pet, 'idle')[1] == 'builtin'
-
-
-def test_delete_missing_override_is_noop(store, builtin_pet):
-    assert store.delete_action_override(builtin_pet, 'idle') is False
+    assert store.delete_action_override(user_pet, 'idle') is True
+    assert store.resolve_frame_path(user_pet, 'idle')[1] == 'pack'
 
 
-def test_delete_last_override_prunes_empty_dir(store, builtin_pet):
+def test_delete_missing_override_is_noop(store, user_pet):
+    assert store.delete_action_override(user_pet, 'idle') is False
+
+
+def test_delete_last_override_prunes_empty_dir(store, user_pet):
     """删掉最后一个覆盖后，空的 overrides 目录也要清掉。
 
     留着它会让人以为「这里还有用户数据」，也是 `_scan_dir` 误判的诱因。
     """
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64)))
-    override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64)))
+    override_dir = os.path.join(store.user_pet_dir(user_pet), OVERRIDES_DIRNAME)
     assert os.path.isdir(override_dir)
 
-    store.delete_action_override(builtin_pet, 'idle')
+    store.delete_action_override(user_pet, 'idle')
     assert not os.path.isdir(override_dir), '空覆盖目录应被清理'
 
 
-def test_delete_one_of_two_overrides_keeps_dir(store, builtin_pet):
+def test_delete_one_of_two_overrides_keeps_dir(store, user_pet):
     """还有别的覆盖时不能删目录。"""
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64)))
-    store.save_action_image(builtin_pet, 'walk', make_image_bytes(size=(64, 64)))
-    store.delete_action_override(builtin_pet, 'idle')
-    override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64)))
+    store.save_action_image(user_pet, 'walk', make_image_bytes(size=(64, 64)))
+    store.delete_action_override(user_pet, 'idle')
+    override_dir = os.path.join(store.user_pet_dir(user_pet), OVERRIDES_DIRNAME)
     assert os.path.isdir(override_dir)
     assert os.listdir(override_dir) == ['walk.png']
 
 
-def test_overrides_listed_in_describe(store, builtin_pet):
-    store.save_action_image(builtin_pet, 'walk', make_image_bytes(size=(64, 64)))
-    item = next(i for i in store.list_pets() if i['id'] == builtin_pet)
+def test_overrides_listed_in_describe(store, user_pet):
+    store.save_action_image(user_pet, 'walk', make_image_bytes(size=(64, 64)))
+    item = next(i for i in store.list_pets() if i['id'] == user_pet)
     assert 'walk' in item['overrides']
 
 
-def test_builtin_pet_with_overrides_stays_builtin(store, builtin_pet):
-    """★ 对内置形象做过覆盖后，它必须**仍然**是内置形象。
+# ------------------------------------------------- 内置形象严格只读（契约反转）
+#
+# 用户要求「插件自带的宠物不应该允许用户进行修改」。
+# 这一组把「只读」钉死在**存储层**，而不是只靠 UI 藏按钮——
+# 接口是公开的，UI 藏了不代表改不了。
 
-    实测踩过（真实浏览器里看到面板显示「自定义」+「删除」按钮）：
-    单动作覆盖会在 `data/pets/<内置 id>/overrides/` 下落文件，
-    于是 `data/pets/<内置 id>/` 这个目录存在了。
-    如果「是不是用户包」按目录存在判断，内置形象就会被当成用户包——
-    后果不止是显示错：
-    ① 面板给出「删除」按钮，用户点了会把一个不存在的用户包删掉（困惑）；
-    ② 更糟的是 `_locate` 用户优先，它会**遮蔽**同名内置包，
-       而那个目录里没有 pet.json，等于把一个能用的内置形象变成「不存在」。
+
+def test_builtin_pet_cannot_be_overridden(store, builtin_pet):
+    """★ 内置形象不允许单动作覆盖。"""
+    with pytest.raises(PetError) as info:
+        store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64)))
+    assert info.value.code == 'builtin_readonly'
+    assert info.value.http_status == 403
+    assert info.value.user_msg and info.value.hint
+    # 磁盘上不该留下任何覆盖文件
+    override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
+    assert not os.path.isdir(override_dir)
+
+
+def test_builtin_pet_ignores_legacy_overrides(store, builtin_pet):
+    """★ 遗留覆盖**不生效**（「严格只读」的实质含义）。
+
+    先手工造出一个覆盖文件（模拟旧版本留下的），再断言解析结果仍是内置原图。
+    只在 UI 上藏按钮是不够的：文件还在就会被 `resolve_frame_path` 捡走。
     """
-    store.save_action_image(builtin_pet, 'idle', make_image_bytes(size=(64, 64)))
+    override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
+    os.makedirs(override_dir, exist_ok=True)
+    write_sheet(os.path.join(override_dir, 'idle.png'), frames=1)
+
+    path, source = store.resolve_frame_path(builtin_pet, 'idle')
+    assert source == 'builtin', f'内置形象不该使用覆盖图，实际来源 {source}'
+    assert path.endswith(os.path.join('builtin-cat', 'idle.png'))
+    assert store.runtime_pack(builtin_pet)['actions']['idle']['frameSource'] == 'builtin'
+
+
+def test_legacy_overrides_are_reported_not_hidden(store, builtin_pet):
+    """★ 遗留覆盖要被**报出来**，不能静默忽略。
+
+    静默忽略的后果是「我明明换过图，怎么没变」——用户无从下手。
+    运行期定义里必须带上 `staleOverrides`，面板据此给出「一键清理」。
+    """
+    override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
+    os.makedirs(override_dir, exist_ok=True)
+    write_sheet(os.path.join(override_dir, 'idle.png'), frames=1)
+    write_sheet(os.path.join(override_dir, 'walk.png'), frames=1)
+
+    payload = store.runtime_pack(builtin_pet)
+    assert sorted(payload['staleOverrides']) == ['idle', 'walk']
+    assert payload['writable'] is False
+
+    # 用户形象没有这个概念
+    write_pack(store.user_pets_dir(), 'mine', payload=pack(id='mine'))
+    assert store.runtime_pack('mine')['staleOverrides'] == []
+    assert store.runtime_pack('mine')['writable'] is True
+
+
+def test_clear_pet_overrides_removes_legacy_files(store, builtin_pet):
+    """★ 「一键清理」：用户自己决定何时清掉遗留覆盖（不静默删数据）。"""
+    override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
+    os.makedirs(override_dir, exist_ok=True)
+    write_sheet(os.path.join(override_dir, 'idle.png'), frames=1)
+    write_sheet(os.path.join(override_dir, 'walk.png'), frames=1)
+
+    removed = store.clear_pet_overrides(builtin_pet)
+    assert sorted(removed) == ['idle', 'walk']
+    assert store.runtime_pack(builtin_pet)['staleOverrides'] == []
+    # 随包资源一个字节都不该被动到
+    assert os.path.isfile(os.path.join(store.builtin_pet_dir(builtin_pet), 'idle.png'))
+
+
+def test_clear_pet_overrides_is_noop_without_legacy(store, builtin_pet):
+    assert store.clear_pet_overrides(builtin_pet) == []
+
+
+def test_user_pet_with_overrides_stays_user(store, user_pet):
+    """★ 做过覆盖的用户形象仍然是「用户形象」，且仍可写。
+
+    （原用例测的是内置形象不被误判成用户包；改成只读后，
+    真正要守住的是「用户包不会被误判成内置包」——那会让它变得不可改。）
+    """
+    store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64)))
 
     items = store.list_pets()
-    matching = [item for item in items if item['id'] == builtin_pet]
-    assert len(matching) == 1, '内置形象不应因为覆盖而出现两条'
-    assert matching[0]['source'] == 'builtin', (
-        f'做过覆盖的内置形象仍应是 builtin，实际 {matching[0]["source"]}'
-    )
+    matching = [item for item in items if item['id'] == user_pet]
+    assert len(matching) == 1, '同一 id 不应出现两条'
+    assert matching[0]['source'] == 'user'
+    assert matching[0]['writable'] is True
     assert 'idle' in matching[0]['overrides']
+    # 覆盖确实生效
+    assert store.resolve_frame_path(user_pet, 'idle')[1] == 'override'
 
-    # 仍然可正常读取（没有被空目录遮蔽）
-    assert store.load_pack(builtin_pet).name == '内置猫'
-    # 内置形象不可删除
-    assert store.delete_pet(builtin_pet) is False
+
+def test_builtin_scale_and_pixelated_remain_writable(store, builtin_pet):
+    """★ 内置形象只读的是**内容**，不是**看法**。
+
+    大小倍率与渲染方式是用户自己的显示偏好，落在 `data/` 里，
+    不该因为「形象只读」而被一起锁掉——否则内置形象就没法适配用户的屏幕了。
+    """
+    store.set_pet_scale(builtin_pet, 2.5)
+    store.set_pet_pixelated(builtin_pet, True)
+    assert store.effective_scale(builtin_pet) == 2.5
+    assert store.effective_pixelated(builtin_pet) is True
+    # 随包资源仍未被改动
     assert os.path.isdir(store.builtin_pet_dir(builtin_pet))
 
 
@@ -751,6 +843,31 @@ def test_delete_clears_active_setting(store):
 
 def test_delete_missing_returns_false(store):
     assert store.delete_pet('ghost') is False
+
+
+def test_delete_clears_per_pet_preferences(store):
+    """★ 删除形象时要清掉它的逐形象偏好（倍率 / 渲染方式）。
+
+    不清的后果很隐蔽：id 会被重新分配（`_allocate_pet_id` 复用 `pet`、`pet-2`…），
+    于是**新建的形象会继承一个早已删除的形象的大小设置**。
+    实测踩到过：验收脚本删掉 `pet` 后重建同名 id，新形象一出生就是 3×。
+    """
+    store.import_zip(sample_zip('temp-pet'))
+    store.set_pet_scale('temp-pet', 3)
+    store.set_pet_pixelated('temp-pet', True)
+    store.update_settings({'activePetId': 'temp-pet'})
+
+    assert store.delete_pet('temp-pet') is True
+
+    settings = store.get_settings()
+    assert 'temp-pet' not in (settings.get('petScales') or {})
+    assert 'temp-pet' not in (settings.get('petPixelated') or {})
+    assert settings['activePetId'] == ''
+
+    # 重建同名形象时不该继承旧偏好
+    store.import_zip(sample_zip('temp-pet'))
+    assert store.effective_scale('temp-pet') == 1
+    assert store.effective_pixelated('temp-pet') is False
 
 
 # ------------------------------------------------------------------ 导出

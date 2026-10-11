@@ -1,11 +1,11 @@
 {
   "id": "stm-pet",
   "name": "桌面宠物",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "api_version": 2,
   "manifest_version": 2,
   "author": "ST-Manager",
-  "description": "常驻桌面的宠物：跟随宿主状态活动、可拖动、会下坠与行走、长时间没互动会睡着；支持导入自己的形象图，并在卡片更新与扫描完成时播报。",
+  "description": "常驻桌面的宠物：跟随宿主状态活动、可拖动、会下坠与行走、长时间没互动会睡着；支持自己新建形象、导入形象包、按形象调整大小与渲染方式，并在卡片更新与扫描完成时播报。",
   "license": "MIT",
   "min_app_version": "1.0.0",
   "backend": {
@@ -82,11 +82,11 @@
       },
       "scale": {
         "type": "number",
-        "title": "宠物大小倍率",
-        "description": "1 表示按形象包定义的单帧尺寸显示。",
+        "title": "宠物大小倍率（默认值）",
+        "description": "全局兜底值。每个形象还能在「桌面宠物设置」里单独调大小与渲染方式，那些设置优先于这里；形象包自己声明的倍率也优先于这里。",
         "default": 1,
-        "minimum": 0.5,
-        "maximum": 3
+        "minimum": 0.25,
+        "maximum": 4
       },
       "sleep_after": {
         "type": "integer",

@@ -26,6 +26,10 @@ const SLEEP_CHECK_INTERVAL = 1000;
 /** 点击与拖拽的判别阈值（像素）。 */
 const CLICK_SLOP = 5;
 
+/** 大小倍率的合法区间（与 `backend/core/pack.py:SCALE_RANGE` 必须一致）。 */
+const SCALE_MIN = 0.25;
+const SCALE_MAX = 4;
+
 const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
 
 /**
@@ -73,7 +77,7 @@ export function createPetView(options = {}) {
 
   const actions = pack.actions || {};
   const baseSize = pack.size || { w: 64, h: 64 };
-  const scale = clamp(Number(config.scale) || 1, 0.5, 3);
+  const scale = clamp(Number(config.scale) || 1, SCALE_MIN, SCALE_MAX);
   const width = Math.max(8, Math.round(baseSize.w * scale));
   const height = Math.max(8, Math.round(baseSize.h * scale));
   const anchorX = Number(pack.anchor?.x ?? 0.5);
@@ -88,6 +92,18 @@ export function createPetView(options = {}) {
   root.style.width = `${width}px`;
   root.style.height = `${height}px`;
   root.style.transform = 'translate3d(0px, 0px, 0)';
+
+  // 渲染方式（像素风 / 平滑插值）。
+  //
+  // 这个属性**必须真的写上去**：`plugin.css` 里的
+  // `[data-pet-pixelated="false"]` 规则靠它选择器匹配。早先这属性从未被设置，
+  // 于是那条规则永不生效、`pixelated` 恒开——用户把倍率调到 2× 以上时，
+  // 写实插画会出现块状边缘。
+  //
+  // 走 `data-` 属性而不是内联 style：样式规则归 CSS（F11 要求作用域内），
+  // 属性只表达「是什么」，不表达「怎么画」。
+  const pixelated0 = config.pixelated === true;
+  root.dataset.petPixelated = pixelated0 ? 'true' : 'false';
 
   const sprite = document.createElement('div');
   sprite.className = 'pet-sprite';
@@ -610,11 +626,20 @@ export function createPetView(options = {}) {
     get running() { return running; },
     get throttleReason() { return throttle.reason; },
     get reducedMotion() { return reducedMotion; },
+    /** 当前生效的大小倍率与单帧尺寸（验收脚本与排查用）。 */
+    get scale() { return scale; },
+    get size() { return { width, height }; },
+    get pixelated() { return root.dataset.petPixelated === 'true'; },
     setConfig(next = {}) {
       Object.assign(config, next);
-      if ('scale' in next) {
-        // 尺寸变化需要重建（简单起见由上层重建视图）
+      // 渲染方式可以**就地**改：只是换一条 CSS 规则，不涉及几何，
+      // 因此不必重建视图（重建会丢掉「正在被拖动」这类瞬时状态）。
+      if ('pixelated' in next) {
+        const flag = next.pixelated === true;
+        root.dataset.petPixelated = flag ? 'true' : 'false';
       }
+      // `scale` **不**在这里处理：它会改包围盒尺寸，进而影响物理与切帧几何，
+      // 必须重建视图（由 `plugin.js` 的 `applyPack` 负责，并保留当前位置）。
       return this;
     },
     applyThrottle,

@@ -79,8 +79,39 @@ MAX_FRAMES = 256
 DEFAULT_MAX_SHEET_PIXELS = 4096
 MAX_FPS = 60
 
+#: 单帧的默认逻辑尺寸。**只是默认值**——`size.w` 与 `size.h` 完全独立，
+#: 形象可以是任意长宽比（真人立绘常见 2:3、3:4），不必是正方形。
 DEFAULT_SIZE = {'w': 64, 'h': 64}
 DEFAULT_ANCHOR = {'x': 0.5, 'y': 1.0}
+
+#: 形象是否按**像素风**渲染（`image-rendering: pixelated`）。
+#:
+#: 默认 **False**（平滑插值）。理由：像素风放大时必须硬边，否则糊；
+#: 而写实插画 / 真人立绘放大时**恰恰相反**——硬边会出现块状锯齿。
+#: 两者诉求互斥，所以只能由形象自己声明，用户在面板上还能覆盖。
+#: 像素风形象请在 `pet.json` 里写 `"pixelated": true`。
+DEFAULT_PIXELATED = False
+
+#: 形象**自带**的大小倍率（可选字段）。语义是「作者认为这个形象适合多大」。
+#:
+#: 为什么包要能声明它：`size` 是单帧的**贴图**尺寸，不等于**观感**尺寸。
+#: 一张 512×512 的真人立绘与一张 64×64 的像素猫，按各自的 `size` 原样显示时
+#: 前者会占掉小半个屏幕。作者在包里声明 `scale` 就能表达「我这个形象该缩到多少」，
+#: 而不是让每个用户自己试。
+#:
+#: 优先级（`store.effective_scale`）：**用户设置 > 包内声明 > 宿主表单默认值**。
+DEFAULT_SCALE = 1.0
+
+#: 倍率的合法区间：`(最小值, 最大值)`。全闭区间。
+#:
+#: 定这个区间的依据是「要同时覆盖二次元小图与真人立绘，又不能把宠物放大到
+#: 遮住整个屏幕」：
+#: - 下界 0.25：512px 的立绘缩到 128px，仍看得清；
+#: - 上界 4：64px 的小图放大到 256px，在高分屏上也够大。
+#: 前端滑块、后端校验、manifest 的默认值**三处共用这一对常量**
+#: （`frontend/panel.js` 里的 `SCALE_MIN` / `SCALE_MAX` 必须与此一致）。
+SCALE_RANGE = (0.25, 4.0)
+
 DEFAULT_PHYSICS = {
     'gravity': 1800.0,
     'walkSpeed': 60.0,
@@ -105,7 +136,12 @@ _PHYSICS_RANGES = {
 }
 
 _MIN_FRAME_SIZE = 1
-_MAX_FRAME_SIZE = 512
+#: 单帧尺寸上限（宽与高**各自**判定，因此非正方形形象完全合法）。
+#:
+#: 放宽到 1024 是为了真人立绘这类形象：512 的上限意味着 2:3 的立绘只能做到
+#: 512×768，在高分屏上放大后不够清晰。上限本身仍要存在——它是解码炸弹防线
+#: 的一部分（真正的硬上限是 `imports.MAX_IMAGE_DIMENSION`）。
+_MAX_FRAME_SIZE = 1024
 
 
 @dataclass
@@ -171,6 +207,10 @@ class PetPack:
     author: str = ''
     size: dict = field(default_factory=lambda: dict(DEFAULT_SIZE))
     anchor: dict = field(default_factory=lambda: dict(DEFAULT_ANCHOR))
+    #: 形象自带的大小倍率（可选，`DEFAULT_SCALE` 表示「没声明」）。
+    scale: float = DEFAULT_SCALE
+    #: 是否按像素风渲染（可选，默认平滑插值，见 `DEFAULT_PIXELATED`）。
+    pixelated: bool = DEFAULT_PIXELATED
     physics: dict = field(default_factory=lambda: dict(DEFAULT_PHYSICS))
     animations: dict = field(default_factory=dict)
     #: 解析时忽略掉的未知字段（向前兼容），仅用于排查。
@@ -242,6 +282,8 @@ class PetPack:
             'author': self.author,
             'size': dict(self.size),
             'anchor': dict(self.anchor),
+            'scale': self.scale,
+            'pixelated': self.pixelated,
             'physics': dict(self.physics),
             'animations': {key: spec.to_dict() for key, spec in self.animations.items()},
             'missingRequired': self.missing_required(),
@@ -463,6 +505,15 @@ def from_dict(raw: dict, *, pack_id: str = '', allow_source_jpeg: bool = False) 
         high_map={'x': 1.0, 'y': 1.0},
     )
 
+    # ---- 形象自带的大小倍率（可选；老包没有这个字段就是 1.0）----
+    pack.scale = _read_number(
+        raw, 'scale', DEFAULT_SCALE,
+        low=SCALE_RANGE[0], high=SCALE_RANGE[1],
+    )
+
+    # ---- 渲染方式（可选；缺省 = 平滑插值）----
+    pack.pixelated = _read_bool(raw, 'pixelated', DEFAULT_PIXELATED)
+
     # ---- 物理 ----
     pack.physics = _parse_mapping(
         raw.get('physics'), 'physics', DEFAULT_PHYSICS,
@@ -510,7 +561,8 @@ def from_dict(raw: dict, *, pack_id: str = '', allow_source_jpeg: bool = False) 
 
     # ---- 向前兼容：记录被忽略的未知顶层字段 ----
     known = {
-        'format', 'id', 'name', 'author', 'size', 'anchor', 'physics', 'animations',
+        'format', 'id', 'name', 'author', 'size', 'anchor', 'scale', 'pixelated',
+        'physics', 'animations',
     }
     pack.ignored_fields = sorted(str(key) for key in raw.keys() if key not in known)
 

@@ -12,7 +12,7 @@ import pytest
 
 from backend.core.store import MANIFEST_FILENAME, PetStore
 from fake_api import FakeApi, build_app
-from pet_test_support import make_image_bytes, minimal_pack, pack, write_pack
+from pet_test_support import make_image_bytes, minimal_pack, pack, write_pack, write_sheet
 
 
 @pytest.fixture()
@@ -32,6 +32,11 @@ def env(tmp_path):
     write_pack(
         builtin_dir, 'solo', payload=minimal_pack(id='solo', name='单帧宠物'),
         sheets={'idle.png': 1},
+    )
+    # 用户自建形象（覆盖类用例要用它 —— 内置形象严格只读）
+    write_pack(
+        data_dir / 'pets', 'my-cat', payload=pack(id='my-cat', name='我的猫'),
+        sheets={'idle.png': 4, 'walk.png': 6, 'fall.png': 2, 'drag.png': 2},
     )
 
     store = PetStore(str(data_dir), str(builtin_dir))
@@ -140,15 +145,19 @@ def test_frame_endpoint_cache_depends_on_version_param(env):
 
 
 def test_frame_endpoint_reports_source(env):
-    """响应头标记帧来源，便于排查「为什么换了图没生效」。"""
+    """响应头标记帧来源，便于排查「为什么换了图没生效」。
+
+    内置形象严格只读，因此**只可能**是 builtin——即便磁盘上存在遗留覆盖。
+    """
     _app, store, client, _api = env
     response = client.get('/api/plugins/stm-pet/frame/default-cat/idle')
     assert response.headers.get('X-Pet-Frame-Source') == 'builtin'
 
+    # 用户形象才允许覆盖
     store.save_action_image(
-        'default-cat', 'idle', make_image_bytes(size=(64, 64), color=(1, 1, 1, 255)),
+        'my-cat', 'idle', make_image_bytes(size=(64, 64), color=(1, 1, 1, 255)),
     )
-    response = client.get('/api/plugins/stm-pet/frame/default-cat/idle')
+    response = client.get('/api/plugins/stm-pet/frame/my-cat/idle')
     assert response.headers.get('X-Pet-Frame-Source') == 'override'
 
 
@@ -308,7 +317,7 @@ def test_import_pet_rejects_fake_zip_extension(env):
 def test_upload_action_image(env):
     _app, store, client, _api = env
     response = client.post(
-        '/api/plugins/stm-pet/pets/default-cat/actions/walk',
+        '/api/plugins/stm-pet/pets/my-cat/actions/walk',
         data={'file': (io.BytesIO(make_image_bytes(size=(200, 100))), 'walk.png')},
         content_type='multipart/form-data',
     )
@@ -317,13 +326,30 @@ def test_upload_action_image(env):
     assert payload['success'] is True
     assert payload['override']['action'] == 'walk'
     assert payload['override']['url']
-    assert store.resolve_frame_path('default-cat', 'walk')[1] == 'override'
+    assert store.resolve_frame_path('my-cat', 'walk')[1] == 'override'
+
+
+def test_upload_action_image_on_builtin_is_forbidden(env):
+    """★ 内置形象严格只读：换图接口直接拒绝（不能只靠 UI 藏按钮）。"""
+    _app, store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/default-cat/actions/walk',
+        data={'file': (io.BytesIO(make_image_bytes(size=(64, 64))), 'walk.png')},
+        content_type='multipart/form-data',
+    )
+    assert response.status_code == 403
+    payload = json_of(response)
+    assert payload['success'] is False
+    assert payload['error'] == 'builtin_readonly'
+    assert payload['hint']
+    # 磁盘上不该留下覆盖
+    assert store.resolve_frame_path('default-cat', 'walk')[1] == 'builtin'
 
 
 def test_upload_action_image_rejects_non_image(env):
     _app, _store, client, _api = env
     response = client.post(
-        '/api/plugins/stm-pet/pets/default-cat/actions/walk',
+        '/api/plugins/stm-pet/pets/my-cat/actions/walk',
         data={'file': (io.BytesIO(b'%PDF-1.4 fake'), 'walk.png')},
         content_type='multipart/form-data',
     )
@@ -336,7 +362,7 @@ def test_upload_action_image_rejects_non_image(env):
 def test_upload_action_image_rejects_bad_action(env):
     _app, _store, client, _api = env
     response = client.post(
-        '/api/plugins/stm-pet/pets/default-cat/actions/..%2Fevil',
+        '/api/plugins/stm-pet/pets/my-cat/actions/..%2Fevil',
         data={'file': (io.BytesIO(make_image_bytes()), 'x.png')},
         content_type='multipart/form-data',
     )
@@ -346,17 +372,17 @@ def test_upload_action_image_rejects_bad_action(env):
 def test_delete_action_image_reverts_to_pack(env):
     _app, store, client, _api = env
     client.post(
-        '/api/plugins/stm-pet/pets/default-cat/actions/walk',
+        '/api/plugins/stm-pet/pets/my-cat/actions/walk',
         data={'file': (io.BytesIO(make_image_bytes(size=(64, 64))), 'walk.png')},
         content_type='multipart/form-data',
     )
-    assert store.resolve_frame_path('default-cat', 'walk')[1] == 'override'
+    assert store.resolve_frame_path('my-cat', 'walk')[1] == 'override'
 
-    response = client.delete('/api/plugins/stm-pet/pets/default-cat/actions/walk')
+    response = client.delete('/api/plugins/stm-pet/pets/my-cat/actions/walk')
     assert response.status_code == 200
     payload = json_of(response)
     assert payload['removed'] is True
-    assert store.resolve_frame_path('default-cat', 'walk')[1] == 'builtin'
+    assert store.resolve_frame_path('my-cat', 'walk')[1] == 'pack'
 
 
 # ------------------------------------------------------------------ 删除形象
@@ -404,10 +430,12 @@ def test_settings_only_expose_structured_keys(env):
     """标量配置归宿主的 `config_schema`，插件设置里不该出现第二份。
 
     两边都存会引出「宿主的设置表单改了、插件却不生效」这类双写不同步的 bug。
+    `petScales` / `petPixelated` 是**结构化**的（每个形象一个值），
+    宿主表单表达不了，因此合法地留在这里。
     """
     _app, _store, client, _api = env
     settings = json_of(client.get('/api/plugins/stm-pet/settings'))['settings']
-    assert set(settings) == {'activePetId'}
+    assert set(settings) == {'activePetId', 'petScales', 'petPixelated'}
     for scalar in ('quietMode', 'quiet_mode', 'scale', 'sleepAfter', 'sleep_after'):
         assert scalar not in settings
 
@@ -439,11 +467,30 @@ def test_preview_endpoint_explains_fallbacks(env):
 
 def test_preview_marks_overridden_actions(env):
     _app, store, client, _api = env
-    store.save_action_image('default-cat', 'walk', make_image_bytes(size=(64, 64)))
-    payload = json_of(client.get('/api/plugins/stm-pet/pets/default-cat/preview'))
+    store.save_action_image('my-cat', 'walk', make_image_bytes(size=(64, 64)))
+    payload = json_of(client.get('/api/plugins/stm-pet/pets/my-cat/preview'))
     walk = next(item for item in payload['actions'] if item['action'] == 'walk')
     assert walk['overridden'] is True
     assert walk['frameSource'] == 'override'
+
+
+def test_preview_exposes_appearance_and_writability(env):
+    """★ 面板要靠这些字段决定「显示哪些控件」。
+
+    内置形象必须带 `writable=false`（前端据此隐藏换图/删除/导出），
+    同时**仍然**带上 scale / pixelated——那两项对内置形象也是可调的。
+    """
+    _app, _store, client, _api = env
+    builtin = json_of(client.get('/api/plugins/stm-pet/pets/default-cat/preview'))
+    assert builtin['writable'] is False
+    assert builtin['source'] == 'builtin'
+    assert builtin['scale'] == 1
+    assert builtin['pixelated'] is False
+    assert builtin['size'] == {'w': 64, 'h': 64}
+
+    mine = json_of(client.get('/api/plugins/stm-pet/pets/my-cat/preview'))
+    assert mine['writable'] is True
+    assert mine['source'] == 'user'
 
 
 # ------------------------------------------------------------------ 导出
@@ -451,11 +498,275 @@ def test_preview_marks_overridden_actions(env):
 
 def test_export_endpoint_returns_zip(env):
     _app, _store, client, _api = env
-    response = client.get('/api/plugins/stm-pet/pets/default-cat/export')
+    response = client.get('/api/plugins/stm-pet/pets/my-cat/export')
     assert response.status_code == 200
     assert response.headers['Content-Type'] == 'application/zip'
     assert 'attachment' in response.headers['Content-Disposition']
     assert response.data[:2] == b'PK'
+
+
+def test_export_builtin_pet_is_forbidden(env):
+    """★ 内置形象不提供导出（用户明确要求）。"""
+    _app, _store, client, _api = env
+    response = client.get('/api/plugins/stm-pet/pets/default-cat/export')
+    assert response.status_code == 403
+    payload = json_of(response)
+    assert payload['success'] is False
+    assert payload['error'] == 'builtin_no_export'
+    assert payload['hint']
+
+
+# ------------------------------------------------------------------ 外观微调
+
+
+def test_update_appearance_saves_scale_and_pixelated(env):
+    """★ 倍率与渲染方式**按形象**保存（用户要求应对不同分辨率与形象）。"""
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/default-cat/appearance',
+        json={'scale': 2.5, 'pixelated': True},
+        content_type='application/json',
+    )
+    assert response.status_code == 200
+    payload = json_of(response)
+    assert payload['pet']['scale'] == 2.5
+    assert payload['pet']['pixelated'] is True
+    # 只影响这一个形象
+    other = json_of(client.get('/api/plugins/stm-pet/pets/my-cat/runtime'))
+    assert other['pet']['scale'] == 1
+    assert other['pet']['pixelated'] is False
+
+
+def test_update_appearance_is_allowed_on_builtin(env):
+    """★ 内置形象只读的是内容，不是「怎么看」——倍率必须可调。
+
+    否则内置形象就没法适配用户的屏幕，而它恰恰是大多数用户唯一会用的形象。
+    """
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/default-cat/appearance',
+        json={'scale': 0.5},
+        content_type='application/json',
+    )
+    assert response.status_code == 200
+    assert json_of(response)['pet']['scale'] == 0.5
+
+
+def test_update_appearance_clamps_scale(env):
+    """超出范围的值被夹到区间内，而不是报错或写进设置。"""
+    _app, store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/my-cat/appearance',
+        json={'scale': 999},
+        content_type='application/json',
+    )
+    assert response.status_code == 200
+    assert json_of(response)['pet']['scale'] == 4
+    assert store.get_settings()['petScales']['my-cat'] == 4
+
+
+def test_update_appearance_null_clears_override(env):
+    """传 null 表示清除覆盖、回落包内声明 / 全局默认。"""
+    _app, _store, client, _api = env
+    client.post(
+        '/api/plugins/stm-pet/pets/my-cat/appearance',
+        json={'scale': 3}, content_type='application/json',
+    )
+    response = client.post(
+        '/api/plugins/stm-pet/pets/my-cat/appearance',
+        json={'scale': None}, content_type='application/json',
+    )
+    assert response.status_code == 200
+    assert json_of(response)['pet']['scale'] == 1
+
+
+def test_update_appearance_rejects_non_boolean_pixelated(env):
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/my-cat/appearance',
+        json={'pixelated': 'yes'}, content_type='application/json',
+    )
+    assert response.status_code == 400
+    assert json_of(response)['success'] is False
+
+
+# ------------------------------------------------------------------ 遗留覆盖清理
+
+
+def test_clear_overrides_endpoint(env):
+    """★ 内置形象的「一键清理」：清掉不再生效的遗留覆盖。"""
+    _app, store, client, _api = env
+    override_dir = os.path.join(store.user_pet_dir('default-cat'), 'overrides')
+    os.makedirs(override_dir, exist_ok=True)
+    write_sheet(os.path.join(override_dir, 'idle.png'), frames=1)
+
+    before = json_of(client.get('/api/plugins/stm-pet/pets/default-cat/runtime'))
+    assert before['pet']['staleOverrides'] == ['idle']
+    assert before['pet']['actions']['idle']['frameSource'] == 'builtin'
+
+    response = client.delete('/api/plugins/stm-pet/pets/default-cat/overrides')
+    assert response.status_code == 200
+    payload = json_of(response)
+    assert payload['removed'] == ['idle']
+    assert payload['pet']['staleOverrides'] == []
+
+
+# ------------------------------------------------------------------ 新建形象
+
+
+def _create_form(name='我的新宠物', actions=None, extra=None):
+    """拼一个新建形象的 multipart 表单。`actions` 形如 `{'idle': (bytes, frames)}`。"""
+    data = {'name': name}
+    data.update(extra or {})
+    for action, spec in (actions or {'idle': (make_image_bytes(size=(64, 64)), 1)}).items():
+        payload, _frames = spec
+        data[action] = (io.BytesIO(payload), f'{action}.png')
+    return data
+
+
+def test_create_pet_endpoint(env):
+    """★ 用户能自己新建形象（不需要 zip、不需要手写 pet.json）。"""
+    _app, store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form('我的新宠物'),
+        content_type='multipart/form-data',
+    )
+    assert response.status_code == 200, response.data
+    payload = json_of(response)
+    assert payload['success'] is True
+    assert payload['pet']['source'] == 'user'
+    assert payload['pet']['name'] == '我的新宠物'
+    assert payload['pet']['writable'] is True
+    assert payload['pet']['actions']['idle']['url']
+    # 落盘且可再次读取
+    assert os.path.isfile(os.path.join(store.user_pet_dir(payload['pet']['id']), 'pet.json'))
+    assert store.active_pet_id() == payload['pet']['id']
+
+
+def test_create_pet_endpoint_derives_frame_size(env):
+    """单帧尺寸从上传图推导——用户不必自己裁成正好尺寸。"""
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form('宽图宠物', {'idle': (make_image_bytes(size=(200, 100)), 1)}),
+        content_type='multipart/form-data',
+    )
+    payload = json_of(response)
+    assert payload['pet']['size'] == {'w': 200, 'h': 100}
+
+
+def test_create_pet_endpoint_supports_multi_frame_sheet(env):
+    """★ 填了帧数就按水平 spritesheet 切分，能做出会动的宠物。"""
+    _app, _store, client, _api = env
+    # 一条 256×64 的图 = 4 帧 × 64px
+    sheet = make_image_bytes(size=(256, 64))
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form(
+            '会动的宠物',
+            {'idle': (sheet, 4)},
+            extra={'meta': json.dumps({'idle': {'frames': 4, 'fps': 8}})},
+        ),
+        content_type='multipart/form-data',
+    )
+    assert response.status_code == 200, response.data
+    idle = json_of(response)['pet']['actions']['idle']
+    assert idle['frames'] == 4
+    assert idle['fps'] == 8
+    assert idle['kind'] == 'animated'
+
+
+def test_create_pet_endpoint_requires_idle(env):
+    """只给 walk 不给 idle → 明确报错（idle 是唯一硬必要动作）。"""
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form('没有待机', {'walk': (make_image_bytes(size=(64, 64)), 1)}),
+        content_type='multipart/form-data',
+    )
+    assert response.status_code == 400
+    payload = json_of(response)
+    assert payload['success'] is False
+    assert payload['error'] == 'pack_animation_idle_missing'
+    assert payload['hint']
+
+
+def test_create_pet_endpoint_without_images_is_structured_error(env):
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data={'name': '空宠物'},
+        content_type='multipart/form-data',
+    )
+    assert response.status_code == 400
+    assert json_of(response)['success'] is False
+
+
+def test_create_pet_endpoint_rejects_non_image(env):
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form('假图', {'idle': (b'%PDF-1.4 fake', 1)}),
+        content_type='multipart/form-data',
+    )
+    assert response.status_code == 400
+    assert json_of(response)['success'] is False
+
+
+def test_create_pet_endpoint_rejects_indivisible_frames(env):
+    """★ 宽度不能被帧数整除时必须明确报错，而不是切出歪帧。"""
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form(
+            '除不尽',
+            {'idle': (make_image_bytes(size=(100, 64)), 1)},
+            extra={'meta': json.dumps({'idle': {'frames': 3}})},
+        ),
+        content_type='multipart/form-data',
+    )
+    assert response.status_code == 400
+    payload = json_of(response)
+    assert payload['success'] is False
+    assert payload['hint']
+
+
+def test_create_pet_endpoint_rejects_bad_action_field_name(env):
+    """字段名即动作名，非法名（路径穿越）要被拒绝。"""
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form('坏动作名', {'../evil': (make_image_bytes(size=(64, 64)), 1)}),
+        content_type='multipart/form-data',
+    )
+    assert response.status_code == 400
+    assert json_of(response)['success'] is False
+
+
+def test_create_pet_endpoint_applies_scale_and_pixelated(env):
+    _app, _store, client, _api = env
+    response = client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form('带外观', extra={'scale': '2', 'pixelated': '1'}),
+        content_type='multipart/form-data',
+    )
+    payload = json_of(response)
+    assert payload['pet']['scale'] == 2
+    assert payload['pet']['pixelated'] is True
+
+
+def test_create_pet_endpoint_leaves_no_staging_dir_on_failure(env):
+    """失败时不留半成品（与 zip 导入同一套 staging 纪律）。"""
+    _app, store, client, _api = env
+    client.post(
+        '/api/plugins/stm-pet/pets/create',
+        data=_create_form('坏图', {'idle': (b'not an image', 1)}),
+        content_type='multipart/form-data',
+    )
+    root = store.user_pets_dir()
+    leftovers = [n for n in os.listdir(root) if n.startswith('.staging-')]
+    assert leftovers == []
 
 
 # ------------------------------------------------------------------ 错误卫生

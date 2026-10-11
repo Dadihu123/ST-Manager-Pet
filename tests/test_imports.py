@@ -24,12 +24,15 @@ from backend.core.imports import (
     MAX_IMAGE_BYTES,
     MAX_IMAGE_DIMENSION,
     MAX_PAYLOAD_BYTES,
+    MAX_SHEET_FRAMES,
     check_payload_size,
     check_size,
     encode_image,
+    fit_within,
     format_bytes,
     load_image,
     normalize_frame,
+    prepare_sheet,
     process_upload,
     sniff_format,
     write_bytes_atomic,
@@ -392,8 +395,98 @@ def test_animated_gif_uses_first_frame():
     assert result['source_format'] == 'GIF'
 
 
-# ------------------------------------------------------------------ 落盘
+# -------------------------------------------------------- spritesheet 准备
 
+
+def test_fit_within_scales_longest_side():
+    assert fit_within(2000, 1000, 512) == (512, 256)
+    assert fit_within(1000, 2000, 512) == (256, 512)
+    # 已经在范围内就不动
+    assert fit_within(300, 450, 512) == (300, 450)
+
+
+def test_fit_within_never_returns_zero():
+    assert fit_within(10000, 1, 512)[0] == 512
+    assert fit_within(10000, 1, 512)[1] >= 1
+
+
+def test_prepare_sheet_single_frame_derives_size():
+    """单帧：尺寸按图本身推导（不再强制 64×64 的正方形）。"""
+    result = prepare_sheet(make_image_bytes(size=(300, 450)), frames=1)
+    assert result['frame_size'] == (300, 450)
+    assert result['frames'] == 1
+    assert result['derived'] is True
+    assert result['sheet_size'] == (300, 450)
+
+
+def test_prepare_sheet_splits_horizontal_sheet():
+    """★ 4 帧的水平图被切成 4 帧，单帧尺寸 = 宽/4。"""
+    result = prepare_sheet(make_image_bytes(size=(256, 64)), frames=4)
+    assert result['frames'] == 4
+    assert result['frame_size'] == (64, 64)
+    assert result['sheet_size'] == (256, 64)
+    # 产物真的是 4 帧拼成的一条
+    decoded = Image.open(io.BytesIO(result['data']))
+    assert decoded.size == (256, 64)
+
+
+def test_prepare_sheet_respects_given_frame_size():
+    """给了 frame_size 就对齐到它（新建形象时用 idle 的尺寸统一所有动作）。"""
+    result = prepare_sheet(make_image_bytes(size=(256, 64)), frames=4, frame_size=(32, 32))
+    assert result['frame_size'] == (32, 32)
+    assert result['sheet_size'] == (128, 32)
+    assert result['derived'] is False
+
+
+def test_prepare_sheet_rejects_indivisible_frames():
+    """★ 宽度不能被帧数整除 → 明确报错，而不是切出歪帧。"""
+    with pytest.raises(PetError) as info:
+        prepare_sheet(make_image_bytes(size=(100, 64)), frames=3)
+    error = info.value
+    assert error.code == CODE_IMAGE_INVALID
+    assert error.user_msg
+    assert error.hint
+    # 错误信息要给出可操作的线索（100 与 3）
+    assert '100' in error.user_msg and '3' in error.user_msg
+
+
+def test_prepare_sheet_rejects_absurd_frame_count():
+    with pytest.raises(PetError) as info:
+        prepare_sheet(make_image_bytes(size=(64, 64)), frames=MAX_SHEET_FRAMES + 1)
+    assert info.value.code == CODE_IMAGE_INVALID
+
+
+def test_prepare_sheet_caps_frame_size_to_pack_limit():
+    """超过单帧上限的图被等比缩到上限内，而不是拒绝。"""
+    result = prepare_sheet(make_image_bytes(size=(4000, 2000)), frames=1, max_frame_size=1024)
+    assert max(result['frame_size']) == 1024
+    assert result['frame_size'] == (1024, 512)
+
+
+def test_prepare_sheet_keeps_transparency():
+    """透明像素必须保留（否则宠物会贴一块白底）。"""
+    result = prepare_sheet(make_image_bytes(size=(32, 32), color=(0, 0, 0, 0)), frames=1)
+    decoded = Image.open(io.BytesIO(result['data'])).convert('RGBA')
+    assert decoded.getpixel((16, 16))[3] == 0
+
+
+def test_prepare_sheet_transcodes_jpeg():
+    """JPEG 输入同样要转成 PNG（宿主资产白名单不含 .jpg）。"""
+    result = prepare_sheet(
+        make_image_bytes(size=(64, 64), fmt='JPEG', mode='RGB'), frames=1,
+    )
+    assert result['extension'] == '.png'
+    assert sniff_format(result['data']) == 'PNG'
+    assert result['source_format'] == 'JPEG'
+
+
+def test_prepare_sheet_rejects_non_image():
+    with pytest.raises(PetError) as info:
+        prepare_sheet(b'%PDF-1.4 fake', frames=1)
+    assert info.value.code == CODE_UNSUPPORTED_FORMAT
+
+
+# ------------------------------------------------------------------ 落盘
 
 def test_write_bytes_atomic_creates_file(tmp_path):
     target = str(tmp_path / 'a' / 'b' / 'idle.png')

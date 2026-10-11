@@ -69,18 +69,22 @@
   width: 100%;
   height: 100%;
   background-repeat: no-repeat;
-  /* 像素风形象不糊（§4.2）。默认小猫是矢量风格的手绘位图，
-   * 这里对 2x 帧同样安全：放大时保持硬边比插值更符合"贴图"预期。 */
-  image-rendering: pixelated;
   /* 朝向翻转用 transform（不重排布局） */
   transform-origin: center center;
+  /* 默认**平滑插值**：写实插画 / 真人立绘放大时，硬边会出现块状锯齿。
+   * 像素风形象由下面的规则打开硬边（`data-pet-pixelated="true"`）。 */
+  image-rendering: auto;
 }
 
-/* 用户导入的是照片/插画时的观感更好（不做硬边放大）。
- * 由 JS 按包是否声明 pixelated 切换；默认不开，保持通用。 */
-[data-plugin="stm-pet"][data-pet-pixelated="false"] .pet-sprite,
-.plugin-stm-pet[data-pet-pixelated="false"] .pet-sprite {
-  image-rendering: auto;
+/* 像素风：放大时保持硬边，否则会糊。
+ *
+ * ⚠️ 这个属性过去**恒开**（写死在 `.pet-sprite` 上），而 JS 从未设置过
+ * `data-pet-pixelated` —— 于是下面那条 `="false"` 规则永不生效，
+ * 用户把倍率调到 2× 以上时写实插画就会出现块状边缘。
+ * 现在默认值反过来（auto），由 JS 按「包内声明 / 用户设置」显式打开。 */
+[data-plugin="stm-pet"][data-pet-pixelated="true"] .pet-sprite,
+.plugin-stm-pet[data-pet-pixelated="true"] .pet-sprite {
+  image-rendering: pixelated;
 }
 
 /* ------------------------------------------------- 宿主遮挡 / 省电兜底 */
@@ -397,6 +401,163 @@
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* ---------------------------------------------------------------- 徽章 */
+
+/* 来源徽章（自定义 / 插件自带）：用户一眼要能分清「这个能不能改」。 */
+.plugin-stm-pet .pet-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--accent-color, #7c5cff);
+  color: var(--content-on-accent, #fff);
+}
+
+.plugin-stm-pet .pet-badge.is-builtin {
+  background: var(--surface-container-raised, rgba(0, 0, 0, 0.08));
+  color: var(--content-secondary, #4b5563);
+}
+
+.plugin-stm-pet .pet-badge.is-required {
+  background: var(--color-warning, #d9a02c);
+  color: var(--content-on-accent, #fff);
+}
+
+/* ---------------------------------------------------------------- 滑块 */
+
+/* 大小倍率滑块。
+ *
+ * 宽度 100% 且 `min-width: 0`：面板右栏在窄屏下会变成单列，
+ * 不给 `min-width: 0` 时 range 的默认宽度会把容器撑破。 */
+.plugin-stm-pet .pet-slider {
+  width: 100%;
+  min-width: 0;
+  margin: 2px 0 4px;
+  accent-color: var(--accent-color, #7c5cff);
+  cursor: pointer;
+}
+
+.plugin-stm-pet .pet-slider-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.plugin-stm-pet .pet-slider-value {
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-color, #7c5cff);
+}
+
+/* ------------------------------------------------------------ 二选一按钮 */
+
+.plugin-stm-pet .pet-choice-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.plugin-stm-pet .pet-choice {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-default, rgba(0, 0, 0, 0.14));
+  background: var(--surface-container, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.plugin-stm-pet .pet-choice:hover {
+  border-color: var(--action-border, rgba(120, 120, 200, 0.5));
+}
+
+.plugin-stm-pet .pet-choice.is-active {
+  border-color: var(--accent-color, #7c5cff);
+  background: var(--surface-container-raised, rgba(124, 92, 255, 0.08));
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- 输入框 */
+
+.plugin-stm-pet .pet-input {
+  padding: 5px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border-default, rgba(0, 0, 0, 0.14));
+  background: var(--surface-container, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  min-width: 0;
+  width: 100%;
+}
+
+.plugin-stm-pet .pet-input:disabled {
+  opacity: 0.5;
+}
+
+.plugin-stm-pet .pet-input.is-num {
+  width: 56px;
+  text-align: center;
+}
+
+/* ------------------------------------------------------------ 新建表单行 */
+
+/* 每行：动作名 | 选图 | 帧数 | fps | 移除。
+ * 窄屏下换行（`flex-wrap`），避免把「移除」挤出可视区。 */
+.plugin-stm-pet .pet-create-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.06));
+}
+
+.plugin-stm-pet .pet-create-row:last-child {
+  border-bottom: none;
+}
+
+.plugin-stm-pet .pet-create-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-width: 88px;
+}
+
+.plugin-stm-pet .pet-create-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.plugin-stm-pet .pet-create-num {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+/* 下载链接：只用于触发浏览器原生下载，必须彻底不可见。
+ * 与 `.pet-file-input` 同理——它挂在 `document.body` 下，
+ * 作用域选择器匹配不到，因此真正的隐藏写在内联 style 里（见 panel.js）。 */
+.plugin-stm-pet .pet-download-link {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
 }
 
 /* ---------------------------------------------------------------- 响应式 */

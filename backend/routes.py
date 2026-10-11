@@ -13,6 +13,7 @@
 """
 
 import functools
+import json
 import logging
 import os
 import re
@@ -26,9 +27,15 @@ from .core.errors import (
     PetError,
 )
 from .core.imports import MAX_IMAGE_BYTES, MAX_PACK_BYTES, check_payload_size
-from .core.pack import ACTION_FALLBACKS
+from .core.pack import ACTION_FALLBACKS, DEFAULT_PIXELATED, SCALE_RANGE
 from .core.paths import is_action_name
-from .core.store import CONFIG_KEYS, PET_ID_PATTERN, PetStore, sanitize_pet_id
+from .core.store import (
+    CONFIG_KEYS,
+    PET_ID_PATTERN,
+    PetStore,
+    clamp_scale,
+    sanitize_pet_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +80,40 @@ def _json_body() -> dict:
     return payload
 
 
+def _json_field(raw) -> dict:
+    """解析表单里一个「JSON 字符串」字段；空值/非法都给空 dict（不报错）。
+
+    做成容错的是因为它是**可选**的元数据（帧数/帧率）：用户没填就该走默认值，
+    而不是让整次新建失败。
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        logger.warning('表单里的 JSON 字段解析失败，按空值处理: %r', raw)
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _optional_bool(raw):
+    """把表单里的三态布尔解析成 `True` / `False` / `None`（未提供）。
+
+    必须区分「没给」与「给了 false」：前者表示「用包内声明 / 默认」，
+    后者表示「用户明确要求关掉」。
+    """
+    if raw is None or raw == '':
+        return None
+    text = str(raw).strip().lower()
+    if text in ('1', 'true', 'yes', 'on'):
+        return True
+    if text in ('0', 'false', 'no', 'off'):
+        return False
+    return None
+
+
 def _read_upload(field: str = 'file', *, limit: int = MAX_IMAGE_BYTES) -> bytes:
     """从 multipart 表单里取一个上传文件；缺失/超限都给结构化错误。"""
     check_payload_size(request.content_length or 0)
@@ -109,8 +150,32 @@ def _read_upload(field: str = 'file', *, limit: int = MAX_IMAGE_BYTES) -> bytes:
     return data
 
 
+def _host_default_scale(api) -> float:
+    """读宿主 `config_schema` 里的全局 `scale`，作为倍率的**兜底默认值**。
+
+    标量配置的唯一来源是宿主的插件设置表单（`api.get_config()`），
+    store 层不自己读它（它没有 api），所以由路由层取出来传进去。
+
+    读不到时返回 `None`，让 store 用自己的默认值——不能在这里抛错：
+    配置读取失败不该让「打开设置面板」这件事整个失败。
+    """
+    try:
+        config = api.get_config() or {}
+    except Exception:  # noqa: BLE001 - 配置读取失败不该阻断形象列表
+        logger.warning('读取宿主配置失败，倍率回落到默认值', exc_info=True)
+        return None
+    value = config.get('scale')
+    if value is None:
+        return None
+    return clamp_scale(value)
+
+
 def register_routes(api, store: PetStore) -> None:
     """注册全部路由。"""
+
+    def runtime(pet_id: str = '') -> dict:
+        """统一的运行期定义出口（自动带上宿主的倍率默认值）。"""
+        return store.runtime_pack(pet_id, host_default_scale=_host_default_scale(api))
 
     # ---------------------------------------------------------------- 形象
 
@@ -128,6 +193,8 @@ def register_routes(api, store: PetStore) -> None:
             'limits': {
                 'maxImageBytes': MAX_IMAGE_BYTES,
                 'maxPackBytes': MAX_PACK_BYTES,
+                'scaleMin': SCALE_RANGE[0],
+                'scaleMax': SCALE_RANGE[1],
             },
         })
 
@@ -138,7 +205,7 @@ def register_routes(api, store: PetStore) -> None:
 
         前端不做回退决策——后端把结论算完，前端只按 `actions[<name>]` 播帧。
         """
-        return jsonify({'success': True, 'pet': store.runtime_pack(pet_id)})
+        return jsonify({'success': True, 'pet': runtime(pet_id)})
 
     @api.route('/runtime', ['GET'])
     @_handle
@@ -153,7 +220,7 @@ def register_routes(api, store: PetStore) -> None:
             'actions': list(ACTION_FALLBACKS),
         }
         if pet_id:
-            payload['pet'] = store.runtime_pack(pet_id)
+            payload['pet'] = runtime(pet_id)
         return jsonify(payload)
 
     @api.route('/frame/<pet_id>/<action>', ['GET'])
@@ -236,7 +303,7 @@ def register_routes(api, store: PetStore) -> None:
         return jsonify({
             'success': True,
             'activePetId': settings['activePetId'],
-            'pet': store.runtime_pack(pet_id),
+            'pet': runtime(pet_id),
         })
 
     @api.route('/pets/<pet_id>', ['DELETE'])
@@ -267,7 +334,74 @@ def register_routes(api, store: PetStore) -> None:
         payload = store.import_zip(data, replace=replace)
         # 导入后直接切过去：用户的意图就是「用这个形象」
         store.update_settings({'activePetId': payload['id']})
-        return jsonify({'success': True, 'pet': payload, 'activePetId': payload['id']})
+        return jsonify({
+            'success': True,
+            'pet': runtime(payload['id']),
+            'activePetId': payload['id'],
+        })
+
+    @api.route('/pets/create', ['POST'])
+    @_handle
+    def create_pet():
+        """**从零新建**一个用户形象（不需要 zip，也不需要手写 pet.json）。
+
+        请求是 multipart：除 `name` 等标量字段外，每个动作一个文件字段，
+        字段名就是动作名（`idle` / `walk` / …），配套的 `frames` / `fps` 走
+        `meta` 这个 JSON 字段（`{"idle": {"frames": 4, "fps": 6}}`）。
+
+        为什么用 multipart 而不是纯 JSON：图是二进制，base64 会让体积涨 33%
+        且要自己处理解码；multipart 是浏览器原生能力（`FormData`），
+        也让「一次提交多个动作的图」这件事天然成立。
+        """
+        payload = request.form.to_dict() or {}
+        name = str(payload.get('name') or '').strip()
+
+        # 每个动作一张图；字段名即动作名
+        frames = {}
+        meta = _json_field(payload.get('meta'))
+        for field_name, uploaded in request.files.items():
+            if not uploaded or not uploaded.filename:
+                continue
+            action = str(field_name or '').strip()
+            if not is_action_name(action):
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'上传字段名不是合法动作名: {action!r}',
+                    user_msg='动作名不合法。',
+                    hint='字段名只能是字母、数字、下划线或连字符（例如 idle）。',
+                )
+            spec = meta.get(action) if isinstance(meta.get(action), dict) else {}
+            frames[action] = {
+                'data': uploaded.read(MAX_IMAGE_BYTES + 1),
+                'frames': spec.get('frames', 1),
+                'fps': spec.get('fps'),
+                'loop': spec.get('loop'),
+            }
+
+        if not frames:
+            raise PetError(
+                CODE_NO_UPLOAD,
+                '新建形象的请求里没有任何图片',
+                user_msg='没有收到图片，请重新选择。',
+                hint='每个动作对应一个文件字段，字段名是动作名（例如 idle）。',
+            )
+
+        scale = payload.get('scale')
+        pixelated = payload.get('pixelated')
+        created = store.create_pet(
+            name,
+            frames,
+            pet_id=payload.get('petId') or '',
+            author=payload.get('author') or '',
+            scale=clamp_scale(scale) if scale not in (None, '') else None,
+            pixelated=_optional_bool(pixelated),
+        )
+        store.update_settings({'activePetId': created['id']})
+        return jsonify({
+            'success': True,
+            'pet': runtime(created['id']),
+            'activePetId': created['id'],
+        })
 
     @api.route('/pets/<pet_id>/export', ['GET'])
     @_handle
@@ -285,6 +419,63 @@ def register_routes(api, store: PetStore) -> None:
                 'Cache-Control': 'no-store',
             },
         )
+
+    # ------------------------------------------------------------ 外观微调
+
+    @api.route('/pets/<pet_id>/appearance', ['POST'])
+    @_handle
+    def update_appearance(pet_id):
+        """调整某形象的**大小倍率**与**渲染方式**（逐形象保存）。
+
+        用户要求「大小开放给用户调节，以应对不同分辨率与不同形象」，
+        因此这两项都是**按形象**存的：换形象自动恢复各自的设置，
+        不必每次重调。传 `null` 表示清除覆盖、回落到包内声明 / 全局默认。
+
+        内置形象**允许**调大小与渲染方式——那两项是「怎么看」而不是「是什么」，
+        改的是 `data/` 里的用户设置，从不碰随包资源。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        store.load_pack(pet_id)  # 不存在会抛 404
+        payload = _json_body()
+
+        if 'scale' in payload:
+            value = payload.get('scale')
+            if value is None or value == '':
+                store.clear_pet_scale(pet_id)
+            else:
+                store.set_pet_scale(pet_id, value)
+
+        if 'pixelated' in payload:
+            flag = payload.get('pixelated')
+            if flag is None or flag == '':
+                store.clear_pet_pixelated(pet_id)
+            else:
+                if not isinstance(flag, bool):
+                    raise PetError(
+                        CODE_IMAGE_INVALID,
+                        f'pixelated 应为布尔值，实际 {type(flag).__name__}',
+                        user_msg='渲染方式只能是开或关。',
+                    )
+                store.set_pet_pixelated(pet_id, flag)
+
+        return jsonify({'success': True, 'pet': runtime(pet_id)})
+
+    @api.route('/pets/<pet_id>/overrides', ['DELETE'])
+    @_handle
+    def clear_overrides(pet_id):
+        """清掉某形象**全部**遗留覆盖图（内置形象的「一键清理」）。
+
+        内置形象改为只读后，早先留下的覆盖文件不再生效。这里让用户自己决定
+        什么时候清掉它们——**不静默删除用户数据**。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        store.load_pack(pet_id)  # 不存在会抛 404
+        removed = store.clear_pet_overrides(pet_id)
+        return jsonify({
+            'success': True,
+            'removed': removed,
+            'pet': runtime(pet_id),
+        })
 
     # ------------------------------------------------------- 单动作图覆盖
 
@@ -319,7 +510,7 @@ def register_routes(api, store: PetStore) -> None:
         return jsonify({
             'success': True,
             'removed': removed,
-            'pet': store.runtime_pack(pet_id),
+            'pet': runtime(pet_id),
         })
 
     # ---------------------------------------------------------------- 设置
@@ -347,9 +538,9 @@ def register_routes(api, store: PetStore) -> None:
     @_handle
     def preview_pet(pet_id):
         """形象的**预览数据**：每个动作的来源与是否可播，供设置页解释回退。"""
-        runtime = store.runtime_pack(pet_id)
+        pack = runtime(pet_id)
         summary = []
-        for action, entry in runtime['actions'].items():
+        for action, entry in pack['actions'].items():
             summary.append({
                 'action': action,
                 'kind': entry.get('kind'),
@@ -359,12 +550,22 @@ def register_routes(api, store: PetStore) -> None:
                 'fps': entry.get('fps'),
                 'url': entry.get('url'),
                 'note': entry.get('note'),
-                'overridden': action in runtime['overrides'],
+                'overridden': action in pack['overrides'],
             })
         return jsonify({
             'success': True,
-            'id': runtime['id'],
-            'name': runtime['name'],
-            'missingRequired': runtime['missingRequired'],
+            'id': pack['id'],
+            'name': pack['name'],
+            'author': pack.get('author', ''),
+            'source': pack.get('source', ''),
+            'size': pack.get('size'),
+            'scale': pack.get('scale'),
+            'pixelated': pack.get('pixelated'),
+            'declaredScale': pack.get('declaredScale'),
+            'declaredPixelated': pack.get('declaredPixelated'),
+            'writable': pack.get('writable', True),
+            'overrides': pack.get('overrides', []),
+            'staleOverrides': pack.get('staleOverrides', []),
+            'missingRequired': pack['missingRequired'],
             'actions': summary,
         })

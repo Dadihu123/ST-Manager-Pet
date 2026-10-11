@@ -483,3 +483,74 @@ def test_pet_pack_defaults_are_independent_instances():
     first.animations['idle'] = 'x'
     assert second.physics['gravity'] != 1
     assert second.animations == {}
+
+
+# ---------------------------------------------------- 倍率 / 渲染方式（新增）
+
+
+def test_scale_defaults_to_one_when_omitted():
+    parsed = from_dict(minimal_pack())
+    assert parsed.scale == 1.0
+
+
+def test_scale_can_be_declared_by_the_pack():
+    """★ 包可以声明「我这个形象适合多大」——真人立绘与像素猫的观感尺寸不同。"""
+    parsed = from_dict(minimal_pack(scale=0.4))
+    assert parsed.scale == 0.4
+    assert parsed.to_dict()['scale'] == 0.4
+
+
+def test_scale_out_of_range_is_rejected():
+    with pytest.raises(PetError) as info:
+        from_dict(minimal_pack(scale=99))
+    assert info.value.code == CODE_PACK_FIELD_INVALID
+    assert 'scale' in info.value.msg
+
+
+def test_scale_must_be_a_number():
+    with pytest.raises(PetError):
+        from_dict(minimal_pack(scale='big'))
+
+
+def test_pixelated_defaults_to_false():
+    """★ 默认**平滑插值**：写实插画放大时硬边会出现块状锯齿。"""
+    assert from_dict(minimal_pack()).pixelated is False
+
+
+def test_pixelated_can_be_declared_by_the_pack():
+    parsed = from_dict(minimal_pack(pixelated=True))
+    assert parsed.pixelated is True
+    assert parsed.to_dict()['pixelated'] is True
+
+
+def test_pixelated_must_be_boolean():
+    with pytest.raises(PetError) as info:
+        from_dict(minimal_pack(pixelated='yes'))
+    assert info.value.code == CODE_PACK_FIELD_INVALID
+    assert 'pixelated' in info.value.msg
+
+
+def test_non_square_frame_size_is_accepted():
+    """★ 形象不必是正方形（真人立绘常见 2:3 / 3:4）。"""
+    parsed = from_dict(minimal_pack(size={'w': 300, 'h': 450}))
+    assert parsed.size == {'w': 300, 'h': 450}
+
+
+def test_frame_size_limits_are_independent_per_axis():
+    """宽与高**各自**判定：一个很宽但很矮的条状形象也合法。"""
+    parsed = from_dict(minimal_pack(size={'w': 1024, 'h': 64}))
+    assert parsed.size == {'w': 1024, 'h': 64}
+
+
+def test_frame_size_beyond_limit_is_rejected():
+    with pytest.raises(PetError) as info:
+        from_dict(minimal_pack(size={'w': 4096, 'h': 64}))
+    assert info.value.code == CODE_PACK_FIELD_INVALID
+    assert 'w' in info.value.msg
+
+
+def test_scale_and_pixelated_are_not_ignored_fields():
+    """新字段必须进已知字段表，否则会被记成「忽略的未知字段」。"""
+    parsed = from_dict(minimal_pack(scale=1.5, pixelated=True))
+    assert 'scale' not in parsed.ignored_fields
+    assert 'pixelated' not in parsed.ignored_fields

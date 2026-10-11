@@ -124,6 +124,49 @@ async function main() {
     });
     await sleep(600);
 
+    // ---- 准备一个**可写**的目标形象
+    //
+    // 插件自带的形象现在是严格只读的（用户要求），所以「换图 / 恢复 / 删除覆盖」
+    // 这一整条链必须在**用户自建**的形象上验。这里用新建接口造一个，
+    // 它同时也就是「用户能自己新建宠物」这条诉求的实证。
+    const target = await page.evaluate(`(async () => {
+      // 造一条 **2 帧**的水平 sheet（128×64 = 2 × 64px）。
+      //
+      // 必须是多帧：单帧形象的 rAF 循环会**正确地**停下来（省电设计），
+      // 那样后面 ⑮「宠物仍在活动」就无法用帧位变化来判定，
+      // 会把一个正确的省电行为误报成故障。
+      const canvas = document.createElement('canvas');
+      canvas.width = 128; canvas.height = 64;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ff7722';
+      ctx.fillRect(0, 0, 64, 64);
+      ctx.fillStyle = '#ffaa55';
+      ctx.fillRect(64, 0, 64, 64);
+      const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+
+      const form = new FormData();
+      form.append('name', '验收目标形象');
+      form.append('idle', blob, 'idle.png');
+      form.append('walk', blob, 'walk.png');
+      form.append('meta', JSON.stringify({ idle: { frames: 2, fps: 8 }, walk: { frames: 2, fps: 8 } }));
+      const response = await fetch('${API}/pets/create', { method: 'POST', body: form });
+      const body = await response.json();
+      if (!body.success) return { error: body.msg || '新建失败' };
+      return {
+        id: body.pet.id,
+        writable: body.pet.writable,
+        source: body.pet.source,
+        idleFrames: body.pet.actions.idle.frames,
+      };
+    })()`);
+    const TARGET = target.id || '';
+    record(
+      '⓪ 新建一个用户形象作为可写目标（自带形象只读）',
+      Boolean(TARGET) && target.writable === true && target.source === 'user'
+        && target.idleFrames === 2,
+      JSON.stringify(target),
+    );
+
     // ---- 基线
     const before = await page.evaluate(`(async () => {
       const data = await (await fetch('${API}/runtime')).json();
@@ -131,6 +174,11 @@ async function main() {
       return { url: idle.url, frameSource: idle.frameSource, petId: data.activePetId };
     })()`);
     const beforeVersion = versionOf(before.url);
+    record(
+      '⓪b 新建后它自动成为当前形象',
+      before.petId === TARGET,
+      `activePetId=${before.petId}，期望 ${TARGET}`,
+    );
 
     // ---- ① 打开设置面板
     const panelOpened = await page.evaluate(`(async () => {
@@ -234,7 +282,7 @@ async function main() {
     // 另外要**绕过浏览器缓存**：这个路由对不带 `?v=` 的请求会回源校验，
     // 但浏览器里仍可能命中上一次的响应。加 `cache: 'no-store'` 排除干扰。
     const pixel = await page.evaluate(`(async () => {
-      const response = await fetch('${API}/frame/default-cat/idle', { cache: 'no-store' });
+      const response = await fetch('${API}/frame/${TARGET}/idle', { cache: 'no-store' });
       const blob = await response.blob();
       const img = new Image();
       img.src = URL.createObjectURL(blob);
@@ -367,7 +415,7 @@ async function main() {
 
     // ---- ⑨ 预览接口标出「已自定」
     const preview = await page.evaluate(`(async () => {
-      const data = await (await fetch('${API}/pets/default-cat/preview')).json();
+      const data = await (await fetch('${API}/pets/${TARGET}/preview')).json();
       const idle = data.actions.find((item) => item.action === 'idle');
       return { overridden: idle.overridden, frameSource: idle.frameSource };
     })()`);
@@ -379,10 +427,10 @@ async function main() {
 
     // ---- ⑩ 删除覆盖 → 回落包内原图
     const cleared = await page.evaluate(`(async () => {
-      const idle = await fetch('${API}/pets/default-cat/actions/idle', { method: 'DELETE' });
+      const idle = await fetch('${API}/pets/${TARGET}/actions/idle', { method: 'DELETE' });
       const idleData = await idle.json();
       // 顺带清掉 walk 的覆盖，让这次验收**不留下痕迹**（可重复运行）
-      const walk = await fetch('${API}/pets/default-cat/actions/walk', { method: 'DELETE' });
+      const walk = await fetch('${API}/pets/${TARGET}/actions/walk', { method: 'DELETE' });
       const walkData = await walk.json();
       return {
         success: idleData.success,
@@ -392,8 +440,10 @@ async function main() {
       };
     })()`);
     record(
+      // 目标是**用户自建**形象，因此删掉覆盖后回落到 `pack`（包内自带）。
+      // `builtin` 只会出现在插件自带的形象上，而那些形象现在根本不接受覆盖。
       '⑩ 删除覆盖后回落到包内原图（两个动作都清理，验收可重复运行）',
-      cleared.removed === true && cleared.source === 'builtin' && cleared.walkRemoved === true,
+      cleared.removed === true && cleared.source === 'pack' && cleared.walkRemoved === true,
       JSON.stringify(cleared),
     );
 
@@ -415,7 +465,7 @@ async function main() {
     const fake = await page.evaluate(`(async () => {
       const form = new FormData();
       form.append('file', new Blob(['%PDF-1.4 fake content'], { type: 'image/png' }), 'evil.png');
-      const response = await fetch('${API}/pets/default-cat/actions/walk', {
+      const response = await fetch('${API}/pets/${TARGET}/actions/walk', {
         method: 'POST', body: form,
       });
       return { status: response.status, body: await response.json() };
@@ -434,7 +484,7 @@ async function main() {
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
       const form = new FormData();
       form.append('file', blob, 'huge.png');
-      const response = await fetch('${API}/pets/default-cat/actions/walk', {
+      const response = await fetch('${API}/pets/${TARGET}/actions/walk', {
         method: 'POST', body: form,
       });
       return { status: response.status, body: await response.json(), bytes: blob.size };
@@ -447,7 +497,7 @@ async function main() {
 
     // ---- ⑬ 路径穿越（动作名）
     const traversal = await page.evaluate(`(async () => {
-      const response = await fetch('${API}/pets/default-cat/actions/' + encodeURIComponent('../evil'), {
+      const response = await fetch('${API}/pets/${TARGET}/actions/' + encodeURIComponent('../evil'), {
         method: 'DELETE',
       });
       return { status: response.status };
@@ -459,17 +509,31 @@ async function main() {
     );
 
     // ---- ⑭ 宠物在所有这些操作后仍然活着
+    //
+    // ⚠️ 采样**不能只取两点**。第一版是「隔 800ms 采两次，要求不同」，
+    // 这在 2 帧动画上会**碰运气**：动画周期恰好是采样间隔的整数倍时，
+    // 两次落在同一帧上，于是一个完全正常的宠物被误报成「卡住不动」。
+    // （实测就是这样：⑮ 时好时坏，而产品一直是对的。）
+    // 改为多采几次、要求出现 ≥2 个不同帧位。
     const alive = await page.evaluate(`(async () => {
       const root = document.querySelector('[data-plugin="stm-pet"].pet-root');
-      const pos1 = getComputedStyle(root.querySelector('.pet-sprite')).backgroundPosition;
-      await new Promise((r) => setTimeout(r, 800));
-      const pos2 = getComputedStyle(root.querySelector('.pet-sprite')).backgroundPosition;
-      return { alive: Boolean(root), animating: pos1 !== pos2, action: root.dataset.petAction };
+      if (!root) return { alive: false };
+      const samples = [];
+      for (let i = 0; i < 10; i += 1) {
+        samples.push(getComputedStyle(root.querySelector('.pet-sprite')).backgroundPosition);
+        await new Promise((r) => setTimeout(r, 160));
+      }
+      return {
+        alive: true,
+        distinct: new Set(samples).size,
+        action: root.dataset.petAction,
+        throttle: root.dataset.petThrottle || '',
+      };
     })()`);
     record(
-      '⑮ 历经上传/删除/非法输入后宠物仍正常活动',
-      alive.alive && alive.animating,
-      JSON.stringify(alive),
+      '⑮ 历经上传/删除/非法输入后宠物仍正常活动（帧位在变化）',
+      alive.alive && alive.distinct >= 2,
+      `不同帧位=${alive.distinct}，action=${alive.action}，throttle=${alive.throttle}`,
     );
 
     // ---- ⑯ 「取消」也要回收文件输入（用户报障的直接机制）
@@ -541,6 +605,227 @@ async function main() {
         && leak.afterAll === leak.baselineAll,    // 宿主自己的输入没被误删
       ),
       JSON.stringify(leak),
+    );
+
+    // ---- ⑰ 内置形象严格只读（后端拒绝 + 面板不渲染编辑控件）
+    //
+    // 用户要求「插件自带的宠物不应该允许用户修改」。这条**必须**从两个层面验：
+    // ① 接口层真的拒绝（不能只靠 UI 藏按钮 —— 接口是公开的）；
+    // ② 面板上确实没有「换图 / 删除 / 导出」控件（不让用户点了才发现不行）。
+    const readonly = await page.evaluate(`(async () => {
+      // ① 接口层：**必须**指向插件自带的形象（default-cat），
+      //    而不是上面新建的可写目标——只有它才该被拒绝。
+      const form = new FormData();
+      form.append('file', new Blob([new Uint8Array([1,2,3])], { type: 'image/png' }), 'x.png');
+      const upload = await fetch('${API}/pets/default-cat/actions/walk', {
+        method: 'POST', body: form,
+      });
+      const uploadBody = await upload.json();
+      const exportRes = await fetch('${API}/pets/default-cat/export');
+      const exportBody = await exportRes.json();
+
+      // ② 面板层：切到内置形象，看控件
+      window.__petApi.surfaces.open('pet-settings', { source: 'verify-upload' });
+      await new Promise((r) => setTimeout(r, 1200));
+      // 用 data-pet-id 精确选中内置形象（靠文字匹配会在改名时失效）
+      const builtin = document.querySelector('.plugin-stm-pet .pet-card[data-pet-id="default-cat"]');
+      if (builtin) builtin.click();
+      await new Promise((r) => setTimeout(r, 900));
+      const panel = document.querySelector('.plugin-stm-pet.pet-panel');
+      const text = panel ? panel.textContent : '';
+      const buttons = Array.from(panel ? panel.querySelectorAll('button') : [])
+        .map((node) => node.textContent.trim());
+      return {
+        uploadStatus: upload.status,
+        uploadError: uploadBody.error,
+        exportStatus: exportRes.status,
+        exportError: exportBody.error,
+        hasSwapButton: buttons.some((t) => t.includes('换图')),
+        hasDeleteButton: buttons.some((t) => t === '删除'),
+        hasExportButton: buttons.some((t) => t.includes('导出')),
+        saysReadonly: text.includes('不可修改') || text.includes('只读') || text.includes('插件自带'),
+      };
+    })()`);
+    record(
+      '⑰ 内置形象严格只读：接口拒绝换图/导出，面板不渲染编辑控件',
+      readonly.uploadStatus === 403 && readonly.uploadError === 'builtin_readonly'
+        && readonly.exportStatus === 403 && readonly.exportError === 'builtin_no_export'
+        && !readonly.hasSwapButton && !readonly.hasDeleteButton && !readonly.hasExportButton
+        && readonly.saysReadonly,
+      JSON.stringify(readonly),
+    );
+
+    // ---- ⑱ 用户能自己新建形象（不需要 zip / pet.json）
+    const created = await page.evaluate(`(async () => {
+      // 造一张 128×64 的图 = 2 帧 × 64px
+      const canvas = document.createElement('canvas');
+      canvas.width = 128; canvas.height = 64;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#22cc88';
+      ctx.fillRect(0, 0, 64, 64);
+      ctx.fillStyle = '#8844ff';
+      ctx.fillRect(64, 0, 64, 64);
+      const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+
+      const form = new FormData();
+      form.append('name', '验收新形象');
+      form.append('scale', '1.5');
+      form.append('pixelated', '1');
+      form.append('idle', blob, 'idle.png');
+      form.append('meta', JSON.stringify({ idle: { frames: 2, fps: 6 } }));
+
+      const response = await fetch('${API}/pets/create', { method: 'POST', body: form });
+      const body = await response.json();
+      return {
+        status: response.status,
+        ok: body.success,
+        id: body.pet ? body.pet.id : '',
+        name: body.pet ? body.pet.name : '',
+        frames: body.pet ? body.pet.actions.idle.frames : 0,
+        size: body.pet ? body.pet.size : null,
+        scale: body.pet ? body.pet.scale : null,
+        pixelated: body.pet ? body.pet.pixelated : null,
+        writable: body.pet ? body.pet.writable : null,
+        error: body.error || '',
+      };
+    })()`);
+    record(
+      '⑱ 新建形象：两帧图被正确切分，尺寸从图推导，倍率/渲染方式生效',
+      created.ok && created.frames === 2 && created.size
+        && created.size.w === 64 && created.size.h === 64
+        && created.scale === 1.5 && created.pixelated === true
+        && created.writable === true,
+      JSON.stringify(created),
+    );
+
+    // ---- ⑲ 新形象立刻出现在屏幕上，且倍率改动**不必刷新页面**
+    //
+    // 这是用户诉求里最容易做错的一环：`petview` 的包围盒尺寸在构造时就定了，
+    // 只改配置不会生效。必须重建视图并保留位置。
+    //
+    // 必须走**面板上的真实滑块**（`input` → `change`），而不是直接 fetch 接口：
+    // 直接调接口插件并不知情，那属于「后台改设置」，测不出「用户拖滑块」这条路径。
+    const liveResize = await page.evaluate(`(async () => {
+      const root = () => document.querySelector('[data-plugin="stm-pet"].pet-root');
+
+      // ① 让目标形象成为**当前形象**（屏幕上跑的就是它）
+      await fetch('${API}/pets/active', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ petId: '${TARGET}' }),
+      });
+      // ② 让面板**选中**同一个形象。
+      //
+      // 这一步不能省：面板的滑块作用于「当前选中的形象」（selectedId），
+      // 而屏幕上跑的是「当前形象」（activePetId）。两者不一致时，
+      // 拖滑块改的是另一个形象——第一版就是这样，于是断言必然失败，
+      // 而产品其实是对的。⑰ 点过内置形象的卡片，所以这里必须显式切回来。
+      // （注意：这段注释里不能用反引号，它会提前结束外层模板字符串。）
+      window.__petApi.surfaces.close('pet-settings');
+      await new Promise((r) => setTimeout(r, 300));
+      window.__petApi.surfaces.open('pet-settings', { source: 'verify-upload' });
+      await new Promise((r) => setTimeout(r, 1500));
+
+      const card = document.querySelector('.plugin-stm-pet .pet-card[data-pet-id="${TARGET}"]');
+      if (!card) return { error: '面板里找不到目标形象的卡片' };
+      card.click();
+      await new Promise((r) => setTimeout(r, 1200));
+
+      const before = root().getBoundingClientRect();
+
+      // 拖滑块到 3×（真实用户路径：input 事件 → change 事件）
+      const slider = document.querySelector('.plugin-stm-pet .pet-slider');
+      if (!slider) return { error: '找不到大小倍率滑块' };
+      slider.value = '3';
+      slider.dispatchEvent(new Event('input', { bubbles: true }));
+      slider.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 2500));
+
+      const after = root().getBoundingClientRect();
+      const data = await (await fetch('${API}/runtime')).json();
+      return {
+        scale: data.pet.scale,
+        petId: data.pet.id,
+        beforeW: Math.round(before.width),
+        afterW: Math.round(after.width),
+        // 位置不该因为改大小而跳到别处（用户拖好的位置要留住）
+        moved: Math.round(Math.abs(after.x - before.x) + Math.abs(after.y - before.y)),
+      };
+    })()`);
+    record(
+      '⑲ 拖面板滑块改倍率 → 运行中的宠物立刻变大（不必刷新页面）',
+      liveResize.scale === 3 && liveResize.petId === TARGET
+        && liveResize.afterW > liveResize.beforeW,
+      `宽度 ${liveResize.beforeW} → ${liveResize.afterW}，scale=${liveResize.scale}，`
+      + `pet=${liveResize.petId}，位移=${liveResize.moved}px`,
+    );
+
+    // ---- ⑳ 渲染方式真的落到 DOM（像素风开关不是摆设）
+    //
+    // 原 bug：CSS 有 `[data-pet-pixelated="false"]` 规则，但 JS 从未设置该属性，
+    // 于是像素风恒开、写实插画放大后出现块状边缘。
+    // 这里走面板上的「平滑」按钮（真实用户路径）。
+    const rendering = await page.evaluate(`(async () => {
+      const root = () => document.querySelector('[data-plugin="stm-pet"].pet-root');
+      const rendering = () => getComputedStyle(root().querySelector('.pet-sprite')).imageRendering;
+
+      // 面板此刻已选中目标形象（见 ⑲），且它是当前形象——两边一致才能断言 DOM
+      const smooth = Array.from(document.querySelectorAll('.plugin-stm-pet .pet-choice'))
+        .find((node) => node.textContent.includes('平滑'));
+      if (!smooth) return { error: '找不到「平滑」渲染方式按钮' };
+      smooth.click();
+      await new Promise((r) => setTimeout(r, 2500));
+
+      const off = { attr: root().dataset.petPixelated, rendering: rendering() };
+
+      // 再切回像素风，确认开关是双向的
+      const pixel = Array.from(document.querySelectorAll('.plugin-stm-pet .pet-choice'))
+        .find((node) => node.textContent.includes('像素风'));
+      if (pixel) {
+        pixel.click();
+        await new Promise((r) => setTimeout(r, 2500));
+      }
+      return {
+        offAttr: off.attr, offRendering: off.rendering,
+        onAttr: root().dataset.petPixelated, onRendering: rendering(),
+      };
+    })()`);
+    record(
+      '⑳ 渲染方式写入 data 属性并影响 image-rendering（像素风不再恒开，可双向切换）',
+      rendering.offAttr === 'false' && rendering.offRendering === 'auto'
+        && rendering.onAttr === 'true' && rendering.onRendering === 'pixelated',
+      JSON.stringify(rendering),
+    );
+
+    // ---- ㉑ 清理：把验收造出来的形象删掉（脚本可重复运行）
+    //
+    // 两个名字都要清：⓪ 建的可写目标与 ⑱ 建的多帧形象。
+    // 漏掉任何一个，脚本第二次跑就会因为「同名形象越来越多」而变得难以诊断。
+    const cleanup = await page.evaluate(`(async () => {
+      const NAMES = ['验收目标形象', '验收新形象'];
+      const data = await (await fetch('${API}/pets')).json();
+      const mine = (data.items || []).filter((item) => NAMES.includes(item.name));
+      const results = [];
+      for (const pet of mine) {
+        const response = await fetch('${API}/pets/' + pet.id, { method: 'DELETE' });
+        results.push((await response.json()).success);
+      }
+      // 回到内置形象，让环境回到初始状态
+      await fetch('${API}/pets/active', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ petId: 'default-cat' }),
+      });
+      const after = await (await fetch('${API}/pets')).json();
+      return {
+        deleted: results.length,
+        remaining: (after.items || []).filter((i) => NAMES.includes(i.name)).length,
+        active: after.activePetId,
+      };
+    })()`);
+    record(
+      '㉑ 验收可重复运行：造出来的形象被清理，当前形象回到内置',
+      cleanup.remaining === 0 && cleanup.active === 'default-cat',
+      JSON.stringify(cleanup),
     );
 
     process.stdout.write(`\n${'='.repeat(70)}\n`);

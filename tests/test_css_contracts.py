@@ -258,6 +258,130 @@ def test_ambient_content_uses_absolute_positioning(css_body):
     assert re.search(r'position\s*:\s*absolute', css_body)
 
 
+# ------------------------------------------------------- 渲染方式（真实踩过）
+
+
+def test_sprite_defaults_to_smooth_rendering(css_body):
+    """★ `.pet-sprite` 的**默认**必须是平滑插值，不能恒开像素风。
+
+    真实踩过的坑：这里原本写死 `image-rendering: pixelated`，而 JS 从未设置过
+    `data-pet-pixelated` —— 于是那条 `="false"` 的规则**永不生效**，像素风恒开。
+    用户把倍率调到 2× 以上时，写实插画 / 真人立绘会出现块状边缘。
+
+    默认值必须反过来（auto），由 JS 按「包内声明 / 用户设置」显式打开硬边。
+    """
+    match = re.search(
+        r'\[data-plugin="stm-pet"\] \.pet-sprite\s*,\s*'
+        r'\.plugin-stm-pet \.pet-sprite\s*\{([^}]*)\}',
+        css_body,
+    )
+    assert match, '找不到 .pet-sprite 的基础规则'
+    body = match.group(1)
+    assert 'image-rendering: auto' in body, (
+        '.pet-sprite 默认应为 image-rendering: auto（写实插画放大时不该有硬边）'
+    )
+    assert 'pixelated' not in body, (
+        '.pet-sprite 上不得写死 pixelated —— 那会让写实插画出现块状边缘'
+    )
+
+
+def test_pixelated_is_opt_in_via_data_attribute(css_body):
+    """像素风由 `data-pet-pixelated="true"` 选择器打开（而不是恒开）。"""
+    assert 'data-pet-pixelated="true"' in css_body, (
+        '必须有 [data-pet-pixelated="true"] .pet-sprite { image-rendering: pixelated }'
+    )
+    match = re.search(
+        r'\[data-plugin="stm-pet"\]\[data-pet-pixelated="true"\] \.pet-sprite[^{]*\{([^}]*)\}',
+        css_body,
+    )
+    assert match and 'pixelated' in match.group(1)
+
+
+def test_js_sets_the_pixelated_data_attribute():
+    """★ JS 必须**真的**写这个属性，否则上面的 CSS 规则永不生效。
+
+    这正是原来的 bug：CSS 里有 `="false"` 规则，但没有任何代码设置该属性。
+    """
+    source = read(os.path.join(REPO_ROOT, 'frontend', 'petview.js'))
+    assert 'dataset.petPixelated' in source, (
+        'petview.js 必须设置 root.dataset.petPixelated，否则渲染方式规则永不生效'
+    )
+    assert "'true'" in source and "'false'" in source
+
+
+def test_frontend_scale_range_matches_backend():
+    """★ 前端滑块的区间必须与后端校验区间一致，否则会出现「拖到了却存不下」。
+
+    后端权威定义在 `backend/core/pack.py:SCALE_RANGE`。
+    比较用**数值**而不是字符串：JS 里写 `4`、Python 里写 `4.0`，两者等价。
+    """
+    import json as _json
+
+    backend = read(os.path.join(REPO_ROOT, 'backend', 'core', 'pack.py'))
+    match = re.search(r'SCALE_RANGE\s*=\s*\(([^)]*)\)', backend)
+    assert match, '找不到 SCALE_RANGE'
+    low, high = [float(part.strip()) for part in match.group(1).split(',')]
+
+    def declared(source: str, name: str) -> float:
+        found = re.search(rf'{name}\s*=\s*([0-9.]+)', source)
+        assert found, f'找不到 {name}'
+        return float(found.group(1))
+
+    for filename in ('panel.js', 'petview.js'):
+        source = read(os.path.join(REPO_ROOT, 'frontend', filename))
+        assert declared(source, 'SCALE_MIN') == low, f'{filename} 的 SCALE_MIN 应为 {low}'
+        assert declared(source, 'SCALE_MAX') == high, f'{filename} 的 SCALE_MAX 应为 {high}'
+
+    with open(os.path.join(REPO_ROOT, 'manifest.json'), encoding='utf-8') as handle:
+        schema = _json.load(handle)['config_schema']['properties']['scale']
+    assert float(schema['minimum']) == low and float(schema['maximum']) == high, (
+        'manifest 的 scale 区间要与 SCALE_RANGE 一致'
+    )
+
+
+def test_panel_never_renders_edit_controls_for_readonly_pets():
+    """★ 内置形象（只读）不得渲染「换图 / 恢复 / 删除 / 导出」控件。
+
+    后端也会拒绝（403），但 UI 上就不该出现——否则用户点了才发现不行。
+    """
+    source = strip_comments(read(os.path.join(REPO_ROOT, 'frontend', 'panel.js')))
+    assert 'detail.writable' in source, 'panel.js 必须按 detail.writable 决定是否渲染编辑控件'
+
+    export_index = source.index("button('导出形象包'")
+    assert source.rindex('detail.writable', 0, export_index) != -1, (
+        '「导出形象包」必须包在 detail.writable 判断里'
+    )
+    delete_index = source.index("button('删除'")
+    assert source.rindex('detail.writable', 0, delete_index) != -1, (
+        '「删除」必须包在 detail.writable 判断里'
+    )
+
+
+def test_download_link_is_hidden_inline():
+    """★ 导出用的 `<a download>` 也必须**内联**隐藏。
+
+    它与 `.pet-file-input` 是同一个坑：节点挂在 `document.body` 下，
+    而作用域 CSS 选择器匹配不到 body 下的裸节点。
+    """
+    source = read(os.path.join(REPO_ROOT, 'frontend', 'panel.js'))
+    start = source.index('function exportPet')
+    section = source[start:source.index('\n  }\n', start)]
+    assert "style.position = 'absolute'" in section
+    assert "style.left = '-9999px'" in section
+    assert "style.opacity = '0'" in section
+    assert 'removeChild(link)' in section or 'link.remove()' in section, (
+        '触发下载后要回收节点，否则每导出一次多一个 <a>'
+    )
+
+
+def test_panel_has_create_form():
+    """用户能自己新建形象（本次的核心诉求之一）。"""
+    source = read(os.path.join(REPO_ROOT, 'frontend', 'panel.js'))
+    assert 'function renderCreate' in source, 'panel.js 必须有新建形象表单'
+    assert "call('/pets/create'" in source, '必须调用新建接口'
+    assert "'新建形象'" in source, '工具栏要有「新建形象」入口'
+
+
 # ------------------------------------------------------- 文件输入（真实踩过）
 
 

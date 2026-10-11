@@ -46,9 +46,13 @@ from datetime import datetime, timezone
 
 from .errors import (
     CODE_ARCHIVE_INVALID,
+    CODE_BUILTIN_NO_EXPORT,
+    CODE_BUILTIN_READONLY,
     CODE_DELETE_FAILED,
     CODE_FILE_TOO_LARGE,
     CODE_IMAGE_INVALID,
+    CODE_PACK_ANIMATION_MISSING,
+    CODE_PACK_IDLE_MISSING,
     CODE_PACK_NOT_FOUND,
     CODE_WRITE_FAILED,
     PetError,
@@ -58,6 +62,7 @@ from .imports import (
     MAX_PACK_BYTES,
     check_size,
     load_image,
+    prepare_sheet,
     process_upload,
     sniff_format,
     write_bytes_atomic,
@@ -65,9 +70,12 @@ from .imports import (
 from .pack import (
     ACTION_FALLBACKS,
     ALLOWED_SHEET_EXTENSIONS,
+    DEFAULT_SCALE,
     IMPORT_SOURCE_EXTENSIONS,
     KIND_ANIMATED,
+    ONE_SHOT_ACTIONS,
     PetPack,
+    SCALE_RANGE,
     loads as loads_pack,
 )
 from .paths import is_action_name, is_safe_relative_name, safe_join, to_posix
@@ -90,11 +98,23 @@ MAX_ARCHIVE_ENTRIES = 2048
 DEFAULT_SETTINGS = {
     # 只放**插件私有**的结构化状态。
     #
-    # 标量开关（勿扰、播报、大小倍率…）声明在 manifest 的 `config_schema` 里，
+    # 标量开关（勿扰、播报…）声明在 manifest 的 `config_schema` 里，
     # 由宿主的插件设置表单渲染、由 `api.get_config()/set_config()` 读写。
     # 两边都存一份会造成「改了宿主表单但插件不生效」这类双写不同步的 bug，
-    # 所以这里只留宿主表单表达不了的东西：当前形象 id 与包列表。
+    # 所以这里只留宿主表单表达不了的东西：当前形象 id、包列表、逐形象倍率。
     'activePetId': '',
+    #: 逐形象的**大小倍率**覆盖：`{pet_id: float}`。
+    #:
+    #: 为什么不能只靠 manifest 里的全局 `scale`：用户明确要求「二次元形象和真人
+    #: 形象所需的大小不同」——一个全局倍率意味着换形象就得重调。宿主表单表达不了
+    #: 「每个形象一个值」（`config_schema` 只支持标量），所以落在这里。
+    #: 优先级见 `effective_scale()`：用户设置 > 包内声明 > 宿主表单默认值。
+    'petScales': {},
+    #: 逐形象的**像素风渲染**覆盖：`{pet_id: bool}`。
+    #:
+    #: 与 `petScales` 同样的道理：像素风与写实插画对放大方式的要求**互斥**
+    #: （前者要硬边、后者要平滑），包能声明默认值，用户还能按自己屏幕覆盖。
+    'petPixelated': {},
 }
 
 #: manifest `config_schema` 里的标量键 → 前端运行期配置的键名。
@@ -109,6 +129,9 @@ CONFIG_KEYS = (
     'sleep_after',
 )
 
+#: 倍率区间的**兜底**（权威定义在 `pack.SCALE_RANGE`，这里只是取用）。
+SCALE_MIN, SCALE_MAX = SCALE_RANGE
+
 #: 图片在包里的扩展名（与 `pack.ALLOWED_SHEET_EXTENSIONS` 同源）。
 #: 这是**落盘后**的严格集合，用于扫描 `overrides/` 之类「一定是最终格式」的目录。
 _IMAGE_EXTENSIONS = tuple(sorted(ALLOWED_SHEET_EXTENSIONS))
@@ -120,6 +143,22 @@ _IMPORT_EXTENSIONS = tuple(sorted(ALLOWED_SHEET_EXTENSIONS | IMPORT_SOURCE_EXTEN
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def clamp_scale(value) -> float:
+    """把一个倍率夹到合法区间内。
+
+    非法输入（`None` / 字符串 / `NaN`）回落到 `DEFAULT_SCALE`，而不是抛错：
+    这个值会被**每个请求**读到（运行期定义里要带上它），为它抛错会让
+    「设置文件里有个脏值」变成「整个形象列表打不开」。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SCALE
+    if number != number:  # NaN
+        return DEFAULT_SCALE
+    return round(min(max(number, SCALE_MIN), SCALE_MAX), 3)
 
 
 def sanitize_pet_id(raw, *, fallback: str = 'pet') -> str:
@@ -201,11 +240,43 @@ class PetStore:
     def _is_builtin_pet(self, pet_id: str) -> bool:
         return os.path.isfile(os.path.join(self.builtin_pet_dir(pet_id), MANIFEST_FILENAME))
 
+    def _is_builtin_only(self, pet_id: str) -> bool:
+        """这个 id 是否**只能**由内置包提供（即用户没有同 id 的自建包）。
+
+        用户要求「插件自带的宠物不允许修改」。判定必须用「有没有自己的 pet.json」
+        而不是「id 在不在内置目录里」——用户完全可能自建一个与内置同 id 的形象
+        （`import_zip` 会主动避让内置 id，但手放目录仍可能撞上），
+        那种情况下用户那份是**可改**的。
+
+        注意与 `_is_user_pet` 的区别：那个只回答「有没有用户包」，
+        在用户包缺失时返回 False，因此不能直接取反（内置形象也返回 False）。
+        """
+        return self._is_builtin_pet(pet_id) and not self._is_user_pet(pet_id)
+
+    def assert_writable(self, pet_id: str) -> str:
+        """确认某形象**可写**；内置形象抛结构化错误。
+
+        所有「改形象」的入口都先过这一关，而不是只在 UI 上藏按钮——
+        接口是公开的，UI 藏了不代表改不了。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        if self._is_builtin_only(pet_id):
+            raise PetError(
+                CODE_BUILTIN_READONLY,
+                f'内置形象不可修改: {pet_id}',
+                user_msg='这是插件自带的形象，不能修改。',
+                hint='想改的话，先「另存为自建形象」或直接新建一个自己的形象。',
+                http_status=403,
+            )
+        return pet_id
+
     # ------------------------------------------------------------ 设置
 
     def get_settings(self) -> dict:
         """读插件自己的设置；文件缺失/损坏时回落到默认值（不抛错）。"""
         settings = dict(DEFAULT_SETTINGS)
+        settings['petScales'] = {}
+        settings['petPixelated'] = {}
         path = self.settings_path()
         if not os.path.isfile(path):
             return settings
@@ -219,7 +290,43 @@ class PetStore:
             for key, value in stored.items():
                 if key in DEFAULT_SETTINGS:
                     settings[key] = value
+        # 两个结构化项必须逐条清洗：
+        # 手工编辑过 / 旧版本写坏的值不能让整个设置读不出来。
+        settings['petScales'] = self._clean_scale_map(settings.get('petScales'))
+        settings['petPixelated'] = self._clean_bool_map(settings.get('petPixelated'))
         return settings
+
+    @staticmethod
+    def _clean_bool_map(raw) -> dict:
+        """把 `{pet_id: bool}` 清洗成「合法 id → 布尔值」。"""
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for key, value in raw.items():
+            pet_id = sanitize_pet_id(key, fallback='')
+            if not pet_id or not isinstance(value, bool):
+                continue
+            cleaned[pet_id] = value
+        return cleaned
+
+    @staticmethod
+    def _clean_scale_map(raw) -> dict:
+        """把 `{pet_id: 倍率}` 清洗成「合法 id → 夹过的倍率」。"""
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for key, value in raw.items():
+            pet_id = sanitize_pet_id(key, fallback='')
+            if not pet_id:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number != number:  # NaN
+                continue
+            cleaned[pet_id] = clamp_scale(number)
+        return cleaned
 
     def update_settings(self, patch: dict) -> dict:
         """浅合并写入设置（未知键忽略；写入失败抛结构化错误）。"""
@@ -229,10 +336,113 @@ class PetStore:
         with self._lock:
             settings = self.get_settings()
             for key, value in patch.items():
-                if key in DEFAULT_SETTINGS:
+                if key not in DEFAULT_SETTINGS:
+                    continue
+                if key == 'petScales':
+                    settings[key] = self._clean_scale_map(value)
+                elif key == 'petPixelated':
+                    settings[key] = self._clean_bool_map(value)
+                else:
                     settings[key] = value
             self._write_json(self.settings_path(), settings)
             return settings
+
+    # ------------------------------------------------------------ 倍率
+
+    def effective_scale(self, pet_id: str, *, host_default: float = None) -> float:
+        """算出某形象**实际生效**的大小倍率。
+
+        优先级（用户明确要求「不同形象需要的大小不同」）：
+        1. **用户设置** `settings.petScales[<id>]` —— 用户在面板上拖的滑块；
+        2. **包内声明** `pet.json` 的 `scale` —— 作者认为这个形象适合多大；
+        3. **宿主表单默认值** `host_default`（manifest 的 `scale`）—— 全局兜底。
+
+        Args:
+            pet_id: 形象 id。
+            host_default: 宿主 `config_schema` 里的 `scale` 值；`None` 时用
+                `DEFAULT_SCALE`。**由调用方传入**是因为标量配置的唯一来源是宿主，
+                store 不该自己去读（它没有 api）。
+
+        Returns:
+            float: 夹在 `SCALE_RANGE` 内的倍率。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        stored = self.get_settings().get('petScales') or {}
+        if pet_id in stored:
+            return clamp_scale(stored[pet_id])
+        try:
+            pack = self.load_pack(pet_id)
+            declared = float(pack.scale)
+            # 包内声明了非 1.0 的值就用它；1.0 视为「没意见」，继续往全局兜底
+            if declared != DEFAULT_SCALE:
+                return clamp_scale(declared)
+        except PetError:
+            pass
+        return clamp_scale(host_default if host_default is not None else DEFAULT_SCALE)
+
+    def set_pet_scale(self, pet_id: str, value) -> float:
+        """写入某形象的倍率覆盖（不校验形象是否存在——由调用方决定）。"""
+        pet_id = sanitize_pet_id(pet_id)
+        scale = clamp_scale(value)
+        with self._lock:
+            settings = self.get_settings()
+            scales = dict(settings.get('petScales') or {})
+            scales[pet_id] = scale
+            settings['petScales'] = scales
+            self._write_json(self.settings_path(), settings)
+        return scale
+
+    def clear_pet_scale(self, pet_id: str) -> bool:
+        """删掉某形象的倍率覆盖（回落到包内声明 / 全局默认）。"""
+        pet_id = sanitize_pet_id(pet_id)
+        with self._lock:
+            settings = self.get_settings()
+            scales = dict(settings.get('petScales') or {})
+            if pet_id not in scales:
+                return False
+            del scales[pet_id]
+            settings['petScales'] = scales
+            self._write_json(self.settings_path(), settings)
+        return True
+
+    def effective_pixelated(self, pet_id: str) -> bool:
+        """算出某形象**实际生效**的渲染方式（像素风 or 平滑插值）。
+
+        优先级与倍率一致：用户设置 > 包内声明 > 默认（平滑）。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        stored = self.get_settings().get('petPixelated') or {}
+        if pet_id in stored:
+            return bool(stored[pet_id])
+        try:
+            return bool(self.load_pack(pet_id).pixelated)
+        except PetError:
+            return DEFAULT_PIXELATED
+
+    def set_pet_pixelated(self, pet_id: str, value) -> bool:
+        """写入某形象的渲染方式覆盖。"""
+        pet_id = sanitize_pet_id(pet_id)
+        flag = bool(value)
+        with self._lock:
+            settings = self.get_settings()
+            flags = dict(settings.get('petPixelated') or {})
+            flags[pet_id] = flag
+            settings['petPixelated'] = flags
+            self._write_json(self.settings_path(), settings)
+        return flag
+
+    def clear_pet_pixelated(self, pet_id: str) -> bool:
+        """删掉某形象的渲染方式覆盖（回落到包内声明 / 默认）。"""
+        pet_id = sanitize_pet_id(pet_id)
+        with self._lock:
+            settings = self.get_settings()
+            flags = dict(settings.get('petPixelated') or {})
+            if pet_id not in flags:
+                return False
+            del flags[pet_id]
+            settings['petPixelated'] = flags
+            self._write_json(self.settings_path(), settings)
+        return True
 
     def _write_json(self, path: str, payload: dict) -> None:
         """UTF-8（`ensure_ascii=False`）+ 原子落盘。"""
@@ -335,6 +545,7 @@ class PetStore:
             'animations': [],
             'missingRequired': [],
             'overrides': self._overridden_actions(pet_id),
+            'staleOverrides': [],
             'error': '',
         }
         try:
@@ -343,12 +554,20 @@ class PetStore:
             base['error'] = exc.user_msg or exc.msg
             return base
 
+        builtin_only = self._is_builtin_only(pet_id)
         base.update({
             'name': pack.name,
             'author': pack.author,
             'size': dict(pack.size),
             'animations': sorted(pack.animations),
             'missingRequired': pack.missing_required(),
+            # 列表也要带上生效值，否则面板切形象时得等详情接口回来才知道大小
+            'scale': self.effective_scale(pet_id),
+            'pixelated': self.effective_pixelated(pet_id),
+            'declaredScale': clamp_scale(pack.scale),
+            'declaredPixelated': bool(pack.pixelated),
+            'writable': not builtin_only,
+            'staleOverrides': base['overrides'] if builtin_only else [],
         })
         return base
 
@@ -415,6 +634,10 @@ class PetStore:
             `(absolute_path, source)`；`source` ∈ `{'override', 'pack', 'builtin'}`。
             该动作没有可用图时返回 `('', 'none')`。
 
+        **内置形象只读**（用户要求「插件自带的宠物不应该允许用户修改」）：
+        内置形象的解析**直接跳过 `overrides/`**，因此磁盘上遗留的覆盖文件
+        不会生效（面板会提示并提供一键清理，见 `list_pet_overrides`）。
+
         Raises:
             PetError: 路径非法。
         """
@@ -429,12 +652,14 @@ class PetStore:
             )
 
         user_dir = self.user_pet_dir(pet_id)
-        # 1) 单动作覆盖
-        override_dir = os.path.join(user_dir, OVERRIDES_DIRNAME)
-        for extension in _IMAGE_EXTENSIONS:
-            candidate = os.path.join(override_dir, f'{action}{extension}')
-            if os.path.isfile(candidate):
-                return candidate, 'override'
+        # 1) 单动作覆盖 —— 只对**用户形象**生效。内置形象不读覆盖目录，
+        #    否则「不可修改」就只是 UI 层面的假象。
+        if not self._is_builtin_only(pet_id):
+            override_dir = os.path.join(user_dir, OVERRIDES_DIRNAME)
+            for extension in _IMAGE_EXTENSIONS:
+                candidate = os.path.join(override_dir, f'{action}{extension}')
+                if os.path.isfile(candidate):
+                    return candidate, 'override'
 
         # 2)/3) 包内自带：用户包优先，然后内置包
         pack = None
@@ -458,11 +683,17 @@ class PetStore:
                 return real, source
         return '', 'none'
 
-    def runtime_pack(self, pet_id: str = '') -> dict:
+    def runtime_pack(self, pet_id: str = '', *, host_default_scale: float = None) -> dict:
         """给前端的**运行期形象**：已解析好的 URL + 回退结论。
 
         前端不做回退决策——回退链是后端领域模型（§3.3 是契约），
         前端只按 `actions[<name>]` 里给的结论播帧。
+
+        Args:
+            pet_id: 形象 id；空串表示用当前形象。
+            host_default_scale: 宿主 `config_schema` 里 `scale` 的值，作为
+                倍率的全局兜底。标量配置的唯一来源是宿主，store 不自己读，
+                因此由路由层传进来。
         """
         pet_id = sanitize_pet_id(pet_id) if pet_id else self.active_pet_id()
         if not pet_id:
@@ -514,6 +745,13 @@ class PetStore:
                 entry['note'] = '这张图在形象包里找不到，将只移动位置、不播放动画。'
             actions[action] = entry
 
+        # 「遗留覆盖」：内置形象磁盘上有覆盖文件、但按只读规则**不生效**。
+        # 必须显式报出来，否则用户看到的是「我明明换过图，怎么没变」——
+        # 静默忽略比报错更难查。面板据此给出「一键清理」。
+        stale_overrides = []
+        if self._is_builtin_only(pet_id):
+            stale_overrides = self._overridden_actions(pet_id)
+
         return {
             'id': pet_id,
             'source': source,
@@ -522,9 +760,18 @@ class PetStore:
             'size': dict(pack.size),
             'anchor': dict(pack.anchor),
             'physics': dict(pack.physics),
+            # 生效值（已按「用户设置 > 包内声明 > 默认」算好）——前端直接用，
+            # 不再自己判断优先级，避免两边规则不一致。
+            'scale': self.effective_scale(pet_id, host_default=host_default_scale),
+            'pixelated': self.effective_pixelated(pet_id),
+            # 包内声明值，供面板显示「作者建议 / 已覆盖」的对比
+            'declaredScale': clamp_scale(pack.scale),
+            'declaredPixelated': bool(pack.pixelated),
+            'writable': not self._is_builtin_only(pet_id),
             'actions': actions,
             'missingRequired': pack.missing_required(),
             'overrides': self._overridden_actions(pet_id),
+            'staleOverrides': stale_overrides,
             'directory': to_posix(os.path.relpath(directory, self.data_dir))
             if source == 'user' else '',
         }
@@ -625,6 +872,203 @@ class PetStore:
 
         logger.info('导入形象包 %s（%d 张图）', pet_id, written)
         return self.runtime_pack(pet_id)
+
+    # ------------------------------------------------------------ 新建形象
+
+    def create_pet(
+        self,
+        name: str,
+        frames: dict,
+        *,
+        pet_id: str = '',
+        author: str = '',
+        scale=None,
+        pixelated=None,
+        anchor: dict = None,
+        physics: dict = None,
+    ) -> dict:
+        """**从零新建**一个用户形象（不需要用户手写 pet.json 或打 zip）。
+
+        这是「用户能自己新建宠物」的实现。用户只需要给每个动作一张图，
+        尺寸由第一张图（通常是 idle）推导，其余动作自动对齐到同一单帧尺寸——
+        否则前端按同一 `width`/`height` 切帧，尺寸不一致的 sheet 会错位。
+
+        Args:
+            name: 形象显示名。
+            frames: `{动作名: {'data': bytes, 'frames': int, 'fps': int,
+                'loop': bool}}`。至少要有 `idle`。
+            pet_id: 想要的 id；空串则从 `name` 推导。与现有形象冲突时自动改名。
+            author: 作者署名（可选）。
+            scale: 自带倍率（可选）。
+            pixelated: 是否像素风（可选）。
+            anchor: 锚点（可选）。
+            physics: 物理参数（可选）。
+
+        Returns:
+            dict: `runtime_pack()` 的结果（新建后可直接切过去）。
+
+        Raises:
+            PetError: 没有 idle / 图非法 / 尺寸推导失败 / 落盘失败。
+        """
+        if not isinstance(frames, dict) or not frames:
+            raise PetError(
+                CODE_PACK_ANIMATION_MISSING,
+                '新建形象时没有提供任何动作',
+                user_msg='至少要给「待机」动作上传一张图。',
+                hint='待机（idle）是唯一必须的动作，其它动作缺失时会回退到它。',
+            )
+
+        # 动作名先全部校验：任何一个非法就整体拒绝，不落半成品
+        cleaned = {}
+        for action, spec in frames.items():
+            action_name = str(action or '').strip()
+            if not is_action_name(action_name):
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'动作名非法: {action_name!r}',
+                    user_msg='动作名不合法。',
+                    hint='动作名只能是字母、数字、下划线或连字符。',
+                )
+            if not isinstance(spec, dict) or not spec.get('data'):
+                continue
+            cleaned[action_name] = spec
+
+        if not cleaned:
+            raise PetError(
+                CODE_PACK_ANIMATION_MISSING,
+                '新建形象时没有提供任何图片',
+                user_msg='至少要给「待机」动作上传一张图。',
+                hint='待机（idle）是唯一必须的动作。',
+            )
+        if 'idle' not in cleaned:
+            available = '、'.join(sorted(cleaned)) or '（无）'
+            raise PetError(
+                CODE_PACK_IDLE_MISSING,
+                '新建形象缺少 idle 动作',
+                user_msg=f'缺少最基本的「待机」动作（当前只给了：{available}）。',
+                hint='「待机」是唯一必须的动作：其它动作缺失都会回退到它。',
+            )
+
+        # 先用 idle 推导单帧尺寸，其余动作统一对齐到它。
+        # 顺序很重要：如果每个动作各自推导，混排的图会得到不同的单帧尺寸。
+        processed = {}
+        frame_size = None
+        for action, spec in cleaned.items():
+            try:
+                count = int(spec.get('frames') or 1)
+            except (TypeError, ValueError):
+                count = 1
+            outcome = prepare_sheet(
+                spec['data'],
+                frames=count,
+                frame_size=frame_size,
+                what=f'「{action}」动作的图',
+            )
+            if frame_size is None:
+                frame_size = outcome['frame_size']
+            processed[action] = outcome
+
+        # ---- 组装 pet.json ----
+        manifest = {
+            'format': 1,
+            'id': '',  # 下面分配
+            'name': str(name or '').strip() or '我的宠物',
+            'size': {'w': int(frame_size[0]), 'h': int(frame_size[1])},
+            'animations': {},
+        }
+        if author:
+            manifest['author'] = str(author).strip()
+        if anchor is not None:
+            manifest['anchor'] = anchor
+        if physics is not None:
+            manifest['physics'] = physics
+        if scale is not None:
+            manifest['scale'] = clamp_scale(scale)
+        if pixelated is not None:
+            manifest['pixelated'] = bool(pixelated)
+
+        for action, outcome in processed.items():
+            spec = cleaned[action]
+            extension = outcome['extension']
+            sheet_name = f'{action}{extension}'
+            try:
+                fps = int(spec.get('fps') or 0)
+            except (TypeError, ValueError):
+                fps = 0
+            entry = {'sheet': sheet_name, 'frames': outcome['frames']}
+            if fps > 0:
+                entry['fps'] = fps
+            if action in ONE_SHOT_ACTIONS:
+                # 一次性动作不循环（与包格式的默认值一致）
+                entry['loop'] = False
+            elif spec.get('loop') is not None:
+                entry['loop'] = bool(spec['loop'])
+            manifest['animations'][action] = entry
+
+        # 先整体校验一遍（复用包格式的规则，避免写出一份自己都读不了的包）
+        loads_pack(
+            json.dumps(manifest, ensure_ascii=False).encode('utf-8'),
+            pack_id=sanitize_pet_id(pet_id or name or 'pet'),
+        )
+
+        with self._lock:
+            base = sanitize_pet_id(pet_id or name or 'pet')
+            final_id = self._allocate_pet_id(base)
+            manifest['id'] = final_id
+            directory = self.user_pet_dir(final_id)
+            staging = safe_join(self.data_dir, PETS_DIRNAME, f'.staging-{final_id}')
+            shutil.rmtree(staging, ignore_errors=True)
+            try:
+                os.makedirs(staging, exist_ok=True)
+                for action, outcome in processed.items():
+                    target = os.path.join(staging, f'{action}{outcome["extension"]}')
+                    write_bytes_atomic(target, outcome['data'])
+                self._write_json(os.path.join(staging, MANIFEST_FILENAME), manifest)
+                shutil.rmtree(directory, ignore_errors=True)
+                os.replace(staging, directory)
+            except PetError:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+            except OSError as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                logger.error('新建形象失败: %s', exc)
+                raise PetError(
+                    CODE_WRITE_FAILED,
+                    f'新建形象失败: {exc}',
+                    user_msg='保存形象失败，请检查磁盘空间与目录权限。',
+                    http_status=500,
+                ) from exc
+
+        logger.info(
+            '新建形象 %s（%d 个动作，单帧 %dx%d）',
+            final_id, len(processed), frame_size[0], frame_size[1],
+        )
+        return self.runtime_pack(final_id)
+
+    # ------------------------------------------------------- 遗留覆盖清理
+
+    def list_pet_overrides(self, pet_id: str) -> list:
+        """列出某形象磁盘上的覆盖动作（**不看是否生效**）。
+
+        用于内置形象的「遗留覆盖」提示：那些文件是内置形象还可写时留下的，
+        现在按只读规则不生效，但确实占着 `data/`。
+        """
+        return self._overridden_actions(sanitize_pet_id(pet_id))
+
+    def clear_pet_overrides(self, pet_id: str) -> list:
+        """删掉某形象**全部**覆盖图，返回被删掉的动作名列表。
+
+        这是内置形象「一键清理」的实现（用户要求）。它**只删 `data/` 下的覆盖**，
+        从不碰 `resources/` 里的随包资源。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        removed = []
+        for action in self.list_pet_overrides(pet_id):
+            if self.delete_action_override(pet_id, action):
+                removed.append(action)
+        if removed:
+            logger.info('已清理形象 %s 的遗留覆盖: %s', pet_id, removed)
+        return removed
 
     def _allocate_pet_id(self, base: str) -> str:
         """找一个不与现有形象冲突的 id（`base-2`、`base-3`…）。"""
@@ -834,10 +1278,10 @@ class PetStore:
     ) -> dict:
         """把一张图存成某个动作的**覆盖**（不改动包内原图）。
 
-        这是「用户能覆盖单个动作的图」的实现（§3.2）：包内原图保留，
+        只对**用户自建形象**开放：内置形象严格只读（`assert_writable`）。
         覆盖文件放在 `pets/<id>/overrides/<action>.png`，解析期优先级最高。
         """
-        pet_id = sanitize_pet_id(pet_id)
+        pet_id = self.assert_writable(pet_id)
         action = str(action or '').strip()
         if not is_action_name(action):
             raise PetError(
@@ -884,7 +1328,12 @@ class PetStore:
         }
 
     def delete_action_override(self, pet_id: str, action: str) -> bool:
-        """删除某动作的覆盖图（回落到包内原图）。返回是否真的删掉了东西。"""
+        """删除某动作的覆盖图（回落到包内原图）。返回是否真的删掉了东西。
+
+        对内置形象**允许删除**：这是清理遗留覆盖的唯一手段（用户要求
+        「严格只读 + 一键清理」），删的是 `data/` 里的覆盖文件，
+        从不碰 `resources/` 下的随包资源。
+        """
         pet_id = sanitize_pet_id(pet_id)
         action = str(action or '').strip()
         if not is_action_name(action):
@@ -946,8 +1395,23 @@ class PetStore:
                     http_status=500,
                 ) from exc
             settings = self.get_settings()
+            changed = False
             if sanitize_pet_id(settings.get('activePetId') or '') == pet_id:
                 settings['activePetId'] = ''
+                changed = True
+            # 顺手清掉这个形象的逐形象偏好（倍率 / 渲染方式）。
+            #
+            # 不清的后果是**设置文件无限增长**，而且更隐蔽：id 会被重新分配
+            # （`_allocate_pet_id` 复用 `pet`、`pet-2`…），于是新建的形象会
+            # 莫名其妙地继承一个早已删除的形象的大小设置。
+            # 实测就是这样：验收脚本删掉 `pet` 后重建同名 id，新形象一出生就是 3×。
+            for key in ('petScales', 'petPixelated'):
+                stored = dict(settings.get(key) or {})
+                if pet_id in stored:
+                    del stored[pet_id]
+                    settings[key] = stored
+                    changed = True
+            if changed:
                 self._write_json(self.settings_path(), settings)
 
         logger.info('已删除用户形象 %s', pet_id)
@@ -956,8 +1420,20 @@ class PetStore:
     # ------------------------------------------------------------ 导出
 
     def export_pet(self, pet_id: str) -> bytes:
-        """把一个形象打包成 zip（便于用户在设备间搬运自己的形象）。"""
+        """把一个**用户自建**形象打包成 zip（便于用户在设备间搬运自己的形象）。
+
+        内置形象**不允许导出**（用户明确要求）：它是随插件发布的资源，
+        导出它没有意义，反而会让用户以为自己「拥有」了它。
+        """
         pet_id = sanitize_pet_id(pet_id)
+        if self._is_builtin_only(pet_id):
+            raise PetError(
+                CODE_BUILTIN_NO_EXPORT,
+                f'内置形象不可导出: {pet_id}',
+                user_msg='这是插件自带的形象，不需要导出。',
+                hint='导出只用于备份自己新建或导入的形象。',
+                http_status=403,
+            )
         pack = self.load_pack(pet_id)
         directory, _source = self._locate(pet_id)
 

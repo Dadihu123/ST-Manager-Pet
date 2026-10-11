@@ -120,10 +120,15 @@ export async function activate(api) {
   /** 把宿主 config 与插件设置折算成宠物视图要的形态（键名归一）。 */
   function viewConfig(extra = {}) {
     const config = state.config || {};
+    // 倍率与渲染方式的**权威值来自后端**（它按「用户设置 > 包内声明 > 全局默认」
+    // 算好了，见 `store.effective_scale`）。这里只在形象数据还没到位时
+    // 用宿主表单的全局值兜底，避免启动瞬间跳一下。
+    const pack = state.pack || {};
     return Object.assign({
       quietMode: config.quiet_mode === true,
       autoRoam: config.auto_roam !== false,
-      scale: Number(config.scale) || 1,
+      scale: pack.scale !== undefined ? pack.scale : (Number(config.scale) || 1),
+      pixelated: pack.pixelated === true,
       sleepAfter: Number(config.sleep_after) || 120,
       showToast: config.show_toast === true,
       reducedMotion: state.hostState ? state.hostState.reducedMotion : false,
@@ -233,10 +238,13 @@ export async function activate(api) {
   async function applyPack(pack) {
     state.pack = pack;
     if (!state.petView) return;
-    // 形象变了就重建视图（尺寸/物理/帧布局都可能不同，增量更新不值得）
+    // 形象变了就重建视图（尺寸/物理/帧布局都可能不同，增量更新不值得）。
+    // 用户改倍率走的也是这条路：包围盒尺寸变了，切帧几何与物理边界都要重算。
     const container = state.petView.element.parentNode;
     const bounds = state.petView.physics;
     if (!container) return;
+    // 记下当前位置：重建后要放回去，否则用户拖好的位置会被重置到屏幕中央，
+    // 而「改个大小」不该让宠物瞬移。
     const position = { x: bounds.x, y: bounds.y };
     state.petView.dispose();
     state.petView = createPetView({
@@ -287,6 +295,8 @@ export async function activate(api) {
         return panel.mount(container);
       },
       onOpen(ctx) {
+        // 每次从入口进来都回到形象详情（而不是停在未提交的新建表单）
+        if (typeof panel.resetView === 'function') panel.resetView();
         panel.onOpen(ctx);
       },
     });
@@ -347,9 +357,21 @@ export async function activate(api) {
   const offConfigChange = typeof api.onConfigChange === 'function'
     ? api.onConfigChange((config) => {
       state.config = Object.assign({}, state.config, config);
-      if (state.petView) state.petView.setConfig(viewConfig());
+      // 宿主表单里的全局 `scale` 是倍率的**兜底值**，改了它可能改变生效倍率
+      // （当该形象既没有用户覆盖、包内也没声明时）。而生效倍率是后端算的，
+      // 因此这里必须重新取一次形象数据，不能只 `setConfig`。
+      refreshRuntime().catch((error) => {
+        logger.warning(`配置变更后刷新形象失败：${error && error.message}`);
+      });
     })
     : () => {};
+
+  /** 重新拉当前形象并应用（配置变更 / 外观调整后走这条）。 */
+  async function refreshRuntime() {
+    const pack = await fetchRuntime();
+    if (pack) await applyPack(pack);
+    else if (state.petView) state.petView.setConfig(viewConfig());
+  }
 
   // 任意用户在宿主页面上的输入也算「互动」——避免用户在看卡片时宠物睡着
   const onAnyInput = () => {

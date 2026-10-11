@@ -44,6 +44,11 @@ MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 #: 图片解压后的像素尺寸上限（宽和高各自）。
 MAX_IMAGE_DIMENSION = 4096
 
+#: 新建形象时一条 spritesheet 的帧数上限。
+#: 与 `pack.MAX_FRAMES`（256）保持一致：这里更严是因为**一张图**里塞几百帧时，
+#: 单帧会小到不可辨认，几乎必然是用户填错了帧数。
+MAX_SHEET_FRAMES = 64
+
 #: 存盘时允许的目标格式 → Pillow 格式名 + 扩展名。
 #: 两种都能被宿主资产白名单接受。
 OUTPUT_FORMATS = {
@@ -252,6 +257,114 @@ def normalize_frame(image: Image.Image, target_w: int, target_h: int) -> Image.I
         ((width - new_size[0]) // 2, (height - new_size[1]) // 2),
     )
     return canvas
+
+
+def fit_within(width: int, height: int, limit: int) -> tuple:
+    """把 `width × height` 等比缩到**最长边不超过** `limit`，返回整数尺寸。
+
+    用于「用户新建形象」时从上传图推导单帧尺寸：用户的图可能远大于形象包允许的
+    单帧上限（`_MAX_FRAME_SIZE` = 512），这时按比例缩到上限内，而不是拒绝他。
+    """
+    limit = max(1, int(limit))
+    width = max(1, int(width))
+    height = max(1, int(height))
+    longest = max(width, height)
+    if longest <= limit:
+        return width, height
+    ratio = limit / longest
+    return max(1, int(round(width * ratio))), max(1, int(round(height * ratio)))
+
+
+def prepare_sheet(
+    data: bytes,
+    *,
+    frames: int = 1,
+    frame_size: tuple = None,
+    what: str = '图片',
+    output_format: str = DEFAULT_OUTPUT_FORMAT,
+    max_frame_size: int = MAX_IMAGE_DIMENSION,
+) -> dict:
+    """把一张上传图做成**规范化的 spritesheet**（新建形象走这条通路）。
+
+    与 `process_upload` 的区别：那个把整张图当**一帧**处理（覆盖单个动作的用法），
+    这里先把图按 `frames` **水平切分**，逐帧归一化到统一的 `frame_size`，再拼回一条
+    sheet。用户因此可以「一张图里放 4 帧」直接当动画用。
+
+    Args:
+        data: 原始字节。
+        frames: 这条 sheet 里有几帧（水平排布）。**宽度必须能被帧数整除**。
+        frame_size: `(w, h)` 单帧目标尺寸；`None` 表示**按切分后的单帧尺寸推导**
+            （并用 `max_frame_size` 封顶）。新建形象时先用 `idle` 推一次，
+            再拿这个尺寸去对齐其它动作，保证所有动作的单帧尺寸一致。
+        what: 错误信息里对这份内容的称呼。
+        output_format: `'png'` 或 `'webp'`。
+        max_frame_size: 推导尺寸时的单帧上限（形象包格式自身的上限）。
+
+    Returns:
+        dict: `{'data', 'extension', 'format', 'frame_size', 'frames',
+                'sheet_size', 'source_format', 'derived'}`。
+        `derived` 为真表示 `frame_size` 是这次推导出来的（调用方应记下来）。
+
+    Raises:
+        PetError: 空文件 / 体积超限 / 非图片 / 尺寸超限 / 损坏 / 帧数不整除。
+    """
+    check_size(len(data), MAX_IMAGE_BYTES, what=what)
+    image = load_image(data, what=what)
+    source_format = str(image.format or sniff_format(data) or '未知')
+
+    count = int(frames or 1)
+    if count < 1:
+        count = 1
+    if count > MAX_SHEET_FRAMES:
+        raise PetError(
+            CODE_IMAGE_INVALID,
+            f'{what} 的帧数 {count} 超过上限 {MAX_SHEET_FRAMES}',
+            user_msg=f'帧数最多 {MAX_SHEET_FRAMES} 帧。',
+            hint='把动作拆成多张图，或减少帧数。',
+        )
+
+    if count > 1 and image.width % count != 0:
+        raise PetError(
+            CODE_IMAGE_INVALID,
+            f'{what} 宽度 {image.width} 不能被帧数 {count} 整除',
+            user_msg=f'这张图宽 {image.width}px，切不成 {count} 帧（除不尽）。',
+            hint=f'把图宽做成 {count} 的倍数（例如每帧 {image.width // count}px），'
+                 f'或把帧数改成 {image.width} 的约数。',
+        )
+
+    tile_w = max(1, image.width // count)
+    tile_h = max(1, image.height)
+    derived = False
+    if frame_size:
+        target_w = max(1, int(frame_size[0]))
+        target_h = max(1, int(frame_size[1]))
+    else:
+        target_w, target_h = fit_within(tile_w, tile_h, max_frame_size)
+        derived = True
+
+    if image.mode != 'RGBA':
+        image = image.convert('RGBA')
+
+    # 逐帧切出来再归一化：这样每帧都是**同一尺寸**，拼接后的 sheet 才是规整的
+    sheet = Image.new('RGBA', (target_w * count, target_h), (0, 0, 0, 0))
+    for index in range(count):
+        tile = image.crop((index * tile_w, 0, (index + 1) * tile_w, tile_h))
+        sheet.paste(normalize_frame(tile, target_w, target_h), (index * target_w, 0))
+
+    encoded, extension = encode_image(sheet, output_format)
+    # 转码后也可能膨胀（例如 GIF → PNG），再查一次
+    check_size(len(encoded), MAX_IMAGE_BYTES, what=f'处理后的{what}')
+
+    return {
+        'data': encoded,
+        'extension': extension,
+        'format': output_format,
+        'frame_size': (target_w, target_h),
+        'frames': count,
+        'sheet_size': (target_w * count, target_h),
+        'source_format': source_format,
+        'derived': derived,
+    }
 
 
 def encode_image(image: Image.Image, fmt: str = DEFAULT_OUTPUT_FORMAT) -> tuple:

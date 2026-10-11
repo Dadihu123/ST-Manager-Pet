@@ -696,3 +696,66 @@ test('钩子非法类型被忽略（不炸）', () => {
     machine.go('nonsense', { now: 1 });
   });
 });
+
+// ================================================================ 大小与渲染方式
+//
+// 这两项是「用户能自己调宠物大小、并选择渲染方式」的核心。
+// 尺寸推导是纯计算，因此在这里测；真正的 DOM 属性由 pytest 的静态契约
+// 与真实浏览器验收覆盖（`frontend/petview.js` 里的 `dataset.petPixelated`）。
+
+/** 与 `frontend/petview.js` 里同一套尺寸推导（含钳制）。 */
+const SCALE_MIN = 0.25;
+const SCALE_MAX = 4;
+
+function petSize(baseSize, rawScale) {
+  const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
+  const scale = clamp(Number(rawScale) || 1, SCALE_MIN, SCALE_MAX);
+  return {
+    scale,
+    width: Math.max(8, Math.round(baseSize.w * scale)),
+    height: Math.max(8, Math.round(baseSize.h * scale)),
+  };
+}
+
+test('尺寸：倍率按形象单帧尺寸等比放大', () => {
+  const result = petSize({ w: 64, h: 64 }, 2);
+  assert.equal(result.width, 128);
+  assert.equal(result.height, 128);
+});
+
+test('尺寸：非正方形形象按各自比例缩放（真人立绘 2:3）', () => {
+  // 用户明确要求放开「必须 64×64」——形象不必是正方形
+  const result = petSize({ w: 300, h: 450 }, 1.5);
+  assert.equal(result.width, 450);
+  assert.equal(result.height, 675);
+  // 长宽比保持不变
+  assert.ok(Math.abs(result.width / result.height - 300 / 450) < 0.001);
+});
+
+test('尺寸：倍率被夹到合法区间', () => {
+  assert.equal(petSize({ w: 64, h: 64 }, 99).scale, SCALE_MAX);
+  assert.equal(petSize({ w: 64, h: 64 }, 0.001).scale, SCALE_MIN);
+  assert.equal(petSize({ w: 64, h: 64 }, -5).scale, SCALE_MIN);
+});
+
+test('尺寸：非法倍率回落到 1 而不是 NaN', () => {
+  for (const bad of [undefined, null, '', 'big', NaN]) {
+    const result = petSize({ w: 64, h: 64 }, bad);
+    assert.equal(result.scale, 1, `${String(bad)} 应回落到 1`);
+    assert.equal(result.width, 64);
+  }
+});
+
+test('尺寸：极小倍率下仍有最小可点尺寸', () => {
+  // 太小就点不中了（拖动需要命中元素）
+  const result = petSize({ w: 4, h: 4 }, SCALE_MIN);
+  assert.ok(result.width >= 8, `宽度不应小于 8，实际 ${result.width}`);
+  assert.ok(result.height >= 8, `高度不应小于 8，实际 ${result.height}`);
+});
+
+test('尺寸：倍率变化会等比改变包围盒（物理边界要跟着重算）', () => {
+  const one = petSize({ w: 200, h: 100 }, 1);
+  const two = petSize({ w: 200, h: 100 }, 2);
+  assert.equal(two.width, one.width * 2);
+  assert.equal(two.height, one.height * 2);
+});
