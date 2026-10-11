@@ -71,7 +71,7 @@
 
 这是本项目最硬的一条约束，必须说清：
 
-内置形象的**逻辑尺寸**由 `pet.json` 的 `size` 决定，现有默认是 **64×64**。
+内置形象的**逻辑尺寸**由 `pet.json` 的 `size` 决定，默认是 64×64（小猫用的就是它）。
 在 64px 见方里画一个真人：
 
 - 整张脸只有约 20px，五官合计不到 10px；
@@ -81,8 +81,17 @@
 所以「真人小女孩」的正确落地方式是：**真人比例 + 插画化概括**。
 真人感来自**比例和神态**（五头身、眼神、姿态），而不是来自纹理精度。
 
-推荐尺寸：`size` 用 **128×128**（比猫大一倍，给脸留出可读像素），
-素材按 **2× 出图（256×256/帧）** 再降采样，兼顾 HiDPI 与清晰度。
+**实际采用（0.2.0 起）**：`size` = **384×576**（2:3 竖构图，人形需要长画幅），
+`scale` = **0.45** → 观感约 **173×259**。
+
+为什么是「大贴图 + 小 scale」而不是直接出 173×259：
+
+- `size` 是**贴图**尺寸，不等于**观感**尺寸；`scale` 才是观感倍率。
+  引擎按 `size × scale` 算包围盒（`petview.js` 的 `width/height`），
+  所以两者可以解耦。
+- 大贴图 + 小 scale 在**高分屏**上是清晰的；反过来（小贴图放大）会糊。
+- 384 宽也是**sheet 宽度的上限约束**推导出来的：横向 sheet 总宽 ≤ 4096，
+  8 帧 × 384 = 3072，安全；512 宽时 8 帧正好 4096，卡在上限不值得。
 
 ---
 
@@ -104,27 +113,69 @@
 
 ---
 
-## 6. 动作规格（11 个）
+## 6. 动作规格（13 个）
 
 对齐 `backend/core/pack.py` 的动作词表。**必需**动作缺失不报错、会沿回退链退化，
 但内置形象应该**全部给全**（否则用户会看到「缺少必要动作」的警告）。
 
+**实际交付值**（与仓库里 `pet.json` 一致）：
+
 | 动作 | 标签 | 帧数 | fps | loop | 表演要点 |
 |---|---|---|---|---|---|
-| `idle` | 待机 | 6 | 6 | ✅ | 呼吸起伏 + 一次眨眼。幅度极小，**这是出现时间最长的动作**，花最多功夫 |
-| `walk` | 行走 | 8 | 10 | ✅ | 小幅快走，手臂自然摆；裙摆微微动 |
+| `idle` | 待机 | 4 | **4** | ✅ | 呼吸起伏 + 一次眨眼。幅度极小，**出现时间最长** |
+| `walk-left` | 向左走 | 4 | **8** | ✅ | **侧视**，朝画面左走。见 §6.1 |
+| `walk-right` | 向右走 | 4 | **8** | ✅ | **侧视**，朝画面右走。见 §6.1 |
+| `walk` | 行走（正面） | 6 | 8 | ✅ | 正面步态，作为没有侧视图时的回退 |
 | `drag` | 被拖动 | 2 | 4 | ✅ | 双脚离地、手向上、表情略无奈（不是惊恐） |
 | `fall` | 下落 | 2 | 8 | ✅ | 身体前倾、头发向上飘 |
 | `land` | 落地 | 3 | 12 | ❌ 单次 | 屈膝缓冲 → 站直；第 1 帧轻微压扁 |
-| `sleep` | 睡觉 | 4 | 3 | ✅ | 抱膝坐或侧躺，眼睛闭合，飘 2–3 个「Z」 |
-| `click` | 被点击 | 4 | 12 | ❌ 单次 | 轻微一跳 + 回头，带一点被打扰的反应 |
-| `happy` | 开心 | 6 | 8 | ❌ 单次 | 弯眼笑，小幅原地跳 |
-| `sad` | 难过 | 4 | 5 | ✅ | 垂眼、眉毛下压、肩膀下沉 |
-| `angry` | 生气 | 4 | 8 | ✅ | 鼓腮、眉压低；**要可爱不要凶** |
-| `look` | 张望 | 6 | 6 | ✅ | 左右转头找东西，像在找某张卡片 |
+| `sleep` | 睡觉 | 4 | 3 | ✅ | 抱膝坐，眼睛闭合，飘 2–3 个「Z」 |
+| `click` | 被点击 | 3 | 12 | ❌ 单次 | 轻微一跳 + 回头，带一点被打扰的反应 |
+| `happy` | 开心 | 4 | 6 | ❌ 单次 | 弯眼笑，小幅原地跳 |
+| `sad` | 难过 | 4 | 4 | ✅ | 垂眼、眉毛下压、肩膀下沉 |
+| `angry` | 生气 | 4 | 6 | ✅ | 鼓腮、眉压低；**要可爱不要凶** |
+| `look` | 张望 | 4 | 5 | ✅ | 左右转头找东西，像在找某张卡片 |
+
+> **节奏**：`idle` 从 6fps 降到 **4fps**、`walk` 从 10 降到 **8fps**——
+> 初版实测「呼吸太快，看着发慌」。慢下来才像在休息而不是喘气。
+> `walkSpeed` 也从 70 降到 **52**，配合降速后的步频，避免「滑步」。
 
 上限提醒（`pack.py`）：单动作 ≤ **256 帧**、`fps` ≤ **60**、
-单帧边长 1–512px、sheet 尺寸 ≤ 4096px。上表远在安全区内。
+单帧边长 1–**1024**px（宽高各自判定）、sheet 总宽 ≤ **4096**、单文件 ≤ **8MB**。
+上表远在安全区内。
+
+### 6.1 为什么需要 `walk-left` / `walk-right`
+
+宠物的移动是**水平**的，而**正面视角**的行走图看起来是「原地踏步 + 平移」——
+两条腿前后交替，人却横向滑走，非常出戏。正确做法是**侧视图**。
+
+于是动作词表新增两个方向化动作：
+
+| 请求 | 引擎行为 |
+|---|---|
+| 有 `walk-left` | 向左移动时播它 |
+| 有 `walk-right` | 向右移动时播它 |
+| **只有一侧** | 另一侧**镜像复用**（后端 `mirror=true`，前端 `scaleX(-1)`） |
+| 两侧都没有 | 回退到正面 `walk`，再回退到 `idle` |
+
+回退链：`walk-left → walk-right → walk → idle`。
+
+**为什么小满必须两套都画**：镜像会把**不对称的头饰翻边**。
+小满左鬓有一枚卡片发夹，如果右移时靠镜像，发夹会跳到右鬓。
+所以「只设置一个、另一个自动镜像」这条便利对**对称形象**适用
+（例如默认小猫），对不对称形象必须自己出两套。
+
+**镜像的两种语义不能混**（这是最容易写错的地方，已在
+`frontend/direction.js` 里用纯函数固化并单测）：
+
+1. **方向化贴图**（`source` 是 `walk-left`/`walk-right`）——
+   朝向**已经画在贴图里**了，翻转与否只看后端的 `mirror` 标记。
+   若再按移动方向翻一次，就翻了两次 = 方向反了。
+2. **正面贴图**（旧式形象，回退到 `walk`）——没有朝向信息，
+   只能按移动方向翻转（这是 0.2.0 之前的旧行为，必须保持）。
+
+另外：提供了方向化贴图的形象，**连 `idle` 等非行走动作也不按朝向翻转**——
+否则发夹会随着朝向左右跳。没有方向化贴图的形象保持旧行为不变。
 
 ---
 
@@ -136,38 +187,47 @@
   "id": "xiaoman",
   "name": "小满",
   "author": "ST-Manager",
-  "size": { "w": 128, "h": 128 },
-  "anchor": { "x": 0.5, "y": 1.0 },
+  "size": { "w": 384, "h": 576 },
+  "anchor": { "x": 0.5, "y": 0.9809 },
+  "scale": 0.45,
+  "pixelated": false,
   "physics": {
     "gravity": 1800,
-    "walkSpeed": 70,
+    "walkSpeed": 52,
     "friction": 0.02,
     "terminalVelocity": 2400,
     "bounce": 0.12
   },
   "animations": {
-    "idle":  { "sheet": "idle.png",  "frames": 6, "fps": 6,  "loop": true  },
-    "walk":  { "sheet": "walk.png",  "frames": 8, "fps": 10, "loop": true  },
-    "drag":  { "sheet": "drag.png",  "frames": 2, "fps": 4,  "loop": true  },
-    "fall":  { "sheet": "fall.png",  "frames": 2, "fps": 8,  "loop": true  },
-    "land":  { "sheet": "land.png",  "frames": 3, "fps": 12, "loop": false },
-    "sleep": { "sheet": "sleep.png", "frames": 4, "fps": 3,  "loop": true  },
-    "click": { "sheet": "click.png", "frames": 4, "fps": 12, "loop": false },
-    "happy": { "sheet": "happy.png", "frames": 6, "fps": 8,  "loop": false },
-    "sad":   { "sheet": "sad.png",   "frames": 4, "fps": 5,  "loop": true  },
-    "angry": { "sheet": "angry.png", "frames": 4, "fps": 8,  "loop": true  },
-    "look":  { "sheet": "look.png",  "frames": 6, "fps": 6,  "loop": true  }
+    "idle":       { "sheet": "idle.png",       "frames": 4, "fps": 4,  "loop": true  },
+    "walk-left":  { "sheet": "walk-left.png",  "frames": 4, "fps": 8,  "loop": true  },
+    "walk-right": { "sheet": "walk-right.png", "frames": 4, "fps": 8,  "loop": true  },
+    "walk":       { "sheet": "walk.png",       "frames": 6, "fps": 8,  "loop": true  },
+    "drag":       { "sheet": "drag.png",       "frames": 2, "fps": 4,  "loop": true  },
+    "fall":       { "sheet": "fall.png",       "frames": 2, "fps": 8,  "loop": true  },
+    "land":       { "sheet": "land.png",       "frames": 3, "fps": 12, "loop": false },
+    "sleep":      { "sheet": "sleep.png",      "frames": 4, "fps": 3,  "loop": true  },
+    "click":      { "sheet": "click.png",      "frames": 3, "fps": 12, "loop": false },
+    "happy":      { "sheet": "happy.png",      "frames": 4, "fps": 6,  "loop": false },
+    "sad":        { "sheet": "sad.png",        "frames": 4, "fps": 4,  "loop": true  },
+    "angry":      { "sheet": "angry.png",      "frames": 4, "fps": 6,  "loop": true  },
+    "look":       { "sheet": "look.png",       "frames": 4, "fps": 5,  "loop": true  }
   }
 }
 ```
 
 与小猫的差异及理由：
 
-- `size` 128（猫是 64）：人形需要更多像素承载脸部，见 §4.2。
-- `walkSpeed` 70（猫是 60）：人走路比猫踱步略快，且 128px 身高的位移看起来更慢，
-  略提速度避免「飘着走」。
+- `size` 384×576 + `scale` 0.45（猫是 64×64 + scale 1）：人形需要更多像素承载脸部，
+  且是竖构图。观感约 173×259，见 §4.2。
+- `walkSpeed` 52（猫是 60）：**不是**「人比猫快」——初版设 70 配合 10fps 时
+  明显滑步（脚在原地倒，人在平移）。降到 52 并配合 8fps 后才踩得实。
+  调这个值要和 `walk` 的 fps、以及侧视步幅一起看。
 - `bounce` 0.12（猫是 0.15）：人落地比猫「实」，回弹要更小。
-- `anchor.y = 1.0`：脚底对齐容器底边 —— 人形必须站住，不能悬空。
+- `anchor.y = 0.9809` **不是 1.0**：素材脚底实际落在 565/576 处（图底部有
+  几像素透明边距）。取 1.0 会让小满整体悬空约 5px（观感尺寸下）。
+  这个值是从素材**量出来**的，不是拍的 —— 换素材后要重新量。
+- `pixelated: false`：写实插画放大时要平滑插值，硬边会出现块状锯齿（猫是像素风）。
 
 ---
 
@@ -200,59 +260,84 @@
 # 1) 目录
 resources/pets/xiaoman/
     pet.json
-    idle.png walk.png drag.png fall.png land.png
+    idle.png walk.png walk-left.png walk-right.png
+    drag.png fall.png land.png
     sleep.png click.png happy.png sad.png angry.png look.png
 
 # 2) 校验（形状、帧数、白名单、上限）
-python -c "from backend.core.pack import load_pack; print(load_pack('resources/pets/xiaoman'))"
+python -c "from backend.core.pack import load_file; print(load_file('resources/pets/xiaoman/pet.json', pack_id='xiaoman'))"
 
-# 3) 跑测试
+# 3) 跑测试（必须显式列出文件，Node 25 不认目录形式）
 python -m pytest tests/ -q
+node --test tests/frontend/logic.test.mjs tests/frontend/announce.test.mjs
 ```
 
-### 8.3 两条硬性注意
+### 8.3 三条硬性注意
 
 1. **不要放 `.jpg`**。运行期 sheet 白名单是
    `{.png .webp .gif .avif .svg}`，JPEG 只在**导入期**被转码放行；
    落盘的包里有 JPEG 会被拒（`pack.py:ALLOWED_SHEET_EXTENSIONS`）。
 2. **单帧必须等宽**，横向 sheet 的总宽 = 帧数 × 单帧宽。
    帧宽不一致会让 `background-position` 推进错位（表现为动作抖动/串帧）。
+3. **统一变换，不要逐帧裁剪对齐**。源图 1024×1536 → 帧 384×576
+   恰好是 **0.375** 等比缩放，整幅缩放可以**原样保留模型画出的所有位移**
+   （跳跃、呼吸、压扁），且零逐帧漂移。
+   只有两类动作需要额外处理：
+   - **每帧都有脚踩地**的（walk / idle / 坐着的 sleep）：要把内容底边
+     对齐到同一条地面线，否则素材里 11–22px 的差异会表现为宠物上下浮。
+   - **腾空**的（fall / drag / 跳跃）：**必须**保留垂直偏移，那是动作本身。
+
+### 8.4 素材生成的三个坑（实测）
+
+1. **不要让模型一次画「多帧 sprite sheet」**。扩散模型画多帧拼图时，
+   帧与帧之间角色会漂移（发型/脸型/服装每格不同），做出来的动画会闪烁。
+   **一帧一张图，逐帧独立生成**，用同一张定妆图做参考图（i2i）保证一致性。
+2. **必须要求真透明**，并明确禁止棋盘格（`checkerboard`）、白底方框、
+   以及**任何投影/地面**（`drop shadow` / `ground plane` / 脚下椭圆）——
+   投影会在透明 PNG 里留灰晕，贴到深色主题上非常明显。
+3. **生成后必须程序化验证 alpha**，不要靠肉眼看预览图
+   （预览渲染器会把透明合成到白底，看起来像白背景）。
+   典型问题：模型输出 alpha 只有 0–254、边缘有 alpha 1–15 的极淡雾点
+   （实测有 7000+ 个像素距主体 4px 以上、最远 369px），
+   贴到界面上就是淡污渍。清理办法：alpha floor + 形态学开运算 + 连通域过滤。
+
+4. **侧面朝向要用「画面空间」描述**，不要用「她的左/右腿」。
+   实测：不管用角色自身的左右还是画面的左右描述**腿**，
+   模型都会固定抬同一条腿，做不出交替步态。
+   有效写法是明确指定**哪一侧的腿着地**（"the leg on the RIGHT side of the
+   picture is planted"），模型才会照做。
+   另外，侧视图容易把**服装配色画漂**（藏青变灰紫、白发夹变金），
+   提示词里要把关键色值再强调一遍。
 
 ---
 
-## 9. 已知约束（需要留意，但不是阻塞）
+## 9. 已知约束
 
-**`image-rendering: pixelated` 目前是恒开的。**
+**`pixelated` 契约已在 0.2.0 修好。**（本节原先记录的「恒开」问题已解决）
 
-`frontend/plugin.css:81` 写了：
+`pet.json` 支持 `pixelated` 布尔字段，`pack.py` 解析、
+`petview.js` 写入 `dataset.petPixelated`，CSS 那条规则因此生效。
+小满声明 `"pixelated": false`，所以写实插画按平滑插值渲染，
+用户把倍率调大时不会出现块状锯齿。
 
-```css
-[data-plugin="stm-pet"][data-pet-pixelated="false"] .pet-sprite { image-rendering: auto; }
-```
+其余仍需留意：
 
-但这个 `data-pet-pixelated` 属性**前端 JS 从未设置**，`pack.py` 也没有对应字段 ——
-所以这条规则永远不生效，贴图始终按「硬边放大」渲染。
-
-对小满的影响：**1× 显示（scale=1）没问题**（256 源 → 128 CSS px 是降采样）；
-但用户把「宠物大小倍率」调到 2× 以上时，写实插画会出现明显块状边缘，
-观感不如平滑插值。
-
-三种处理，按代价从低到高：
-
-- **不处理**：默认 scale=1，多数用户不会调。可接受。
-- **降规格**：源图按 1× 出（128×128/帧），彻底回避放大场景。
-- **修契约**（推荐，但属于插件改动）：在 `pet.json` 增加 `pixelated` 布尔字段
-  （`pack.py` 解析 → `petview.js` 写 `dataset.petPixelated`），
-  让写实形象自动拿到 `image-rendering: auto`。
-  CSS 那条规则已经是现成的，只差把值接上。
+- **`anchor.y` 必须按素材实测**，不能想当然写 1.0。见 §7 的说明。
+- **左右不对称的形象必须两套侧视图都给**，镜像会把头饰翻边。见 §6.1。
 
 ---
 
-## 10. 待办
+## 10. 状态
 
-- [ ] 出定妆图（§4.1），确认角色一致性
-- [ ] 按 §6 出 11 个动作的 spritesheet
-- [ ] 写 `resources/pets/xiaoman/pet.json`（§7 骨架）
-- [ ] 决定 `pixelated` 契约是否要修（§9）
-- [ ] 决定小满是否取代 `default-cat` 成为默认形象，或作为并列的内置形象
-      （`store.py` 的内置形象扫描支持多个，并列不需要删猫）
+- [x] 定妆图（§4.1），角色一致性已确认
+- [x] 13 个动作的 spritesheet（含 `walk-left` / `walk-right`）
+- [x] `resources/pets/xiaoman/pet.json`（§7 骨架，值已按实测更新）
+- [x] `pixelated` 契约（§9，0.2.0 已修）
+- [x] 小满与 `default-cat` **并列**为内置形象（`store.py` 的内置扫描支持多个）
+
+### 后续可做
+
+- 若要让用户能**自建**方向化形象，面板已支持上传 `walk-left` / `walk-right`
+  （`panel.js` 的 `CREATABLE_ACTIONS`）。
+- `walk` 目前是 6 帧正面步态，仅作为没有侧视图时的回退。
+  若确认不再需要正面回退，可以只保留两个侧视动作。
