@@ -1,0 +1,35 @@
+/* 阶段 0 冒烟样式。
+ *
+ * 作用域必须是 `.plugin-<id>` 或 `[data-plugin="<id>"]`——宿主安装期静态检查
+ * （`installer.scan_css_scope`）会拒绝加载顶层裸选择器。
+ * 这里**刻意不写** `position: fixed`：常驻容器由宿主的 ambient surface 提供。
+ */
+
+/* 作用域根：插件在 ambient 容器内的自绘内容。
+ *
+ * **必须**用 `[data-plugin]` 或插件自己加上的 `plugin-<id>` 类——宿主给 ambient
+ * shell 设的是 `data-plugin`，它**不会**给 shell 加 `plugin-<id>`（那是
+ * `api.createRoot()` 的行为，而 createRoot 的落点是 plugin-host-root）。
+ * 只写 `.plugin-<id> .pet-smoke-box` 会整份样式匹配不到（实测踩过）。
+ */
+[data-plugin="stm-pet-smoke"] .pet-smoke-box,
+.plugin-stm-pet-smoke .pet-smoke-box {
+  position: absolute;
+  /* 放在视口右下角、贴底再抬高一点：那里既没有侧边栏（z-index 高于
+   * --z-ambient 55）也没有入口坞，命中测试拿到的就是方块自己，
+   * 点击用例才不会被宿主功能性 UI 挡掉。 */
+  right: 48px;
+  bottom: 160px;
+  width: 96px;
+  height: 96px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: var(--accent-color, #7c5cff);
+  color: var(--content-primary, #fff);
+  font-size: 12px;
+  /* 必须取回：ambient 容器整体 pointer-events: none，且该属性可继承 */
+  pointer-events: auto;
+  cursor: pointer;
+}

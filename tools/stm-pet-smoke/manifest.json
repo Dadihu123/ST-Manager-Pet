@@ -1,0 +1,20 @@
+{
+  "id": "stm-pet-smoke",
+  "name": "Pet ambient smoke",
+  "version": "0.1.0",
+  "api_version": 2,
+  "manifest_version": 2,
+  "author": "ST-Manager",
+  "description": "阶段 0 冒烟：只注册一个 ambient surface 并放一个纯色方块，用来在真实浏览器里核对容器契约。",
+  "license": "MIT",
+  "backend": {
+    "entry": "backend",
+    "register": "register"
+  },
+  "frontend": {
+    "entry": "frontend/plugin.js",
+    "styles": [
+      "frontend/plugin.css"
+    ]
+  }
+}

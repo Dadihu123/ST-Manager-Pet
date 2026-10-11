@@ -1,0 +1,89 @@
+{
+  "id": "stm-pet",
+  "name": "桌面宠物",
+  "version": "0.1.0",
+  "api_version": 2,
+  "manifest_version": 2,
+  "author": "ST-Manager",
+  "description": "常驻桌面的宠物：跟随宿主状态活动、可拖动、会下坠与行走、长时间没互动会睡着；支持导入自己的形象图，并在卡片更新与扫描完成时播报。",
+  "license": "MIT",
+  "min_app_version": "1.0.0",
+  "backend": {
+    "entry": "backend",
+    "register": "register",
+    "jobs": [],
+    "hooks": []
+  },
+  "frontend": {
+    "entry": "frontend/plugin.js",
+    "styles": [
+      "frontend/plugin.css"
+    ],
+    "entries": [
+      {
+        "id": "pet-settings",
+        "kind": "settings",
+        "label": "桌面宠物设置",
+        "description": "形象管理与导入、动作覆盖、播报与勿扰。",
+        "icon": "frontend/assets/icon.svg",
+        "surface": {
+          "id": "pet-settings",
+          "type": "modal",
+          "size": "lg"
+        },
+        "priority": 80
+      }
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "quiet_mode": {
+        "type": "boolean",
+        "title": "勿扰模式",
+        "description": "开启后宠物只换动作、不弹提示，且全屏遮罩期间不打扰。",
+        "default": false
+      },
+      "announce_cards": {
+        "type": "boolean",
+        "title": "卡片更新时播报",
+        "description": "宿主里卡片被创建 / 更新 / 移动时让宠物做出反应（已限流）。",
+        "default": true
+      },
+      "announce_jobs": {
+        "type": "boolean",
+        "title": "扫描 / 索引完成时播报",
+        "description": "全量扫描或索引作业结束时让宠物做出反应。",
+        "default": true
+      },
+      "show_toast": {
+        "type": "boolean",
+        "title": "播报时弹轻提示",
+        "description": "关闭后宠物只换动作，不弹宿主轻提示。",
+        "default": false
+      },
+      "auto_roam": {
+        "type": "boolean",
+        "title": "自动漫游",
+        "description": "空闲时宠物会自己在屏幕底部走动。",
+        "default": true
+      },
+      "scale": {
+        "type": "number",
+        "title": "宠物大小倍率",
+        "description": "1 表示按形象包定义的单帧尺寸显示。",
+        "default": 1,
+        "minimum": 0.5,
+        "maximum": 3
+      },
+      "sleep_after": {
+        "type": "integer",
+        "title": "打盹等待（秒）",
+        "description": "无任何互动超过该时长后宠物睡着；任何输入或核心事件都会唤醒它。",
+        "default": 120,
+        "minimum": 10,
+        "maximum": 3600
+      }
+    }
+  }
+}

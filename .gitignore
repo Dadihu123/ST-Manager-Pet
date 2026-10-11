@@ -1,0 +1,20 @@
+# 运行时用户数据：宿主保证插件更新时保留该目录，因此不进版本库
+data/
+
+# 构建 / 核对产物（截图、报告）
+artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.log
+Thumbs.db
+desktop.ini

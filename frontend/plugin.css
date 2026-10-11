@@ -1,0 +1,439 @@
+/* ==========================================================================
+ * stm-pet 前端样式
+ *
+ * 作用域（F11，宿主安装期静态检查 → 不过就拒绝加载整份样式）：
+ *   每条规则的**顶层选择器**都必须以 `.plugin-stm-pet` 或
+ *   `[data-plugin="stm-pet"]` 为根。两种写法都被 `installer.scan_css_scope()`
+ *   认可。
+ *
+ *   ⚠️ 实测要点：宿主的 ambient **shell** 只带 `data-plugin` 属性，
+ *   **不带** `plugin-<id>` 类（`plugin-<id>` 是 `api.createRoot()` 加的，
+ *   而 createRoot 的落点在 `#plugin-host-root`，不在 ambient 容器里）。
+ *   所以这里**必须**用 `[data-plugin="stm-pet"]` 才能匹配到真实 DOM。
+ *   详见 docs/HOST_FEEDBACK.md 第 2 条——只写 `.plugin-stm-pet .pet-body`
+ *   会整份样式静默失效，症状恰好是「拖不动 / 点了没反应」。
+ *
+ * 硬约束（§0 判定标准）：
+ *   - 本文件里**零个 `position: fixed`**。常驻容器由宿主的 ambient surface
+ *     提供（`position: fixed; inset: 0`），宠物在容器内用 `position: absolute`。
+ *   - 不写 z-index：层级由宿主容器决定（`--z-ambient` = 55）。
+ *   - 颜色只用 `.color-*` 语义类与既有 CSS 变量，不写字面量。
+ * ========================================================================== */
+
+/* ---------------------------------------------------------------- 根元素 */
+
+/* 宠物本体。
+ *
+ * `position: absolute`（**不是** fixed）+ `translate3d` 位移。
+ * 初始位置在左上角，由 JS 用 transform 挪到世界坐标——
+ * 这样每帧只改合成层，不触发 layout。 */
+[data-plugin="stm-pet"].pet-root,
+.plugin-stm-pet.pet-root {
+  position: absolute;
+  left: 0;
+  top: 0;
+  will-change: auto;
+  /* 必须显式取回：ambient 容器整体 `pointer-events: none`，
+   * 且该属性**可继承**——漏掉的表现是「拖不动 / 点了没反应」（§8 陷阱 1）。 */
+  pointer-events: auto;
+  /* 拖动时不要触发文本选择/原生图片拖拽 */
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  cursor: grab;
+  /* 逐帧换 background-position 时不要让浏览器做平滑过渡 */
+  transition: none;
+}
+
+/* 运动期间才加 `will-change`：常驻会占显存（§4.1） */
+[data-plugin="stm-pet"].pet-root.is-moving,
+.plugin-stm-pet.pet-root.is-moving {
+  will-change: transform;
+  cursor: grabbing;
+}
+
+[data-plugin="stm-pet"].pet-root:focus,
+.plugin-stm-pet.pet-root:focus {
+  /* 宠物不进 Tab 序，这里只是防御性声明 */
+  outline: none;
+}
+
+/* ---------------------------------------------------------------- 贴图 */
+
+/* spritesheet 容器：帧推进靠改 `background-position`。
+ *
+ * **不用** `<img src>` 换帧——换 src 会走网络与解码，换 background-position
+ * 只改绘制（§2.5）。 */
+[data-plugin="stm-pet"] .pet-sprite,
+.plugin-stm-pet .pet-sprite {
+  width: 100%;
+  height: 100%;
+  background-repeat: no-repeat;
+  /* 像素风形象不糊（§4.2）。默认小猫是矢量风格的手绘位图，
+   * 这里对 2x 帧同样安全：放大时保持硬边比插值更符合"贴图"预期。 */
+  image-rendering: pixelated;
+  /* 朝向翻转用 transform（不重排布局） */
+  transform-origin: center center;
+}
+
+/* 用户导入的是照片/插画时的观感更好（不做硬边放大）。
+ * 由 JS 按包是否声明 pixelated 切换；默认不开，保持通用。 */
+[data-plugin="stm-pet"][data-pet-pixelated="false"] .pet-sprite,
+.plugin-stm-pet[data-pet-pixelated="false"] .pet-sprite {
+  image-rendering: auto;
+}
+
+/* ------------------------------------------------- 宿主遮挡 / 省电兜底 */
+
+/* 宿主在遮罩活跃 / 对话框打开 / 页面不可见时给 ambient 容器加
+ * `is-host-occluded`（**宿主统一触发，插件不得各自监听**，§4.5）。
+ *
+ * 这里只做**视觉兜底**：JS 侧的逻辑判断以 `onState()` 为主，
+ * 这个类负责「JS 还没来得及反应时先把循环动画暂停」。
+ * 用 `animation-play-state` 而不是改 opacity：宠物骤隐看起来像坏了。 */
+[data-plugin="stm-pet"] .plugin-surface--ambient.is-host-occluded .pet-sprite,
+.plugin-stm-pet .plugin-surface--ambient.is-host-occluded .pet-sprite {
+  animation-play-state: paused;
+}
+
+/* 宿主忙 / 窄屏（JS 侧的 `is-throttled`）：降低存在感，但不消失 */
+[data-plugin="stm-pet"].pet-root.is-throttled,
+.plugin-stm-pet.pet-root.is-throttled {
+  opacity: 0.75;
+}
+
+/* ---------------------------------------------------------------- 设置面板 */
+
+/* 设置面板的根容器由本插件自绘（宿主的 modal surface 给外壳）。 */
+
+.plugin-stm-pet.pet-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 0;
+  height: 100%;
+  color: var(--content-primary, #1f2937);
+  font-size: 13px;
+}
+
+.plugin-stm-pet .pet-panel-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+}
+
+.plugin-stm-pet .pet-panel-toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+.plugin-stm-pet .pet-panel-body {
+  display: grid;
+  grid-template-columns: minmax(200px, 260px) minmax(0, 1fr);
+  gap: 16px;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.plugin-stm-pet .pet-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 4px;
+}
+
+.plugin-stm-pet .pet-panel-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  min-height: 0;
+  padding-right: 4px;
+}
+
+/* ---------------------------------------------------------------- 形象卡片 */
+
+.plugin-stm-pet .pet-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+  border-radius: 10px;
+  background: var(--surface-container, transparent);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+  width: 100%;
+  color: inherit;
+  font: inherit;
+}
+
+.plugin-stm-pet .pet-card:hover {
+  border-color: var(--action-border, rgba(120, 120, 200, 0.5));
+}
+
+.plugin-stm-pet .pet-card.is-active {
+  border-color: var(--accent-color, #7c5cff);
+  background: var(--surface-container-raised, rgba(124, 92, 255, 0.08));
+}
+
+.plugin-stm-pet .pet-card.is-broken {
+  border-color: var(--color-danger, #d9534f);
+}
+
+.plugin-stm-pet .pet-card-thumb {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  image-rendering: pixelated;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.06));
+}
+
+.plugin-stm-pet .pet-card-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.plugin-stm-pet .pet-card-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-stm-pet .pet-card-meta {
+  font-size: 11px;
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- 动作网格 */
+
+.plugin-stm-pet .pet-action-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 8px;
+}
+
+.plugin-stm-pet .pet-action-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 6px;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+  border-radius: 10px;
+  background: var(--surface-container, transparent);
+  position: relative;
+}
+
+.plugin-stm-pet .pet-action-tile.is-fallback {
+  border-style: dashed;
+}
+
+.plugin-stm-pet .pet-action-tile.is-missing {
+  opacity: 0.55;
+}
+
+.plugin-stm-pet .pet-action-preview {
+  width: 56px;
+  height: 56px;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  image-rendering: pixelated;
+}
+
+.plugin-stm-pet .pet-action-name {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.plugin-stm-pet .pet-action-note {
+  font-size: 10px;
+  opacity: 0.65;
+  text-align: center;
+  line-height: 1.3;
+}
+
+.plugin-stm-pet .pet-action-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 6px;
+  background: var(--accent-color, #7c5cff);
+  color: var(--content-on-accent, #fff);
+}
+
+/* 未覆盖 / 需要用户注意的降级提示 */
+.plugin-stm-pet .pet-action-badge.is-warn {
+  background: var(--color-warning, #d9a02c);
+}
+
+/* ---------------------------------------------------------------- 按钮 */
+
+.plugin-stm-pet .pet-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-default, rgba(0, 0, 0, 0.14));
+  background: var(--surface-container-raised, transparent);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.plugin-stm-pet .pet-button:hover:not(:disabled) {
+  border-color: var(--action-border, rgba(120, 120, 200, 0.5));
+}
+
+.plugin-stm-pet .pet-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.plugin-stm-pet .pet-button.is-primary {
+  background: var(--accent-color, #7c5cff);
+  border-color: var(--accent-color, #7c5cff);
+  color: var(--content-on-accent, #fff);
+}
+
+.plugin-stm-pet .pet-button.is-danger {
+  border-color: var(--color-danger, #d9534f);
+  color: var(--color-danger, #d9534f);
+}
+
+.plugin-stm-pet .pet-button.is-icon {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------- 表单 */
+
+.plugin-stm-pet .pet-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.plugin-stm-pet .pet-field-label {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.plugin-stm-pet .pet-field-hint {
+  font-size: 11px;
+  opacity: 0.65;
+  line-height: 1.4;
+}
+
+.plugin-stm-pet .pet-section {
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+  border-radius: 10px;
+  padding: 12px;
+}
+
+.plugin-stm-pet .pet-section-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.plugin-stm-pet .pet-empty {
+  padding: 24px;
+  text-align: center;
+  opacity: 0.6;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 结构化提示（缺动作 / 回退说明）——不是错误，但要显眼 */
+.plugin-stm-pet .pet-notice {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.1));
+  background: var(--surface-container-raised, rgba(0, 0, 0, 0.02));
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.plugin-stm-pet .pet-notice.is-warn {
+  border-color: var(--color-warning, #d9a02c);
+}
+
+.plugin-stm-pet .pet-notice.is-error {
+  border-color: var(--color-danger, #d9534f);
+}
+
+/* 隐藏的文件输入（上传走它，不用自绘拖拽区） */
+.plugin-stm-pet .pet-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------- 响应式 */
+
+@media (max-width: 900px) {
+  .plugin-stm-pet .pet-panel-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ------------------------------------------------- 减少动效（**必须遵守**） */
+
+/* 用户开这个选项是因为动效让他不适，因此这里不是"降速"而是**关掉**（§8 陷阱 13）。
+ *
+ * 两个层面都要停：
+ * 1. CSS 动画（本文件里的过渡与任何 animation）；
+ * 2. JS 的 rAF 循环 —— 由 `decideThrottle` 返回 paused 实现（见 clock.js），
+ *    这里只是 CSS 侧的兜底，保证即使 JS 还没反应也不会继续动。 */
+@media (prefers-reduced-motion: reduce) {
+  [data-plugin="stm-pet"].pet-root,
+  .plugin-stm-pet.pet-root {
+    transition: none;
+  }
+
+  [data-plugin="stm-pet"] .pet-sprite,
+  .plugin-stm-pet .pet-sprite {
+    animation: none;
+  }
+
+  .plugin-stm-pet .pet-card,
+  .plugin-stm-pet .pet-button {
+    transition: none;
+  }
+}
+
+/* 宿主的 reducedMotion 广播（与系统媒体查询同步，但走 JS 的那条更及时） */
+[data-plugin="stm-pet"].pet-root.is-static-motion .pet-sprite,
+.plugin-stm-pet.pet-root.is-static-motion .pet-sprite {
+  animation: none;
+}

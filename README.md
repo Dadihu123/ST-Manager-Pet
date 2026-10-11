@@ -1,0 +1,400 @@
+# 桌面宠物（stm-pet）
+
+ST-Manager 官方插件：一只常驻在界面上的桌面宠物。它会随宿主状态活动、能被拖着走、
+松手会下坠、闲时自己溜达、长时间没人理就睡着；卡片更新与扫描完成时它会做出反应；
+用户能导入自己的形象图。
+
+- 插件 id：`stm-pet`
+- `api_version`：2
+- 权限：**不声明任何权限**（不读卡片、不读世界书、不联网）
+
+---
+
+## 1. 安装
+
+把本仓库目录放到宿主的插件目录下，目录名必须是 `stm-pet`：
+
+```
+<ST-Manager>/data/plugins/stm-pet/
+├─ manifest.json
+├─ backend/
+├─ frontend/
+├─ resources/pets/default-cat/   随包默认形象
+└─ data/                         用户数据（宿主在插件更新时保留）
+```
+
+重启 ST-Manager，或在「设置 → 插件」里启用。桌面端会在屏幕上出现一只小猫；
+移动端**不挂载**（见 §7）。
+
+依赖：只用宿主已装好的 Flask 与 Pillow。**没有新增任何第三方依赖**，
+也没有打包器（前端是浏览器原生 ESM，由宿主 `import()` 加载）。
+
+---
+
+## 2. 宠物包格式
+
+一个形象包是一个目录，里面有 `pet.json` 和若干张 spritesheet 图片。
+
+```json
+{
+  "format": 1,
+  "id": "my-pet",
+  "name": "小猫",
+  "author": "",
+  "size": { "w": 64, "h": 64 },
+  "anchor": { "x": 0.5, "y": 1.0 },
+  "physics": {
+    "gravity": 1800, "walkSpeed": 60, "friction": 0.02,
+    "terminalVelocity": 2400, "bounce": 0.15
+  },
+  "animations": {
+    "idle": { "sheet": "idle.png", "frames": 4, "fps": 6,  "loop": true },
+    "walk": { "sheet": "walk.png", "frames": 6, "fps": 10, "loop": true },
+    "fall": { "sheet": "fall.png", "frames": 2, "fps": 8,  "loop": true },
+    "drag": { "sheet": "drag.png", "frames": 2, "fps": 4,  "loop": true },
+    "land": { "sheet": "land.png", "frames": 3, "fps": 12, "loop": false }
+  }
+}
+```
+
+### 字段说明
+
+| 字段 | 说明 |
+|---|---|
+| `format` | 格式版本。**向前兼容**：更高的版本号不拒绝，未知字段忽略 |
+| `size` | 单帧的**逻辑尺寸**（CSS px）。贴图实际像素可以是它的 N 倍（2x 帧） |
+| `anchor` | 贴图内哪个点对齐世界坐标。`0.5, 1.0` = 底边中点（脚踩地） |
+| `physics.friction` | **每秒速度保留比例**（越小刹车越快）。默认 `0.02`；详见 §2.3 |
+| `animations.<动作>.sheet` | 相对包目录的路径。**水平排布**（帧 0..n-1 从左到右）；垂直排布加 `"layout": "vertical"` |
+
+### 支持的图片格式
+
+`.png` `.webp` `.gif` `.avif` `.svg`
+
+> **`.jpg` / `.jpeg` 不在宿主的插件资产白名单里。** 导入时会**自动转码成 PNG**，
+> 并把 `pet.json` 里的 `sheet` 指向一起改掉——用户把一堆 JPEG 打包上传也能用。
+> 但**手写** `pet.json` 时请直接用 PNG/WebP。
+
+### 最省事的写法
+
+`sheet` 可以只写文件名，表示单帧：
+
+```json
+{ "animations": { "idle": "idle.png" } }
+```
+
+**任何一张单帧图都能跑起来**：缺失的动作沿回退链下溯，最终一定落到 `idle`。
+
+---
+
+## 3. 动作词表与回退链（契约）
+
+| 动作 | 级别 | 触发 | 省略时的回退 |
+|---|---|---|---|
+| `idle` | **必要** | 无输入 | ——（唯一硬必要动作） |
+| `walk` | **必要** | 水平移动 | → `idle`（只位移容器，不播帧） |
+| `drag` | **必要** | 指针按住拖拽中 | → `idle` |
+| `fall` | **必要** | 自由下落中 | → `idle` |
+| `land` | 可选 | 触地瞬间 | → `fall` 尾帧 → `idle` |
+| `sleep` | 可选 | 长时间无操作 | → `idle`（降频） |
+| `click` | 可选 | 被单击 | → `idle` |
+| `happy` / `sad` / `angry` | 可选 | 事件播报时 | → `idle` |
+| `look` | 可选 | 指针靠近 | → `idle` + 容器翻转（`scaleX(-1)`） |
+
+**「必要动作」的含义不是「不给就报错」，而是「不给就退化为静态位移」。**
+没有 `walk` 的图时，宠物照常走动，只是不播帧。
+
+**唯一会报错的**是「连 `idle` 都没有」——因为没有它就没有任何东西可显示。
+此时的错误信息会说明**当前包里有哪些动作**，并给出修复建议。
+
+### 3.1 回退是后端算好的
+
+插件后端在 `/runtime` 接口里把每个动作的**结论**都算好（含回退到哪个动作、
+为什么、一句话解释），前端只负责播。因此设置面板能直接告诉用户
+「缺什么、会怎么回退」，而不是只把动作置灰。
+
+### 3.2 动作覆盖（不改动包本身）
+
+每个动作都能在设置面板里单独换图。覆盖文件落在
+`data/pets/<id>/overrides/<动作>.png`，解析优先级：
+
+```
+用户覆盖 > 用户包内 > 随包内置
+```
+
+内置形象的图片**永远不被写入**——用户对内置宠物换图时只落覆盖文件，
+因此插件更新不会丢用户改动。
+
+### 3.3 关于 `friction` 的取值
+
+实施提示词给的示例是 `0.85`。按「每秒保留比例」理解，0.85 意味着一次甩出要滑行
+约 12 个屏幕宽度、走停后还要滑 30 秒才归零——那不算「松手有减速」，是失控。
+本插件默认取 **`0.02`**：走路停下约 0.4 秒，甩出后 2 秒内滑行约 500px。
+语义已冻结为**每秒速度保留比例**；包可以自定义。
+
+---
+
+## 4. 状态机
+
+```
+idle ⇄ walk（随机漫游 / 被指定移动）
+idle → drag → fall → land → idle
+idle → sleep（长时间无操作）→ idle（任何输入）
+任意 → happy/sad/angry（事件播报，播完回 idle）
+```
+
+两条硬要求：
+
+1. **任何状态都能被 `drag` 打断**——用户抓它时立刻响应；
+2. **`sleep` 期间收到核心事件会唤醒**——用户不会希望「因为宠物睡了所以没看到播报」。
+
+非法迁移会被**拒绝并记录**（不会静默错位）。抓在手里时收到播报会被推迟，
+松手后补播——用户的动作优先。
+
+---
+
+## 5. 配置项
+
+标量开关走**宿主的插件设置表单**（`manifest.config_schema`），在「设置 → 插件」
+里改：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `quiet_mode` | `false` | **勿扰**：只换动作、不弹提示 |
+| `announce_cards` | `true` | 卡片更新时播报（已限流） |
+| `announce_jobs` | `true` | 扫描 / 索引完成时播报 |
+| `show_toast` | `false` | 播报时弹宿主轻提示 |
+| `auto_roam` | `true` | 空闲时自己走动 |
+| `scale` | `1` | 大小倍率（0.5–3） |
+| `sleep_after` | `120` | 无互动多久打盹（秒） |
+
+**「勿扰开关」是插件自己实现的**（宿主侧未做，属产品决策）：
+
+- 开启后**仍然换动作**——用户还是要知道发生了什么；
+- 但不弹提示，且全屏遮罩期间完全不打扰。
+
+形象管理（当前形象、导入、动作覆盖）不走宿主表单——宿主的 `config_schema`
+只支持标量，渲染不了列表与预览图，因此自带 UI（「设置 → 插件 → 桌面宠物设置」，
+或**右键宠物**）。
+
+---
+
+## 6. 播报与限流
+
+订阅的核心事件（都走 `api.on()`，SSE 通路）：
+
+| 事件 | 反应 |
+|---|---|
+| `card.created` / `card.updated` / `card.moved` / `tag.applied` / `worldbook.saved` | `happy` |
+| `card.deleted` | `sad` |
+| `scan.completed` / `index.job_done` | `happy`（+ 可选提示） |
+
+**`card.updated` 在批量操作时会高频触发**（选 500 张卡改标签 = 推 500 次）。
+因此播报采用**前导 + 尾随限流**：
+
+- 窗口 `3` 秒（卡片）/ `1` 秒（扫描与索引）；
+- 窗口内的第一次**立刻播**（用户马上看到「它注意到了」）；
+- 中间的被丢弃，但**最后一次会在窗口结束时补播**——
+  这样批量操作结束时宠物会再动一下，而不是「开头动一下就彻底没反应」。
+
+`scan.completed` / `index.job_done` 尤其值得一提：它们**没有任何 UI 动作触发**，
+在这条通路修好之前前端无从得知操作已完成。
+
+---
+
+## 7. 移动端行为
+
+**移动端不挂载宠物。** 这是宿主的产品决策（屏幕小、常驻图层会遮挡内容且没有
+「挪开」的手段），插件不绕过它。
+
+移动端的降级形态：**只保留「设置」入口**。用户仍可在「设置 → 插件」里打开
+形象管理面板查看、导入、预览形象——只是屏幕上不会出现常驻的宠物。
+
+判定方式（实测过的一个坑）：宿主的 `surfaces.register()` 在**桌面与移动端都返回
+key**，因此不能靠返回值判可用；插件用 `api.surfaces.isOpen('pet')` 判定——
+移动端 `_mountAmbient` 提前返回、不写 open 表，所以返回 `false`。
+详见 `docs/HOST_FEEDBACK.md`。
+
+---
+
+## 8. 性能与省电
+
+循环会**自己停**。省电策略（§4.5 的表格逐条落地）：
+
+| 条件 | 行为 |
+|---|---|
+| 页面不可见 | **停绘** |
+| 系统「减少动效」（`reducedMotion`） | **停绘**（不是降速）——只显示一帧静息图 |
+| 宿主忙（批处理 / 索引 / 扫描） | 降到 1/4 帧率 |
+| 全屏遮罩 / 对话框打开 | 降到 1/4 帧率 |
+| 视口 < 900px 宽 | 降到 1/2 帧率 |
+
+其它措施：
+
+- **一个 rAF 循环**驱动一切（物理 + 帧推进 + 状态机），不是每个动作一个定时器；
+- **固定步长物理**（1/120s）+ 累加器，表现与帧率无关；
+- **帧推进用时间累加**，不用 `setInterval`（掉帧不累积漂移）；
+- 帧推进走 **spritesheet + `background-position`**，换帧只改绘制，
+  不走网络与解码；
+- `will-change: transform` **只在运动期间**加，停下就摘；
+- 单帧形象 + 物理静止时，rAF **真的停掉**，有事件再唤醒。
+
+`reducedMotion` 的语义是**关掉循环帧动画**，不是「降速」——用户开这个选项
+是因为动效让他不适，降速对他没有任何帮助。CSS 侧同时有
+`@media (prefers-reduced-motion: reduce)` 兜底。
+
+---
+
+## 9. 隐私与权限
+
+- **不声明任何权限**：不读卡片、不读世界书、不读标签、不联网、不跑作业。
+- 只订阅核心事件（宿主广播的**事实**，不含卡片内容）。
+- 用户上传的图只落在插件自己的 `data/` 目录里，不经网络外发。
+- 无遥测、无外部请求。
+
+### 导入安全
+
+用户上传是不可信输入，因此做了：
+
+1. **路径穿越**：`realpath` 后校验在数据目录内；zip 内绝对路径与 `..` 一律拒绝；
+2. **解码炸弹**：`Image.MAX_IMAGE_PIXELS` + 显式 4096×4096 上限；
+3. **只信内容不信扩展名**：按 magic bytes 判真实格式，PDF/EXE 冒充 PNG 会被拒；
+4. **体积上限**：单图 8 MiB、单包 32 MiB、解压后 128 MiB、条目数 2048；
+5. **格式白名单 + 转码**：JPEG 等统一转成 PNG/WebP 落盘；
+6. **结构化错误**：所有失败都返回 `{success:false, msg, error, hint}`，
+   **绝不暴露堆栈**。
+
+---
+
+## 10. 开发
+
+```bash
+# 后端 + CSS/JS 契约测试
+python -m pytest -q
+
+# 前端纯逻辑测试（Node 原生 test runner，零依赖）
+node --test "tests/frontend/*.test.mjs"
+```
+
+### 真实浏览器验收
+
+阶段 0 与阶段 2–5 的判定项都在**真实 Chrome** 里验过。用法：
+
+```bash
+# 1. 建一个影子宿主（复用宿主代码，但用独立 data/，不污染用户数据）
+python tools/host_sandbox.py --create --install .
+
+# 2. 启动它
+cd %TEMP%\st-manager-pet-sandbox && python app.py
+
+# 3. 跑验收
+node tools/verify-pet.mjs        # 宠物本身：19 项
+node tools/verify-upload.mjs     # 形象管理链：15 项
+```
+
+影子宿主的做法：用 junction 复用宿主的 `core/` `static/` `templates/`，
+但 `data/` 是真实独立目录，因此**宿主仓库一个字节都不写**。
+
+### 验收自检
+
+```bash
+python tools/acceptance_check.py --out artifacts/acceptance-report.txt
+```
+
+逐条核对实施提示词 §6 的验收标准并给出**证据**（不是「我看过了」）。
+Windows 终端默认 GBK，中文会乱码，所以报告建议写文件（§8 陷阱 8）。
+
+### 辅助工具
+
+| 工具 | 用途 |
+|---|---|
+| `tools/host_sandbox.py` | 建/删影子宿主（junction 复用宿主代码，独立 `data/`） |
+| `tools/acceptance_check.py` | 逐条核对验收标准 |
+| `tools/crop_icon.py` | 裁剪插件图标的 viewBox（含各尺寸渲染对照） |
+| `tools/make_builtin_pets.py` | 生成随包默认形象（构建期，产物提交进仓库） |
+| `tools/preview_builtin_pet.py` | 把各动作拼成对照图，人眼核对 |
+| `tools/screenshot-pet.mjs` | 在真实浏览器里给宠物拍截图 |
+| `tools/check_jpeg_pack.py` | 手工核对「包内 JPEG 自动转码」这条链 |
+
+### 插件图标
+
+图标由 `frontend/assets/icon.svg` 提供，用在三处：设置入口（`entries[].icon`）、
+设置面板标题、插件总览。
+
+**宿主的渲染方式决定了它必须是「单色剪影」**（`static/css/modules/icons.css`）：
+
+```css
+.ui-icon.ui-icon--asset {
+  background-color: currentColor;
+  -webkit-mask: var(--ui-icon-mask) center / contain no-repeat;
+}
+```
+
+两个后果：
+
+1. **mask 只看 alpha**，颜色统一由 `currentColor` 决定 —— 多色/渐变会被抹平，
+   因此设计成单色填充剪影（深色/浅色主题自动适配）。
+2. **`contain` 按 SVG 自身比例缩放** —— 所以 viewBox **必须紧贴内容**。
+   原设计稿画布是 1792×2400、内容只占中间一块，不裁剪的话
+   在 16px 图标位里只剩一小团。
+
+裁剪由 `tools/crop_icon.py` 完成（可重跑，`--measure` 会核对 bbox 常量）：
+
+```bash
+python tools/crop_icon.py --measure   # 核对源文件的 bbox
+python tools/crop_icon.py             # 重新生成 + 输出各尺寸对照图
+```
+
+`tests/test_icon_contracts.py` 把这些都锁成了测试：viewBox 必须贴内容、
+必须是单色、`fill` 必须显式给（mask 下 `stroke` 无效）、
+图标路径必须是合法的插件资源路径。
+
+图标也用在**宿主轻提示（toast）**里 —— 通知因此是品牌化的。
+这依赖宿主 `ST-Manager@715d0a8` 的修复（该修复由本插件审计发现并提交提示词，
+见 `docs/HOST_TOAST_ICON_FIX_PROMPT.md`）：修复前 toast 的图标位只接受
+16 个写死的宿主图标名，插件资源路径会被静默丢弃。在**旧宿主**上，
+这个图标会降级为「图标位留空 + 一条 console 警告」，**文案照常显示**。
+
+### 目录结构
+```
+backend/
+├─ __init__.py          register(api) 装配入口
+├─ routes.py            后端路由（含错误处理）
+└─ core/
+   ├─ pack.py           宠物包格式 + 动作回退链
+   ├─ store.py          形象存储（两层覆盖 / 导入导出 / 设置）
+   ├─ imports.py        导入安全（magic bytes / 解码炸弹 / 转码）
+   ├─ paths.py          路径安全（自己实现，不 import 宿主）
+   └─ errors.py         错误码与结构化异常
+
+frontend/
+├─ plugin.js            入口：注册 ambient / 订阅事件 / 清理
+├─ petview.js           **唯一**碰 DOM 的模块
+├─ clock.js             帧推进 + 省电决策（纯逻辑）
+├─ physics.js           物理（固定步长，纯逻辑）
+├─ statemachine.js      状态机（纯逻辑）
+├─ announce.js          播报 + 限流（纯逻辑）
+├─ panel.js             形象管理面板
+└─ plugin.css           样式（全部带作用域）
+```
+
+**设计原则**：判定逻辑都在纯逻辑层（可在 Node 里测），
+`petview.js` 只负责把逻辑接到 DOM、把宿主事件翻译成逻辑调用。
+
+---
+
+## 11. 已知限制
+
+- **移动端没有常驻宠物**（宿主的产品决策，见 §7）。
+- **`api.host.onState()` 没有「能力探测」字段**：插件判定 ambient 是否真的挂载
+  只能靠 `api.surfaces.isOpen()`。
+- 形象的**动效时长不能逐动作微调**：只能设 `frames` 与 `fps`。
+- 没有多宠物 / 多实例：一个宿主里只养一只。
+- 形象包不支持**垂直以外的多行排布**（`horizontal` / `vertical` 两种）。
+- `anchor` 只影响贴图与世界坐标的对齐，不支持旋转 / 缩放锚点。
+
+---
+
+## 12. 许可
+
+MIT
