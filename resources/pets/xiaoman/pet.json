@@ -1,0 +1,91 @@
+{
+  "format": 1,
+  "id": "xiaoman",
+  "name": "小满",
+  "author": "ST-Manager",
+  "size": {
+    "w": 384,
+    "h": 576
+  },
+  "anchor": {
+    "x": 0.5,
+    "y": 0.9809
+  },
+  "scale": 0.45,
+  "pixelated": false,
+  "physics": {
+    "gravity": 1800,
+    "walkSpeed": 70,
+    "friction": 0.02,
+    "terminalVelocity": 2400,
+    "bounce": 0.12
+  },
+  "animations": {
+    "idle": {
+      "sheet": "idle.png",
+      "frames": 4,
+      "fps": 6,
+      "loop": true
+    },
+    "walk": {
+      "sheet": "walk.png",
+      "frames": 6,
+      "fps": 10,
+      "loop": true
+    },
+    "drag": {
+      "sheet": "drag.png",
+      "frames": 2,
+      "fps": 4,
+      "loop": true
+    },
+    "fall": {
+      "sheet": "fall.png",
+      "frames": 2,
+      "fps": 8,
+      "loop": true
+    },
+    "land": {
+      "sheet": "land.png",
+      "frames": 3,
+      "fps": 12,
+      "loop": false
+    },
+    "click": {
+      "sheet": "click.png",
+      "frames": 3,
+      "fps": 12,
+      "loop": false
+    },
+    "sleep": {
+      "sheet": "sleep.png",
+      "frames": 4,
+      "fps": 3,
+      "loop": true
+    },
+    "happy": {
+      "sheet": "happy.png",
+      "frames": 4,
+      "fps": 8,
+      "loop": false
+    },
+    "sad": {
+      "sheet": "sad.png",
+      "frames": 4,
+      "fps": 5,
+      "loop": true
+    },
+    "angry": {
+      "sheet": "angry.png",
+      "frames": 4,
+      "fps": 8,
+      "loop": true
+    },
+    "look": {
+      "sheet": "look.png",
+      "frames": 4,
+      "fps": 6,
+      "loop": true
+    }
+  }
+}
