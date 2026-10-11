@@ -258,6 +258,79 @@ def test_ambient_content_uses_absolute_positioning(css_body):
     assert re.search(r'position\s*:\s*absolute', css_body)
 
 
+# ------------------------------------------------------- 文件输入（真实踩过）
+
+
+def _pick_file_section() -> str:
+    """取出 `panel.js` 里 `pickFile()` 的函数体（含前置注释）。"""
+    source = read(os.path.join(REPO_ROOT, 'frontend', 'panel.js'))
+    start = source.index('function pickFile')
+    # 往前带上紧邻的文档注释，这样注释里写的约束也被覆盖到
+    head = source.rfind('/**', 0, start)
+    if head != -1 and source[head:start].rstrip().endswith('*/'):
+        start = head
+    return source[start:source.index('\n  }\n', start)]
+
+
+def test_file_input_is_hidden_inline_not_only_by_scoped_css():
+    """★ 真实踩过的 bug：文件输入只加类名 → 作用域 CSS 匹配不到它。
+
+    `pickFile()` 把 `<input type=file>` 挂在 `document.body` 下，而
+    `plugin.css` 里的 `.plugin-stm-pet .pet-file-input` 是**作用域内**选择器
+    （F11 强制每条顶层规则以插件作用域为根），body 上既没有 `plugin-stm-pet`
+    类也没有 `data-plugin` 属性 —— 那条隐藏规则根本匹配不到。
+
+    症状：原生「选择文件 / 未选择任何文件」控件按文档流排在页面最底部，
+    **每点一次多一条，刷新页面才消失**（用户截图报障）。
+
+    修法只能是**内联** style（不能给 CSS 加裸选择器：那会让
+    `installer.scan_css_scope()` 判定整份样式违规、拒绝加载）。
+    """
+    section = _pick_file_section()
+
+    assert "style.position = 'absolute'" in section, (
+        '文件输入必须内联隐藏 —— 只靠作用域 CSS 类名匹配不到 body 下的它'
+    )
+    assert "style.left = '-9999px'" in section, '必须内联移出视口'
+    assert "style.opacity = '0'" in section, '必须内联透明'
+    assert 'aria-hidden' in section, '隐藏元素要从无障碍树里摘掉'
+
+
+def test_file_input_is_cleaned_up_on_change_and_cancel():
+    """★ 同一 bug 的另一半：**取消也要回收**。
+
+    用户点「取消」时浏览器只派发 `cancel`、**不派发 `change`**
+    （Safari / 旧 Firefox 连 `cancel` 都不派发），只监听 `change`
+    会让 input 永久留在 DOM 里 —— 这正是「点一次多一条」的直接原因。
+    """
+    section = _pick_file_section()
+
+    assert "addEventListener('change'" in section, '必须有 change 路径'
+    assert "addEventListener('cancel'" in section, (
+        '必须有 cancel 路径 —— 用户取消时不会派发 change'
+    )
+    assert 'removeChild(input)' in section or 'input.remove()' in section, (
+        '必须真正把节点从 DOM 里摘掉'
+    )
+    assert "removeEventListener('focus'" in section, (
+        '回收时要摘掉 window focus 监听，否则监听器泄漏'
+    )
+
+
+def test_file_input_css_rule_stays_scoped():
+    """反向钉死：**不能**为了隐藏文件输入而写一条裸 `.pet-file-input` 规则。
+
+    那会让宿主的 `scan_css_scope()` 判定整份样式违规并拒绝加载，
+    症状从「多出几条选择文件」变成「面板完全没样式」——更难查。
+    """
+    css = read(PLUGIN_CSS)
+    for match in re.finditer(r'(?m)^\s*([^{}\n]*\.pet-file-input[^{}\n]*)\{', css):
+        selector = match.group(1).strip()
+        assert (
+            f'.plugin-{PLUGIN_ID}' in selector or f'[data-plugin="{PLUGIN_ID}"]' in selector
+        ), f'.pet-file-input 的规则必须带作用域根，否则整份样式被拒绝加载: {selector}'
+
+
 # ------------------------------------------------------------ JS 静态契约
 
 

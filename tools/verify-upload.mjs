@@ -150,6 +150,13 @@ async function main() {
     );
 
     // ---- ② 点「换图」→ 用 CDP 塞入真实文件（用户路径）
+    //
+    // ⚠️ 这里**必须**同时断言「可见性」，不能只断言「存在」。
+    // 第一版只查 `Boolean(window.__capturedInput)`，于是漏掉了一个真实 bug：
+    // 文件输入挂在 `document.body` 下，而 `plugin.css` 的隐藏规则是**作用域内**
+    // 选择器（`.plugin-stm-pet .pet-file-input`），匹配不到 body 下的裸 input →
+    // 原生「选择文件 / 未选择任何文件」控件堆在页面底部，每点一次多一条。
+    // 断言「存在」时它照样 PASS，所以脚本 15/15 全绿而用户能看见它。
     const uploadInfo = await page.evaluate(`(async () => {
       const tile = Array.from(document.querySelectorAll('.plugin-stm-pet .pet-action-tile'))
         .find((node) => (node.querySelector('.pet-action-name') || {}).textContent === '待机');
@@ -168,11 +175,25 @@ async function main() {
       button.click();
       await new Promise((r) => setTimeout(r, 250));
       document.body.appendChild = original;
-      return { found: Boolean(window.__capturedInput) };
+      const input = window.__capturedInput;
+      if (!input) return { found: false };
+      // 可见性核对：原生控件一旦可见就会占据布局并显示文字
+      const rect = input.getBoundingClientRect();
+      const style = getComputedStyle(input);
+      const visible = rect.width > 4 && rect.height > 4 && style.opacity !== '0'
+        && style.visibility !== 'hidden' && style.display !== 'none';
+      return {
+        found: true,
+        visible,
+        rect: [Math.round(rect.width), Math.round(rect.height)],
+        opacity: style.opacity,
+        position: style.position,
+        ariaHidden: input.getAttribute('aria-hidden'),
+      };
     })()`);
     record(
-      '② 点「换图」会创建文件输入',
-      Boolean(uploadInfo && uploadInfo.found),
+      '② 点「换图」会创建文件输入，且它**不可见**（不是只「存在」）',
+      Boolean(uploadInfo && uploadInfo.found && uploadInfo.visible === false),
       JSON.stringify(uploadInfo),
     );
 
@@ -449,6 +470,77 @@ async function main() {
       '⑮ 历经上传/删除/非法输入后宠物仍正常活动',
       alive.alive && alive.animating,
       JSON.stringify(alive),
+    );
+
+    // ---- ⑯ 「取消」也要回收文件输入（用户报障的直接机制）
+    //
+    // 用户点「取消」时浏览器**只派发 `cancel`、不派发 `change`**，
+    // 只监听 change 会让 input 永久留在 DOM 里 → 每点一次多一条
+    // 「选择文件 / 未选择任何文件」，刷新页面才消失。
+    //
+    // 这条断言与 ② 的可见性断言互补：② 保证「看得见的是零」，
+    // 这里保证「攒下来的也是零」。两者都缺一不可 ——
+    // 旧脚本只断言「存在」，所以 15/15 全绿却漏掉了这个 bug。
+    //
+    // ⚠️ 计数只能数**宠物插件自己的** `input.pet-file-input`。
+    // 宿主页面本身就有二十来个静态文件输入（卡片导入 / 头像 / 世界书 /
+    // 美化资源 / 预设…），它们由宿主自己的非作用域 CSS 正确隐藏，与本 bug 无关。
+    // 第一版断言写成 `after === 0`，于是把宿主的输入全部计入而必然失败
+    // （实测 `before: 24, after: 24` —— 数量其实纹丝不动，说明并没有泄漏）。
+    //
+    // 同时必须记录**峰值**以证明「创建确实发生过」：只断言「最终等于基线」的话，
+    // 万一 pickFile 压根没被调用（按钮改名、面板没渲染），测试会假绿。
+    const leak = await page.evaluate(`(async () => {
+      const panelApi = window.__petApi;
+      panelApi.surfaces.open('pet-settings', { source: 'verify-upload' });
+      await new Promise((r) => setTimeout(r, 1200));
+
+      // 插件自己的（应被回收）
+      const mine = () => document.querySelectorAll('body input.pet-file-input').length;
+      // 全页面的（用来证明没误删宿主自己的输入）
+      const all = () => document.querySelectorAll('body input[type=file]').length;
+
+      const baselineMine = mine();
+      const baselineAll = all();
+      let peakMine = baselineMine;
+      let sawButton = true;
+
+      // 连点三次「导入形象包」再全部取消：走的是真实的 cancel 路径
+      for (let round = 0; round < 3; round += 1) {
+        const button = Array.from(
+          document.querySelectorAll('.plugin-stm-pet .pet-panel-toolbar button'),
+        ).find((node) => node.textContent.includes('导入形象包'));
+        if (!button) { sawButton = false; break; }
+        button.click();
+        await new Promise((r) => setTimeout(r, 150));
+        peakMine = Math.max(peakMine, mine());
+        // 用户按取消：Chromium 会派发 cancel；这里同时派发以模拟真实行为，
+        // 并触发 window focus 兜底（两条回收路径都覆盖到）
+        for (const input of document.querySelectorAll('body input.pet-file-input')) {
+          input.dispatchEvent(new Event('cancel', { bubbles: false }));
+        }
+        window.dispatchEvent(new Event('focus'));
+        await new Promise((r) => setTimeout(r, 200));
+      }
+
+      // 再等一拍，让 focus 兜底里的 setTimeout(0) 跑完
+      await new Promise((r) => setTimeout(r, 300));
+
+      return {
+        sawButton,
+        baselineMine, peakMine, afterMine: mine(),
+        baselineAll, afterAll: all(),
+      };
+    })()`);
+    record(
+      '⑯ 连续三次「导入 → 取消」：每次确实创建，取消后零残留（无 DOM 泄漏）',
+      Boolean(
+        leak && leak.sawButton
+        && leak.peakMine > leak.baselineMine      // 创建真的发生了
+        && leak.afterMine === leak.baselineMine   // 全部被回收
+        && leak.afterAll === leak.baselineAll,    // 宿主自己的输入没被误删
+      ),
+      JSON.stringify(leak),
     );
 
     process.stdout.write(`\n${'='.repeat(70)}\n`);

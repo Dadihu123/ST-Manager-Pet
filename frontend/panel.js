@@ -217,15 +217,66 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     });
   }
 
+  /**
+   * 打开系统文件选择器（导入形象包 / 逐动作换图共用）。
+   *
+   * ⚠️ 两个**必须**遵守的点，都是实测踩出来的：
+   *
+   * 1. **隐藏必须内联写死，不能只靠 `.pet-file-input` 那个类。**
+   *    这个 `<input>` 挂在 `document.body` 上（面板在 modal 里，祖先带
+   *    `overflow` / `transform` 时原生选择器行为不稳定，且不该进宿主的焦点陷阱），
+   *    而 `plugin.css` 里的 `.plugin-stm-pet .pet-file-input` 是**作用域内**选择器
+   *    （F11 强制要求每条顶层规则以插件作用域为根），匹配不到 body 下的裸 input ——
+   *    结果是原生「选择文件 / 未选择任何文件」控件直接排在页面底部，
+   *    **每点一次多一条，刷新页面才消失**。
+   *
+   *    注意**不能**用「给 CSS 加一条裸 `.pet-file-input` 规则」来修：那会让
+   *    `installer.scan_css_scope()` 判定整份样式违规并拒绝加载（症状变成「面板
+   *    完全没样式」）。内联 style 是唯一既过作用域检查、又能真正隐藏的写法。
+   *
+   * 2. **取消也必须回收元素。** 用户点「取消」时浏览器只派发 `cancel`
+   *    （Safari / 旧 Firefox 连 `cancel` 都不派发），**不派发 `change`** ——
+   *    只监听 `change` 会让这个 input 永久留在 DOM 里。
+   *    因此 `change` / `cancel` / 「窗口重新获得焦点后仍无文件」三条路都要收。
+   */
   function pickFile({ accept, onPicked }) {
     const input = el('input', 'pet-file-input');
     input.type = 'file';
     if (accept) input.accept = accept;
+    // 内联的视觉隐藏（不依赖作用域选择器，见上面第 1 点）
+    input.style.position = 'absolute';
+    input.style.left = '-9999px';
+    input.style.top = '0';
+    input.style.width = '1px';
+    input.style.height = '1px';
+    input.style.opacity = '0';
+    input.style.pointerEvents = 'none';
+    input.tabIndex = -1;
+    input.setAttribute('aria-hidden', 'true');
+
+    let settled = false;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('focus', onWindowFocus);
+      if (input.parentNode) input.parentNode.removeChild(input);
+    };
+
     input.addEventListener('change', () => {
       const file = input.files && input.files[0];
-      input.remove();
+      cleanup();
       if (file) onPicked(file);
     });
+    // 用户点了「取消」：Chromium 派发 cancel，Safari / 旧 Firefox 不派发
+    input.addEventListener('cancel', cleanup);
+    // 兜底：对话框关闭后窗口重获焦点；再等一拍仍没有文件就回收
+    const onWindowFocus = () => {
+      window.setTimeout(() => {
+        if (!input.files || !input.files.length) cleanup();
+      }, 0);
+    };
+    window.addEventListener('focus', onWindowFocus);
+
     document.body.appendChild(input);
     input.click();
   }

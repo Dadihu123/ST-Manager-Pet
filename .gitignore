@@ -4,6 +4,9 @@ data/
 # 构建 / 核对产物（截图、报告）
 artifacts/
 
+# 临时脚本 / 一次性诊断产物
+tmp/
+
 # Python
 __pycache__/
 *.py[cod]
