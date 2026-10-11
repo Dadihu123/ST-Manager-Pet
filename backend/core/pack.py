@@ -33,11 +33,27 @@ from .paths import is_safe_relative_name, to_posix
 #: 未知字段忽略；只在日志/响应里回传实际读到的值供排查。
 FORMAT_VERSION = 1
 
+#: 方向化行走动作 → 对侧动作名。
+#:
+#: 为什么需要：宠物是**水平**移动的，而正面视角的行走图看起来是
+#: 「原地踏步 + 平移」。因此允许形象提供左右两套侧视行走图。
+#:
+#: 只提供一侧时，另一侧**镜像**复用（见 `ResolvedAction.mirror`），
+#: 对称的形象（例如默认小猫）因此不必画两套。
+#: 但**左右不对称**的形象（例如「小满」的发夹只在单侧）必须自己画两套，
+#: 否则镜像会把发夹翻到另一边——这不是引擎能替作者决定的事。
+WALK_DIRECTION_ACTIONS = {
+    'walk-left': 'walk-right',
+    'walk-right': 'walk-left',
+}
+
 #: 动作词表与「省略时的回退链」（§3.3，照抄为契约）。
 #: `idle` 是唯一硬必要动作；其余缺失时沿链下溯，最终一定落到 `idle`。
 ACTION_FALLBACKS = {
     'idle': (),
     'walk': ('idle',),
+    'walk-left': ('walk', 'idle'),
+    'walk-right': ('walk', 'idle'),
     'drag': ('idle',),
     'fall': ('idle',),
     'land': ('fall', 'idle'),
@@ -177,6 +193,10 @@ class ResolvedAction:
     fps: int = 0
     loop: bool = True
     layout: str = 'horizontal'
+    #: 是否要把 `sheet` **水平镜像**后再播（方向化行走只提供一侧时为 True）。
+    #: 前端据此决定 `transform: scaleX(-1)`——注意这**不同于**「按朝向翻转」：
+    #: 方向化贴图本身已经画好了朝向，翻转只由这个标记决定。
+    mirror: bool = False
     #: 尝试过的动作序列（含起点），用于向用户解释「为什么看起来是这样」。
     chain: list = field(default_factory=list)
     #: 面向用户的一句话解释。
@@ -192,6 +212,7 @@ class ResolvedAction:
             'fps': self.fps,
             'loop': self.loop,
             'layout': self.layout,
+            'mirror': self.mirror,
             'chain': list(self.chain),
             'note': self.note,
         }
@@ -228,6 +249,10 @@ class PetPack:
         命中某个有 sheet 的动作 → `kind='animated'`；
         命中的动作存在但**没有 sheet**（或链路落空）→ `kind='static'`，
         调用方应只位移容器、不播帧。
+
+        方向化行走（`walk-left` / `walk-right`）多一层：
+        自己那一侧缺失时，**镜像**对侧复用（`mirror=True`）。
+        镜像之后才轮到正面 `walk`，最后是 `idle`。
         """
         action = str(action or '').strip()
         if not action:
@@ -235,6 +260,10 @@ class PetPack:
 
         # 未知动作名：直接并入回退链（保证向前兼容：新动作名在旧包上不报错）
         chain = [action]
+        # 方向化行走：先试对侧（镜像），再走常规回退链
+        opposite = WALK_DIRECTION_ACTIONS.get(action)
+        if opposite:
+            chain.append(opposite)
         for candidate in ACTION_FALLBACKS.get(action, ('idle',)):
             if candidate not in chain:
                 chain.append(candidate)
@@ -246,13 +275,21 @@ class PetPack:
             if spec is None:
                 continue
             if spec.sheet:
-                note = ''
+                # 命中的是对侧方向化动作 → 需要镜像
+                mirrored = bool(opposite) and candidate == opposite
                 if candidate != action:
-                    note = f'缺少「{action}」动作，已回退到「{candidate}」。'
+                    if mirrored:
+                        note = (f'缺少「{action}」动作，已镜像复用'
+                                f'「{candidate}」。')
+                    else:
+                        note = f'缺少「{action}」动作，已回退到「{candidate}」。'
+                else:
+                    note = ''
                 return ResolvedAction(
                     action=action, source=candidate, kind=KIND_ANIMATED,
                     sheet=spec.sheet, frames=spec.frames, fps=spec.fps,
                     loop=spec.loop, layout=spec.layout,
+                    mirror=mirrored,
                     chain=chain, note=note,
                 )
             # 存在但没 sheet → 只位移不播帧（「必要动作」的降级语义）
@@ -271,8 +308,23 @@ class PetPack:
         )
 
     def missing_required(self) -> list:
-        """缺失的「必要动作」列表（**不是错误**，但要告诉用户会怎么降级）。"""
-        return [name for name in REQUIRED_ACTIONS if name not in self.animations]
+        """缺失的「必要动作」列表（**不是错误**，但要告诉用户会怎么降级）。
+
+        `walk` 的特例：提供了**任一侧**方向化行走（`walk-left` / `walk-right`）
+        就算满足——另一侧会自动镜像，正面 `walk` 已不再是必需。
+        不这样特判的话，只给侧视图的形象会被误报「缺少行走」。
+        """
+        def satisfied(name: str) -> bool:
+            if name in self.animations:
+                return True
+            if name == 'walk':
+                return any(
+                    candidate in self.animations
+                    for candidate in WALK_DIRECTION_ACTIONS
+                )
+            return False
+
+        return [name for name in REQUIRED_ACTIONS if not satisfied(name)]
 
     def to_dict(self) -> dict:
         return {

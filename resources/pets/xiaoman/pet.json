@@ -15,7 +15,7 @@
   "pixelated": false,
   "physics": {
     "gravity": 1800,
-    "walkSpeed": 70,
+    "walkSpeed": 52,
     "friction": 0.02,
     "terminalVelocity": 2400,
     "bounce": 0.12
@@ -24,13 +24,25 @@
     "idle": {
       "sheet": "idle.png",
       "frames": 4,
-      "fps": 6,
+      "fps": 4,
       "loop": true
     },
     "walk": {
       "sheet": "walk.png",
       "frames": 6,
-      "fps": 10,
+      "fps": 8,
+      "loop": true
+    },
+    "walk-left": {
+      "sheet": "walk-left.png",
+      "frames": 4,
+      "fps": 8,
+      "loop": true
+    },
+    "walk-right": {
+      "sheet": "walk-right.png",
+      "frames": 4,
+      "fps": 8,
       "loop": true
     },
     "drag": {
@@ -66,25 +78,25 @@
     "happy": {
       "sheet": "happy.png",
       "frames": 4,
-      "fps": 8,
+      "fps": 6,
       "loop": false
     },
     "sad": {
       "sheet": "sad.png",
       "frames": 4,
-      "fps": 5,
+      "fps": 4,
       "loop": true
     },
     "angry": {
       "sheet": "angry.png",
       "frames": 4,
-      "fps": 8,
+      "fps": 6,
       "loop": true
     },
     "look": {
       "sheet": "look.png",
       "frames": 4,
-      "fps": 6,
+      "fps": 5,
       "loop": true
     }
   }

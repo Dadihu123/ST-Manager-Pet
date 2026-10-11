@@ -22,6 +22,7 @@ from backend.core.pack import (
     KIND_ANIMATED,
     KIND_STATIC,
     REQUIRED_ACTIONS,
+    WALK_DIRECTION_ACTIONS,
     PetPack,
     from_dict,
     load_file,
@@ -83,6 +84,114 @@ def test_fallback_table_matches_contract():
         assert ACTION_FALLBACKS[name] == ('idle',)
     # 唯一硬必要动作
     assert REQUIRED_ACTIONS[0] == 'idle'
+    # 方向化行走：先回退到正面 walk，再 idle
+    assert ACTION_FALLBACKS['walk-left'] == ('walk', 'idle')
+    assert ACTION_FALLBACKS['walk-right'] == ('walk', 'idle')
+    assert WALK_DIRECTION_ACTIONS == {
+        'walk-left': 'walk-right',
+        'walk-right': 'walk-left',
+    }
+
+
+# ------------------------------------------------------ 方向化行走（walk-left/right）
+
+
+def _directional_pack(**anims):
+    base = {'idle': {'sheet': 'idle.png'}}
+    base.update(anims)
+    return from_dict({'id': 'dir', 'animations': base})
+
+
+def test_walk_direction_both_sides_use_their_own_sheet():
+    parsed = _directional_pack(**{
+        'walk-left': {'sheet': 'wl.png', 'frames': 4},
+        'walk-right': {'sheet': 'wr.png', 'frames': 4},
+    })
+    left = parsed.resolve('walk-left')
+    right = parsed.resolve('walk-right')
+    assert left.source == 'walk-left'
+    assert left.sheet == 'wl.png'
+    assert left.mirror is False, '自己那一侧不该镜像'
+    assert right.source == 'walk-right'
+    assert right.sheet == 'wr.png'
+    assert right.mirror is False
+
+
+def test_walk_direction_missing_side_mirrors_the_other():
+    """★ 只提供一侧时，另一侧镜像复用——这是「可只设置一个」的落点。"""
+    parsed = _directional_pack(**{
+        'walk-left': {'sheet': 'wl.png', 'frames': 4},
+    })
+    # 有的一侧：正常播，不镜像
+    left = parsed.resolve('walk-left')
+    assert left.source == 'walk-left'
+    assert left.mirror is False
+    # 缺的一侧：仍解析到左侧贴图，但标记需要镜像
+    right = parsed.resolve('walk-right')
+    assert right.source == 'walk-left'
+    assert right.sheet == 'wl.png'
+    assert right.mirror is True
+    assert right.kind == KIND_ANIMATED
+    assert right.note, '镜像复用要给出解释'
+
+
+def test_walk_direction_falls_back_to_frontal_walk_then_idle():
+    """旧式形象：只有正面 walk 时，左右都回退到它且**不**镜像。
+
+    不镜像的原因：正面图没有朝向信息，翻转由前端按移动方向决定
+    （`direction.js` 的旧行为），后端不该再叠一层。
+    """
+    parsed = _directional_pack(**{'walk': {'sheet': 'w.png', 'frames': 6}})
+    for action, opposite in (('walk-left', 'walk-right'),
+                             ('walk-right', 'walk-left')):
+        resolved = parsed.resolve(action)
+        assert resolved.source == 'walk', f'{action} 应回退到正面 walk'
+        assert resolved.sheet == 'w.png'
+        assert resolved.mirror is False
+        # 链路记录「试过哪些」：自己 → 对侧 → 正面 → idle
+        assert resolved.chain == [action, opposite, 'walk', 'idle']
+
+
+def test_walk_direction_falls_back_to_idle_when_no_walk_at_all():
+    parsed = _directional_pack()
+    for action in ('walk-left', 'walk-right'):
+        resolved = parsed.resolve(action)
+        assert resolved.source == 'idle'
+        assert resolved.mirror is False
+        assert resolved.kind == KIND_ANIMATED
+
+
+def test_directional_walk_satisfies_the_walk_requirement():
+    """★ 只给侧视行走的形象不该被误报「缺少行走」。"""
+    parsed = _directional_pack(**{
+        'walk-left': {'sheet': 'wl.png', 'frames': 4},
+        'drag': {'sheet': 'd.png'},
+        'fall': {'sheet': 'f.png'},
+    })
+    assert 'walk' not in parsed.missing_required(), \
+        '有 walk-left 就不该报缺少 walk'
+    # 完全没有行走动作时仍要报
+    bare = _directional_pack(**{
+        'drag': {'sheet': 'd.png'},
+        'fall': {'sheet': 'f.png'},
+    })
+    assert 'walk' in bare.missing_required()
+
+
+def test_mirror_flag_is_json_safe_and_round_trips():
+    parsed = _directional_pack(**{'walk-left': {'sheet': 'wl.png', 'frames': 4}})
+    payload = parsed.resolve('walk-right').to_dict()
+    assert payload['mirror'] is True
+    assert payload['source'] == 'walk-left'
+    # 必须能直接 json 序列化（要经 HTTP 给前端）
+    assert json.loads(json.dumps(payload))['mirror'] is True
+
+
+def test_frontal_walk_resolution_has_no_mirror_flag():
+    """正面动作不该带 mirror=True（回归保护）。"""
+    parsed = from_dict(pack())
+    for action in ACTION_FALLBACKS:
+        assert parsed.resolve(action).mirror is False, action
 
 
 def test_single_frame_pack_resolves_every_action_to_idle():

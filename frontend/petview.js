@@ -14,6 +14,11 @@
  */
 
 import { createFrameClock, createIdleGate, decideThrottle } from './clock.js';
+import {
+  mirrorForNonWalkAction,
+  resolveWalkVisual,
+  walkActionFor,
+} from './direction.js';
 import { createPhysics, estimateReleaseVelocity } from './physics.js';
 import { createStateMachine, STATES } from './statemachine.js';
 
@@ -152,6 +157,13 @@ export function createPetView(options = {}) {
   let reducedMotion = Boolean(config.reducedMotion);
   let disposed = false;
   let facing = 1;
+  /**
+   * 当前**行走方向**（负数向左）。
+   *
+   * 与 `facing` 分开：`facing` 是「朝向」，会保留到停下之后（站着时仍朝那边）；
+   * `walkDirection` 只在行走期间有意义，用来选 `walk-left` / `walk-right`。
+   */
+  let walkDirection = 1;
   let dragSamples = [];
   let pointerId = null;
   let dragStart = null;
@@ -170,7 +182,9 @@ export function createPetView(options = {}) {
   function applyActionForState() {
     const state = machine.state;
     let name = machine.action;
-    if (state === STATES.WALK) name = 'walk';
+    // 行走用**方向化**动作名：形象提供侧视左右两套时播对应那套，
+    // 没提供时后端已把回退结论算好（对侧镜像 → 正面 walk → idle）。
+    if (state === STATES.WALK) name = walkActionFor(walkDirection);
     else if (state === STATES.DRAG) name = 'drag';
     else if (state === STATES.FALL) name = 'fall';
     else if (state === STATES.LAND) name = 'land';
@@ -178,6 +192,8 @@ export function createPetView(options = {}) {
     else if (state === STATES.REACT) name = machine.action;
     else name = 'idle';
     setAction(name);
+    // 动作换了 → 翻转结论可能也变了（正面图要按朝向翻，方向化贴图不翻）
+    applyFacing();
   }
 
   /**
@@ -242,8 +258,21 @@ export function createPetView(options = {}) {
     root.style.transform = `translate3d(${left.toFixed(2)}px, ${top.toFixed(2)}px, 0)`;
   }
 
+  /**
+   * 按当前状态决定是否水平翻转贴图。
+   *
+   * 两种语义**不能混为一谈**（见 `direction.js` 的说明）：
+   * - 行走时：翻转由「方向化贴图 + 后端 `mirror` 标记」决定。
+   *   方向化贴图已经画好了朝向，再按朝向翻一次就反了。
+   * - 其它动作：只有**没有**方向化贴图的形象才按朝向翻转（旧行为）。
+   *   提供了方向化贴图的形象（典型：头饰不对称）连 idle 也不翻，
+   *   否则发夹会随朝向左右跳。
+   */
   function applyFacing() {
-    sprite.style.transform = facing < 0 ? 'scaleX(-1)' : '';
+    const mirror = machine.state === STATES.WALK
+      ? resolveWalkVisual(walkDirection, actions).mirror
+      : mirrorForNonWalkAction(facing, actions);
+    sprite.style.transform = mirror ? 'scaleX(-1)' : '';
   }
 
   // ---------------------------------------------------------------- rAF
@@ -408,10 +437,10 @@ export function createPetView(options = {}) {
     const world = physics.bounds;
     walkTargetX = 40 + Math.random() * Math.max(1, world.width - 80);
     const direction = walkTargetX > physics.x ? 1 : -1;
-    if (direction !== facing) {
-      facing = direction;
-      applyFacing();
-    }
+    // 先写方向，再进 WALK 态：`startWalk` 会触发 `applyActionForState`，
+    // 那里要按方向选 `walk-left` / `walk-right`，顺序反了会播错一侧。
+    walkDirection = direction;
+    if (direction !== facing) facing = direction;
     physics.walk(direction);
     machine.startWalk({ now: performance.now() });
     wake();

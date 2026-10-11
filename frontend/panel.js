@@ -12,7 +12,9 @@
 
 const ACTION_LABELS = {
   idle: '待机',
-  walk: '行走',
+  walk: '行走（正面）',
+  'walk-left': '向左走',
+  'walk-right': '向右走',
   drag: '被拖动',
   fall: '下落',
   land: '落地',
@@ -26,10 +28,19 @@ const ACTION_LABELS = {
 
 const REQUIRED_ACTIONS = ['idle', 'walk', 'drag', 'fall'];
 
-/** 新建形象时可上传的动作（按重要性排序，`idle` 必须给）。 */
+/**
+ * 新建形象时可上传的动作（按重要性排序，`idle` 必须给）。
+ *
+ * `walk-left` / `walk-right` 是**可选**的侧视行走：宠物水平移动，
+ * 正面行走图看起来像原地踏步，侧视图才像真的在走。
+ * 只给一侧也行——另一侧会自动镜像；但**左右不对称**的形象
+ * （例如头饰只在一侧）应当两套都给，否则镜像会把细节翻边。
+ */
 const CREATABLE_ACTIONS = [
   { action: 'idle', required: true },
   { action: 'walk', required: false },
+  { action: 'walk-left', required: false },
+  { action: 'walk-right', required: false },
   { action: 'drag', required: false },
   { action: 'fall', required: false },
   { action: 'land', required: false },

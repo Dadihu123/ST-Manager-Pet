@@ -26,6 +26,15 @@ import {
   REACT_ACTIONS,
   STATES,
 } from '../../frontend/statemachine.js';
+import {
+  WALK_LEFT,
+  WALK_RIGHT,
+  isDirectionalSource,
+  mirrorForNonWalkAction,
+  packHasDirectionalWalk,
+  resolveWalkVisual,
+  walkActionFor,
+} from '../../frontend/direction.js';
 
 // ================================================================ 帧推进
 
@@ -758,4 +767,107 @@ test('尺寸：倍率变化会等比改变包围盒（物理边界要跟着重�
   const two = petSize({ w: 200, h: 100 }, 2);
   assert.equal(two.width, one.width * 2);
   assert.equal(two.height, one.height * 2);
+});
+
+// ================================================================ 方向化行走
+
+/** 侧视左右两套都给的形象。 */
+const BOTH_SIDES = {
+  idle: { source: 'idle', url: '/f/idle' },
+  'walk-left': { source: 'walk-left', url: '/f/wl', mirror: false },
+  'walk-right': { source: 'walk-right', url: '/f/wr', mirror: false },
+};
+
+/** 只给左侧：右侧应镜像复用（后端置 mirror=true）。 */
+const LEFT_ONLY = {
+  idle: { source: 'idle', url: '/f/idle' },
+  'walk-left': { source: 'walk-left', url: '/f/wl', mirror: false },
+  'walk-right': { source: 'walk-left', url: '/f/wl', mirror: true },
+};
+
+/** 旧式形象：只有正面 walk，左右都回退到它，没有 mirror 标记。 */
+const LEGACY = {
+  idle: { source: 'idle', url: '/f/idle' },
+  'walk-left': { source: 'walk', url: '/f/w', mirror: false },
+  'walk-right': { source: 'walk', url: '/f/w', mirror: false },
+};
+
+/** 连行走图都没有：全部回退到 idle。 */
+const IDLE_ONLY = {
+  idle: { source: 'idle', url: '/f/idle' },
+  'walk-left': { source: 'idle', url: '/f/idle', mirror: false },
+  'walk-right': { source: 'idle', url: '/f/idle', mirror: false },
+};
+
+test('方向：向左请求 walk-left，向右请求 walk-right', () => {
+  assert.equal(walkActionFor(-1), WALK_LEFT);
+  assert.equal(walkActionFor(1), WALK_RIGHT);
+  assert.equal(walkActionFor(-0.001), WALK_LEFT, '任何负数都算向左');
+  assert.equal(walkActionFor(0), WALK_RIGHT, '0 按向右处理');
+});
+
+test('方向：source 以 walk- 开头才算方向化贴图', () => {
+  assert.ok(isDirectionalSource('walk-left'));
+  assert.ok(isDirectionalSource('walk-right'));
+  assert.equal(isDirectionalSource('walk'), false, '正面图不是方向化贴图');
+  assert.equal(isDirectionalSource('idle'), false);
+  assert.equal(isDirectionalSource(''), false);
+  assert.equal(isDirectionalSource(undefined), false);
+});
+
+test('方向：两侧都有时按方向取图，且都不翻转', () => {
+  assert.ok(packHasDirectionalWalk(BOTH_SIDES));
+  assert.deepEqual(resolveWalkVisual(-1, BOTH_SIDES),
+    { action: WALK_LEFT, mirror: false });
+  assert.deepEqual(resolveWalkVisual(1, BOTH_SIDES),
+    { action: WALK_RIGHT, mirror: false });
+});
+
+test('方向：只给一侧时，另一侧镜像复用', () => {
+  // 自己那一侧正常播
+  assert.deepEqual(resolveWalkVisual(-1, LEFT_ONLY),
+    { action: WALK_LEFT, mirror: false });
+  // 缺的那一侧：仍请求 walk-right，但贴图镜像
+  assert.deepEqual(resolveWalkVisual(1, LEFT_ONLY),
+    { action: WALK_RIGHT, mirror: true });
+});
+
+test('方向：旧式正面形象——两侧都按朝向翻转（旧行为不变）', () => {
+  assert.equal(packHasDirectionalWalk(LEGACY), false,
+    '只有正面 walk 不算方向化');
+  // 向左走：正面图镜像，看起来像朝左
+  assert.deepEqual(resolveWalkVisual(-1, LEGACY),
+    { action: WALK_LEFT, mirror: true });
+  // 向右走：正面图不翻
+  assert.deepEqual(resolveWalkVisual(1, LEGACY),
+    { action: WALK_RIGHT, mirror: false });
+});
+
+test('方向：连行走图都没有时不崩，回退到 idle', () => {
+  assert.equal(packHasDirectionalWalk(IDLE_ONLY), false);
+  const left = resolveWalkVisual(-1, IDLE_ONLY);
+  assert.equal(left.action, WALK_LEFT, '动作名仍按方向给，由后端回退链决定播什么');
+  assert.equal(left.mirror, true);
+});
+
+test('方向：actions 缺失 / 为 null 时不抛异常', () => {
+  assert.equal(packHasDirectionalWalk(null), false);
+  assert.equal(packHasDirectionalWalk(undefined), false);
+  assert.doesNotThrow(() => resolveWalkVisual(-1, null));
+  assert.doesNotThrow(() => mirrorForNonWalkAction(-1, null));
+});
+
+test('方向：非行走动作——有方向化贴图就不按朝向翻转（保护不对称头饰）', () => {
+  // 小满这类形象：发夹只在一侧，idle 翻转会让发夹左右跳
+  assert.equal(mirrorForNonWalkAction(-1, BOTH_SIDES), false,
+    '有方向化贴图时 idle 不该翻转');
+  assert.equal(mirrorForNonWalkAction(1, BOTH_SIDES), false);
+  // 只给一侧也算「作者在意左右」
+  assert.equal(mirrorForNonWalkAction(-1, LEFT_ONLY), false);
+});
+
+test('方向：非行走动作——旧式形象保持按朝向翻转', () => {
+  assert.equal(mirrorForNonWalkAction(-1, LEGACY), true, '旧行为：向左则镜像');
+  assert.equal(mirrorForNonWalkAction(1, LEGACY), false);
+  assert.equal(mirrorForNonWalkAction(-1, IDLE_ONLY), true);
 });
