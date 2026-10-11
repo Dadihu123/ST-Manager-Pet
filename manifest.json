@@ -21,6 +21,18 @@
     ],
     "entries": [
       {
+        "id": "pet-dock",
+        "kind": "dock",
+        "label": "桌面宠物",
+        "description": "打开桌面宠物设置：形象管理、动作覆盖、播报与勿扰。",
+        "icon": "frontend/assets/icon.svg",
+        "surface": {
+          "id": "pet-settings",
+          "type": "modal"
+        },
+        "priority": 45
+      },
+      {
         "id": "pet-settings",
         "kind": "settings",
         "label": "桌面宠物设置",
