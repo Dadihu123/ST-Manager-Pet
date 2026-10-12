@@ -7,6 +7,9 @@ artifacts/
 # 临时脚本 / 一次性诊断产物
 tmp/
 
+# 提示词 / 方案书
+docs/
+
 # Python
 __pycache__/
 *.py[cod]
