@@ -72,7 +72,7 @@ function writeTestPng(target) {
     for (let x = 0; x < width; x += 1) {
       const offset = rowStart + 1 + x * 3;
       const inSquare = x >= 32 && y < 32;
-      // 右上角青色方块，其余橙色 —— 与内置小猫（橙色描边+白肚）明显不同
+      // 右上角青色方块，其余橙色 —— 与内置形象（真人立绘）明显不同
       raw[offset] = inSquare ? 0 : 255;
       raw[offset + 1] = inSquare ? 200 : 120;
       raw[offset + 2] = inSquare ? 200 : 0;
@@ -147,8 +147,13 @@ async function main() {
       const form = new FormData();
       form.append('name', '验收目标形象');
       form.append('idle', blob, 'idle.png');
-      form.append('walk', blob, 'walk.png');
-      form.append('meta', JSON.stringify({ idle: { frames: 2, fps: 8 }, walk: { frames: 2, fps: 8 } }));
+      // 字段名就是动作名。行走只有方向化动作（walk-left / walk-right），
+      // 正面 walk 已退役，传它只会得到一个词表外的动作。
+      // （注意：这段注释里不能用反引号，它会提前结束外层模板字符串。）
+      form.append('walk-left', blob, 'walk-left.png');
+      form.append('meta', JSON.stringify({
+        idle: { frames: 2, fps: 8 }, 'walk-left': { frames: 2, fps: 8 },
+      }));
       const response = await fetch('${API}/pets/create', { method: 'POST', body: form });
       const body = await response.json();
       if (!body.success) return { error: body.msg || '新建失败' };
@@ -317,14 +322,17 @@ async function main() {
     // 这一步与 ⑦ 配合，验证「用户换图 → 运行中的宠物立刻用上」。
     //
     // 另外必须给**两个**最常用的动作都换图：宠物会自己漫游
-    // （在 idle 与 walk 之间切换），只覆盖 idle 的话，
-    // 采样时它可能正在 walk，断言就会失效。
+    // （在 idle 与行走之间切换），只覆盖 idle 的话，
+    // 采样时它可能正在走，断言就会失效。
+    //
+    // 行走用 `walk-left`（标签「向左走」）：正面 `walk` 已退役，
+    // 面板里只有方向化的左右两项。
     const walkPanel = await page.evaluate(`(async () => {
       window.__petApi.surfaces.open('pet-settings', { source: 'verify-upload' });
       await new Promise((r) => setTimeout(r, 1200));
       const tile = Array.from(document.querySelectorAll('.plugin-stm-pet .pet-action-tile'))
-        .find((node) => (node.querySelector('.pet-action-name') || {}).textContent === '行走');
-      if (!tile) return { error: '找不到 walk（行走）动作卡片' };
+        .find((node) => (node.querySelector('.pet-action-name') || {}).textContent === '向左走');
+      if (!tile) return { error: '找不到 walk-left（向左走）动作卡片' };
       const button = Array.from(tile.querySelectorAll('button'))
         .find((node) => node.textContent.includes('换图'));
       if (!button) return { error: '找不到「换图」按钮' };
@@ -342,7 +350,7 @@ async function main() {
       return { found: Boolean(window.__capturedWalkInput) };
     })()`);
     record(
-      '⑥ 「行走」动作也通过面板换图',
+      '⑥ 「向左走」动作也通过面板换图',
       Boolean(walkPanel && walkPanel.found),
       JSON.stringify(walkPanel),
     );
@@ -400,17 +408,17 @@ async function main() {
       return {
         overrides: data.pet.overrides,
         idleSource: data.pet.actions.idle.frameSource,
-        walkSource: data.pet.actions.walk.frameSource,
+        walkSource: data.pet.actions['walk-left'].frameSource,
         action,
         spriteUrl: getComputedStyle(sprite).backgroundImage,
         expectedUrl: entry.url,
       };
     })()`);
     record(
-      '⑧ 刷新页面后覆盖仍在（idle + walk 都持久化，sprite 与后端版本一致）',
+      '⑧ 刷新页面后覆盖仍在（idle + walk-left 都持久化，sprite 与后端版本一致）',
       afterReload.idleSource === 'override' && afterReload.walkSource === 'override'
         && versionOf(afterReload.spriteUrl) === versionOf(afterReload.expectedUrl),
-      `overrides=${JSON.stringify(afterReload.overrides)}，idle=${afterReload.idleSource}，walk=${afterReload.walkSource}，版本一致=${versionOf(afterReload.spriteUrl) === versionOf(afterReload.expectedUrl)}`,
+      `overrides=${JSON.stringify(afterReload.overrides)}，idle=${afterReload.idleSource}，walk-left=${afterReload.walkSource}，版本一致=${versionOf(afterReload.spriteUrl) === versionOf(afterReload.expectedUrl)}`,
     );
 
     // ---- ⑨ 预览接口标出「已自定」
@@ -429,8 +437,8 @@ async function main() {
     const cleared = await page.evaluate(`(async () => {
       const idle = await fetch('${API}/pets/${TARGET}/actions/idle', { method: 'DELETE' });
       const idleData = await idle.json();
-      // 顺带清掉 walk 的覆盖，让这次验收**不留下痕迹**（可重复运行）
-      const walk = await fetch('${API}/pets/${TARGET}/actions/walk', { method: 'DELETE' });
+      // 顺带清掉 walk-left 的覆盖，让这次验收**不留下痕迹**（可重复运行）
+      const walk = await fetch('${API}/pets/${TARGET}/actions/walk-left', { method: 'DELETE' });
       const walkData = await walk.json();
       return {
         success: idleData.success,
@@ -465,7 +473,7 @@ async function main() {
     const fake = await page.evaluate(`(async () => {
       const form = new FormData();
       form.append('file', new Blob(['%PDF-1.4 fake content'], { type: 'image/png' }), 'evil.png');
-      const response = await fetch('${API}/pets/${TARGET}/actions/walk', {
+      const response = await fetch('${API}/pets/${TARGET}/actions/walk-left', {
         method: 'POST', body: form,
       });
       return { status: response.status, body: await response.json() };
@@ -484,7 +492,7 @@ async function main() {
       const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
       const form = new FormData();
       form.append('file', blob, 'huge.png');
-      const response = await fetch('${API}/pets/${TARGET}/actions/walk', {
+      const response = await fetch('${API}/pets/${TARGET}/actions/walk-left', {
         method: 'POST', body: form,
       });
       return { status: response.status, body: await response.json(), bytes: blob.size };
@@ -613,22 +621,31 @@ async function main() {
     // ① 接口层真的拒绝（不能只靠 UI 藏按钮 —— 接口是公开的）；
     // ② 面板上确实没有「换图 / 删除 / 导出」控件（不让用户点了才发现不行）。
     const readonly = await page.evaluate(`(async () => {
-      // ① 接口层：**必须**指向插件自带的形象（default-cat），
+      // ① 接口层：**必须**指向插件自带的形象，
       //    而不是上面新建的可写目标——只有它才该被拒绝。
+      //
+      // 不写死 id：内置形象由 resources/pets/ 决定（当前是小满 / 小卡），
+      // 写死会让「换掉内置形象」把这条断言变成假失败。取列表里第一个内置的。
+      // （注意：这段注释里不能用反引号，它会提前结束外层模板字符串。）
+      const list = await (await fetch('${API}/pets')).json();
+      const builtinItem = (list.items || []).find((item) => item.source === 'builtin');
+      if (!builtinItem) return { error: '没有找到内置形象' };
+      const BUILTIN = builtinItem.id;
+
       const form = new FormData();
       form.append('file', new Blob([new Uint8Array([1,2,3])], { type: 'image/png' }), 'x.png');
-      const upload = await fetch('${API}/pets/default-cat/actions/walk', {
+      const upload = await fetch('${API}/pets/' + BUILTIN + '/actions/walk-left', {
         method: 'POST', body: form,
       });
       const uploadBody = await upload.json();
-      const exportRes = await fetch('${API}/pets/default-cat/export');
+      const exportRes = await fetch('${API}/pets/' + BUILTIN + '/export');
       const exportBody = await exportRes.json();
 
       // ② 面板层：切到内置形象，看控件
       window.__petApi.surfaces.open('pet-settings', { source: 'verify-upload' });
       await new Promise((r) => setTimeout(r, 1200));
       // 用 data-pet-id 精确选中内置形象（靠文字匹配会在改名时失效）
-      const builtin = document.querySelector('.plugin-stm-pet .pet-card[data-pet-id="default-cat"]');
+      const builtin = document.querySelector('.plugin-stm-pet .pet-card[data-pet-id="' + BUILTIN + '"]');
       if (builtin) builtin.click();
       await new Promise((r) => setTimeout(r, 900));
       const panel = document.querySelector('.plugin-stm-pet.pet-panel');
@@ -636,6 +653,7 @@ async function main() {
       const buttons = Array.from(panel ? panel.querySelectorAll('button') : [])
         .map((node) => node.textContent.trim());
       return {
+        builtinId: BUILTIN,
         uploadStatus: upload.status,
         uploadError: uploadBody.error,
         exportStatus: exportRes.status,
@@ -810,21 +828,25 @@ async function main() {
         const response = await fetch('${API}/pets/' + pet.id, { method: 'DELETE' });
         results.push((await response.json()).success);
       }
-      // 回到内置形象，让环境回到初始状态
+      // 回到内置形象，让环境回到初始状态。
+      // 不写死 id：取列表里第一个内置的（当前是小满 / 小卡）。
+      const builtin = (data.items || []).find((item) => item.source === 'builtin');
+      const wanted = builtin ? builtin.id : '';
       await fetch('${API}/pets/active', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ petId: 'default-cat' }),
+        body: JSON.stringify({ petId: wanted }),
       });
       const after = await (await fetch('${API}/pets')).json();
       return {
         deleted: results.length,
         remaining: (after.items || []).filter((i) => NAMES.includes(i.name)).length,
         active: after.activePetId,
+        expected: wanted,
       };
     })()`);
     record(
       '㉑ 验收可重复运行：造出来的形象被清理，当前形象回到内置',
-      cleanup.remaining === 0 && cleanup.active === 'default-cat',
+      cleanup.remaining === 0 && cleanup.active === cleanup.expected,
       JSON.stringify(cleanup),
     );
 

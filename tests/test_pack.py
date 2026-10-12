@@ -43,7 +43,9 @@ def test_full_pack_parses_all_fields():
     assert parsed.anchor == {'x': 0.5, 'y': 1.0}
     assert parsed.physics['gravity'] == 1800
     assert parsed.physics['friction'] == 0.02
-    assert set(parsed.animations) == {'idle', 'walk', 'fall', 'drag', 'land'}
+    assert set(parsed.animations) == {
+        'idle', 'walk-left', 'walk-right', 'fall', 'drag', 'land',
+    }
     assert parsed.missing_required() == []
 
 
@@ -74,7 +76,6 @@ def test_defaults_filled_when_omitted():
 def test_fallback_table_matches_contract():
     """§3.3 的动作词表与回退链是**契约**，逐条固定下来。"""
     assert ACTION_FALLBACKS['idle'] == ()
-    assert ACTION_FALLBACKS['walk'] == ('idle',)
     assert ACTION_FALLBACKS['drag'] == ('idle',)
     assert ACTION_FALLBACKS['fall'] == ('idle',)
     assert ACTION_FALLBACKS['land'] == ('fall', 'idle')
@@ -84,13 +85,25 @@ def test_fallback_table_matches_contract():
         assert ACTION_FALLBACKS[name] == ('idle',)
     # 唯一硬必要动作
     assert REQUIRED_ACTIONS[0] == 'idle'
-    # 方向化行走：先回退到正面 walk，再 idle
-    assert ACTION_FALLBACKS['walk-left'] == ('walk', 'idle')
-    assert ACTION_FALLBACKS['walk-right'] == ('walk', 'idle')
+    # 行走**只有方向化动作**：两侧都没有就退到 idle（不是正面 walk）
+    assert ACTION_FALLBACKS['walk-left'] == ('idle',)
+    assert ACTION_FALLBACKS['walk-right'] == ('idle',)
     assert WALK_DIRECTION_ACTIONS == {
         'walk-left': 'walk-right',
         'walk-right': 'walk-left',
     }
+
+
+def test_frontal_walk_is_not_in_the_vocabulary():
+    """★ 正面 `walk` 已从词表里删除（2026-10）。
+
+    正面行走图看起来是「原地踏步 + 平移」，与水平移动的语义不符；
+    内置形象（小满 / 小卡）都只出方向化贴图。这里把它钉成回归保护：
+    谁再往词表里加回 `walk`，这条测试会拦住。
+    """
+    assert 'walk' not in ACTION_FALLBACKS, '行走只认 walk-left / walk-right'
+    # 「行走」这项需求仍然存在（`missing_required` 里报的是代号 `walk`）
+    assert 'walk' in REQUIRED_ACTIONS
 
 
 # ------------------------------------------------------ 方向化行走（walk-left/right）
@@ -135,30 +148,33 @@ def test_walk_direction_missing_side_mirrors_the_other():
     assert right.note, '镜像复用要给出解释'
 
 
-def test_walk_direction_falls_back_to_frontal_walk_then_idle():
-    """旧式形象：只有正面 walk 时，左右都回退到它且**不**镜像。
-
-    不镜像的原因：正面图没有朝向信息，翻转由前端按移动方向决定
-    （`direction.js` 的旧行为），后端不该再叠一层。
-    """
-    parsed = _directional_pack(**{'walk': {'sheet': 'w.png', 'frames': 6}})
+def test_walk_direction_falls_back_to_idle_when_no_walk_at_all():
+    """两侧都没有行走图 → 两个方向都退到 idle（**没有正面 walk 这一层**）。"""
+    parsed = _directional_pack()
     for action, opposite in (('walk-left', 'walk-right'),
                              ('walk-right', 'walk-left')):
-        resolved = parsed.resolve(action)
-        assert resolved.source == 'walk', f'{action} 应回退到正面 walk'
-        assert resolved.sheet == 'w.png'
-        assert resolved.mirror is False
-        # 链路记录「试过哪些」：自己 → 对侧 → 正面 → idle
-        assert resolved.chain == [action, opposite, 'walk', 'idle']
-
-
-def test_walk_direction_falls_back_to_idle_when_no_walk_at_all():
-    parsed = _directional_pack()
-    for action in ('walk-left', 'walk-right'):
         resolved = parsed.resolve(action)
         assert resolved.source == 'idle'
         assert resolved.mirror is False
         assert resolved.kind == KIND_ANIMATED
+        # 链路记录「试过哪些」：自己 → 对侧 → idle
+        assert resolved.chain == [action, opposite, 'idle']
+
+
+def test_frontal_walk_sheet_is_ignored_by_walking_actions():
+    """旧式形象给的正面 `walk` 图**不再被行走采纳**（动作已退役）。
+
+    词表外的动作名仍会被解析（向前兼容），但它不在回退链上，
+    因此 `walk-left` / `walk-right` 走的是 → `idle`。
+    """
+    parsed = _directional_pack(**{'walk': {'sheet': 'w.png', 'frames': 6}})
+    for action in ('walk-left', 'walk-right'):
+        resolved = parsed.resolve(action)
+        assert resolved.source == 'idle', f'{action} 不该再回退到正面 walk'
+        assert resolved.sheet == 'idle.png'
+        assert resolved.mirror is False
+    # 包自己声明的 `walk` 仍然可解析（词表外动作的向前兼容）
+    assert parsed.resolve('walk').source == 'walk'
 
 
 def test_directional_walk_satisfies_the_walk_requirement():
@@ -187,8 +203,8 @@ def test_mirror_flag_is_json_safe_and_round_trips():
     assert json.loads(json.dumps(payload))['mirror'] is True
 
 
-def test_frontal_walk_resolution_has_no_mirror_flag():
-    """正面动作不该带 mirror=True（回归保护）。"""
+def test_walk_actions_never_get_mirror_flag_on_a_full_pack():
+    """两侧都自己画了行走图的形象，任何动作都不该带 mirror=True。"""
     parsed = from_dict(pack())
     for action in ACTION_FALLBACKS:
         assert parsed.resolve(action).mirror is False, action
@@ -233,7 +249,7 @@ def test_missing_required_action_degrades_to_static():
     parsed = from_dict(pack(animations={
         'idle': {'sheet': 'idle.png', 'frames': 2, 'fps': 6},
     }))
-    for action in ('walk', 'drag', 'fall'):
+    for action in ('walk-left', 'walk-right', 'drag', 'fall'):
         resolved = parsed.resolve(action)
         assert resolved.kind == KIND_ANIMATED, '有 idle 时仍应播 idle 帧'
         assert resolved.source == 'idle'
@@ -243,10 +259,10 @@ def test_action_declared_without_sheet_is_static():
     """声明了动作但 sheet 为空 → 只位移不播帧（静态降级）。"""
     parsed = from_dict({'id': 'x', 'animations': {
         'idle': {'sheet': 'idle.png', 'frames': 2, 'fps': 6},
-        'walk': {'sheet': '', 'frames': 1, 'fps': 6},
+        'walk-left': {'sheet': '', 'frames': 1, 'fps': 6},
     }})
-    resolved = parsed.resolve('walk')
-    # walk 自身存在但没 sheet，回退链继续往下找到有 sheet 的 idle
+    resolved = parsed.resolve('walk-left')
+    # walk-left 自身存在但没 sheet，回退链继续往下找到有 sheet 的 idle
     assert resolved.source == 'idle'
     assert resolved.kind == KIND_ANIMATED
 
@@ -291,11 +307,11 @@ def test_no_animations_at_all_is_readable_error():
 
 def test_missing_idle_is_readable_error_and_names_what_exists():
     with pytest.raises(PetError) as info:
-        from_dict({'id': 'x', 'animations': {'walk': {'sheet': 'walk.png'}}})
+        from_dict({'id': 'x', 'animations': {'walk-left': {'sheet': 'wl.png'}}})
     error = info.value
     assert error.code == CODE_PACK_IDLE_MISSING
     # 错误信息要说清「当前有什么」，用户才知道怎么改
-    assert 'walk' in error.user_msg
+    assert 'walk-left' in error.user_msg
     assert 'idle' in error.hint
 
 

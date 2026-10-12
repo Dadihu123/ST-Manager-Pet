@@ -4,7 +4,7 @@
  * 为什么需要这个模块
  * ------------------
  * 宠物的移动是**水平**的，而正面视角的行走图看起来是「原地踏步 + 平移」。
- * 因此形象可以给左右两套侧视行走图（`walk-left` / `walk-right`）。
+ * 因此行走**只认方向化贴图**（`walk-left` / `walk-right`），没有正面 `walk`。
  *
  * 三件事必须在这里判定清楚，否则会出现「左右颠倒」或「发夹翻边」：
  *
@@ -13,8 +13,8 @@
  *    - 方向化贴图（后端 `source` 是 `walk-*`）**已经画好了朝向**，
  *      再按朝向翻一次就反了；翻转与否只看后端的 `mirror` 标记
  *      （后端在「只提供一侧」时会置 `mirror=true`）。
- *    - 回退到**正面** `walk` 的旧式形象（例如默认小猫）没有朝向信息，
- *      只能沿用旧行为：按朝向翻转。
+ *    - 两侧都没有行走图时，后端把两个方向都回退到 `idle`；那张图没有朝向信息，
+ *      只能沿用旧行为：按移动方向翻转。
  * 3. **非行走动作要不要按朝向翻转**：
  *    提供了方向化贴图的形象，说明作者在意左右差异（典型：头饰不对称），
  *    此时连 `idle` 也不该按朝向翻转——否则发夹会左右跳。
@@ -81,7 +81,8 @@ export function resolveWalkVisual(direction, actions) {
   const spec = (actions || {})[wanted];
   const legacyMirror = Number(direction) < 0;
 
-  // 连行走图都没有（只有 idle）：交给回退链，翻转沿用旧行为
+  // 连行走图都没有（两侧都回退到了 idle）：那张图没有朝向信息，
+  // 翻转沿用旧行为，按移动方向翻。
   if (!spec || !spec.url) return { action: wanted, mirror: legacyMirror };
 
   if (isDirectionalSource(spec.source)) {
@@ -89,7 +90,7 @@ export function resolveWalkVisual(direction, actions) {
     return { action: wanted, mirror: spec.mirror === true };
   }
 
-  // 回退到了正面 `walk`：没有朝向信息，按移动方向翻转（旧行为）
+  // 回退到了非方向化贴图（`idle` 等）：没有朝向信息，按移动方向翻转（旧行为）
   return { action: wanted, mirror: legacyMirror };
 }
 

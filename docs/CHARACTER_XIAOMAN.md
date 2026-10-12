@@ -3,8 +3,12 @@
 > 目标：为宠物插件做一个**随包内置**的默认形象，形象是「真人小女孩」。
 > 本文是形象规格书 —— 画师或图像模型可以据此直接出图，出图后按 §6 打包即可。
 >
-> 相关：`resources/pets/default-cat/pet.json`（现有默认形象，猫）、
-> `backend/core/pack.py`（包格式与上限）、`tools/make_builtin_pets.py`（内置形象的生成方式）。
+> **小满就是插件的默认形象**：首次安装（`activePetId` 为空）时启用它
+> （`backend/core/store.py:DEFAULT_PET_ID`）。
+>
+> 相关：`resources/pets/xiaoka/pet.json`（另一个内置形象，写实真人小卡）、
+> `docs/BUILTIN_PET_XIAOKA_PROMPT.md`（小卡的出图规格书）、
+> `backend/core/pack.py`（包格式与上限）、`tools/preview_builtin_pet.py`（对照图工具）。
 
 ---
 
@@ -20,7 +24,7 @@
 | 气质 | 不喧哗、不索取注意力。桌面宠物是**长期共处**的东西，名字不该是「糖糖」「闹闹」这类高唤醒词 |
 | 读音 | 两个字、上声+上声，短促好念，中文语境里是真实存在的女孩名 |
 | 与配色 | 小满对应麦熟，正好落在**栗色/麦金**的发色上（见 §4） |
-| 与现有形象 | 现有默认小猫是橘色（`#F7A84C`）。小满的栗发是同一色系的低饱和版本 —— 换形象后视觉上仍是「同一个位置的同一个东西」 |
+| 与另一个形象 | 小卡（`xiaoka`）是照片写实。小满是**半写实插画**，刻意避开照片写实（见 §4.2）—— 两者分工在**渲染目标**上，而不是画风上 |
 
 备选（如果想换）：**小禾**（麦苗，更幼态）、**穗穗**（麦穗，更软萌）。
 本文按「小满」写，换名只需改 `pet.json` 的 `name`。
@@ -166,8 +170,8 @@
 
 **为什么小满必须两套都画**：镜像会把**不对称的头饰翻边**。
 小满左鬓有一枚卡片发夹，如果右移时靠镜像，发夹会跳到右鬓。
-所以「只设置一个、另一个自动镜像」这条便利对**对称形象**适用
-（例如默认小猫），对不对称形象必须自己出两套。
+所以「只设置一个、另一个自动镜像」这条便利对**左右对称的形象**适用，
+对不对称形象（小满的发夹、小卡的腰侧木牌）必须自己出两套。
 
 **镜像的两种语义不能混**（这是最容易写错的地方，已在
 `frontend/direction.js` 里用纯函数固化并单测）：
@@ -265,9 +269,11 @@
 
 ### 8.1 生成素材
 
-内置形象走 `tools/make_builtin_pets.py` 那条路（Pillow 程序化绘制）**不适合人形** ——
+内置形象**不适合**用程序化绘制（Pillow 画几何图形）那条路 ——
 画一个可信的小女孩不是几十行 `draw.ellipse` 能办到的。
 人形应该**用图像模型出图 + 人工/脚本切帧**，产物提交进仓库。
+（原先画 64×64 像素橘猫的 `tools/make_builtin_pets.py` 已随 `default-cat`
+一起删除；核对用 `tools/preview_builtin_pet.py xiaoman` 生成对照图。）
 
 出图 prompt（每位姿一张，保持同一角色）：
 
@@ -366,7 +372,9 @@ node --test tests/frontend/logic.test.mjs tests/frontend/announce.test.mjs
 - [x] **12** 个动作的 spritesheet（含 `walk-left` / `walk-right`；正面 `walk` 已移除）
 - [x] `resources/pets/xiaoman/pet.json`（§7 骨架，值已按实测更新）
 - [x] `pixelated` 契约（§9，0.2.0 已修）
-- [x] 小满与 `default-cat` **并列**为内置形象（`store.py` 的内置扫描支持多个）
+- [x] 与 `xiaoka` 并列，成为**仅有的两个**内置形象
+      （`store.py` 的内置扫描支持多个；原 `default-cat` 已移除）
+- [x] 插件**首次安装的默认形象**（`store.DEFAULT_PET_ID = 'xiaoman'`）
 - [x] `walk-left` / `walk-right` 按 §6.2 重画：两帧接触 + 两帧过渡，
       手臂前后摆动、两个接触帧的遮挡相位翻转（实测交叉像素 2935 ↔ 50 与 1307 ↔ 2283）
 - [x] `sleep` 重画为 4 帧：抱膝坐姿统一，每只鞋上都有奶油色袜口 + 白色鞋带
@@ -375,8 +383,9 @@ node --test tests/frontend/logic.test.mjs tests/frontend/announce.test.mjs
 
 - 若要让用户能**自建**方向化形象，面板已支持上传 `walk-left` / `walk-right`
   （`panel.js` 的 `CREATABLE_ACTIONS`）。
-- `walk`（正面 6 帧步态）已移除，回退链缩短为 `walk-left → walk-right → idle`。
-  若将来需要兼容**完全没有侧视图**的第三方形象，前端仍能回退到 `idle`，无需重建 `walk`。
+- `walk`（正面 6 帧步态）已从**词表**里删除，回退链缩短为
+  `walk-left → walk-right → idle`；两侧都没有时前端退到 `idle`，无需重建 `walk`。
+  「缺行走」在 `missingRequired` 里报的仍是代号 `walk`（提供任一侧即算满足）。
 - `sleep` 的**残留缺陷**：4 帧内容高度差 **16px**（旧版 39px），
   略超「≤ 8px」的理想门限；底边对齐后的轮廓 IoU 已从 0.772 提到 **0.900**。
   若要彻底消除尺寸跳动，需要模型严格锁定构图重出（当前 6 次生成额度内未做到）。

@@ -785,14 +785,12 @@ const LEFT_ONLY = {
   'walk-right': { source: 'walk-left', url: '/f/wl', mirror: true },
 };
 
-/** 旧式形象：只有正面 walk，左右都回退到它，没有 mirror 标记。 */
-const LEGACY = {
-  idle: { source: 'idle', url: '/f/idle' },
-  'walk-left': { source: 'walk', url: '/f/w', mirror: false },
-  'walk-right': { source: 'walk', url: '/f/w', mirror: false },
-};
-
-/** 连行走图都没有：全部回退到 idle。 */
+/**
+ * 两侧都没有行走图（例如只传了 idle 的自建形象）：两个方向都回退到 `idle`。
+ *
+ * 这是**唯一**会走到「非方向化贴图」那条分支的形态——正面 `walk` 已退役，
+ * 后端不会再给出 `source: 'walk'`。
+ */
 const IDLE_ONLY = {
   idle: { source: 'idle', url: '/f/idle' },
   'walk-left': { source: 'idle', url: '/f/idle', mirror: false },
@@ -809,7 +807,8 @@ test('方向：向左请求 walk-left，向右请求 walk-right', () => {
 test('方向：source 以 walk- 开头才算方向化贴图', () => {
   assert.ok(isDirectionalSource('walk-left'));
   assert.ok(isDirectionalSource('walk-right'));
-  assert.equal(isDirectionalSource('walk'), false, '正面图不是方向化贴图');
+  assert.equal(isDirectionalSource('walk'), false,
+    '正面 walk 已退役；即便出现这个名字，它也不是方向化贴图');
   assert.equal(isDirectionalSource('idle'), false);
   assert.equal(isDirectionalSource(''), false);
   assert.equal(isDirectionalSource(undefined), false);
@@ -832,22 +831,14 @@ test('方向：只给一侧时，另一侧镜像复用', () => {
     { action: WALK_RIGHT, mirror: true });
 });
 
-test('方向：旧式正面形象——两侧都按朝向翻转（旧行为不变）', () => {
-  assert.equal(packHasDirectionalWalk(LEGACY), false,
-    '只有正面 walk 不算方向化');
-  // 向左走：正面图镜像，看起来像朝左
-  assert.deepEqual(resolveWalkVisual(-1, LEGACY),
-    { action: WALK_LEFT, mirror: true });
-  // 向右走：正面图不翻
-  assert.deepEqual(resolveWalkVisual(1, LEGACY),
-    { action: WALK_RIGHT, mirror: false });
-});
-
-test('方向：连行走图都没有时不崩，回退到 idle', () => {
-  assert.equal(packHasDirectionalWalk(IDLE_ONLY), false);
+test('方向：连行走图都没有时不崩，回退到 idle 并按朝向翻转', () => {
+  assert.equal(packHasDirectionalWalk(IDLE_ONLY), false,
+    '两侧都回退到 idle，说明作者没有方向化贴图');
   const left = resolveWalkVisual(-1, IDLE_ONLY);
   assert.equal(left.action, WALK_LEFT, '动作名仍按方向给，由后端回退链决定播什么');
+  // idle 那张图没有朝向信息 → 沿用旧行为：向左则镜像
   assert.equal(left.mirror, true);
+  assert.equal(resolveWalkVisual(1, IDLE_ONLY).mirror, false);
 });
 
 test('方向：actions 缺失 / 为 null 时不抛异常', () => {
@@ -866,8 +857,7 @@ test('方向：非行走动作——有方向化贴图就不按朝向翻转（�
   assert.equal(mirrorForNonWalkAction(-1, LEFT_ONLY), false);
 });
 
-test('方向：非行走动作——旧式形象保持按朝向翻转', () => {
-  assert.equal(mirrorForNonWalkAction(-1, LEGACY), true, '旧行为：向左则镜像');
-  assert.equal(mirrorForNonWalkAction(1, LEGACY), false);
-  assert.equal(mirrorForNonWalkAction(-1, IDLE_ONLY), true);
+test('方向：非行走动作——没有方向化贴图的形象保持按朝向翻转', () => {
+  assert.equal(mirrorForNonWalkAction(-1, IDLE_ONLY), true, '旧行为：向左则镜像');
+  assert.equal(mirrorForNonWalkAction(1, IDLE_ONLY), false);
 });

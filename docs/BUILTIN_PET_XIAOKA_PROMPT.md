@@ -3,9 +3,8 @@
 > 目标：给宠物插件再做一个**随包内置**的官方形象 —— 写实真人风格的小女孩。
 > 本文是可直接投喂图像模型的提示词规格书；出图后按 §7 切帧、按 §8 打包。
 >
-> 相关：`docs/CHARACTER_XIAOMAN.md`（首个内置形象小满的规格书）、
-> `backend/core/pack.py`（包格式与上限）、`tools/make_builtin_pets.py`（程序化形象，**不适用于人形**）、
-> `artifacts/builtin-xiaoka-baseline/`（本轮产出的基准形象，待确认）。
+> 相关：`docs/CHARACTER_XIAOMAN.md`（另一个内置形象小满的规格书）、
+> `backend/core/pack.py`（包格式与上限）、`tools/preview_builtin_pet.py`（对照图工具）。
 
 ---
 
@@ -14,13 +13,16 @@
 **小卡**（`id: xiaoka`）—— 六到七岁的小女孩，围裙口袋里插着一张索引卡，
 腰侧挂着一枚木质的卡片吊牌。她是「卡片堆里的小管理员」。
 
-与已有形象的分工：
+与已有形象的分工（插件只有这两个内置形象）：
 
 | 形象 | 风格 | 作用 |
 |---|---|---|
-| `default-cat` | 64×64 像素风橘猫 | 兜底形象，任何分辨率下都不会坏 |
-| `xiaoman` | 半写实插画（非照片） | 二次元审美的默认脸 |
+| `xiaoman` | 半写实插画（非照片） | **首次安装的默认形象**（`store.DEFAULT_PET_ID`） |
 | **`xiaoka`** | **写实真人**（照片级） | 想要「桌面上真的站着一个人」的那部分用户 |
+
+> 早先还有一个 `default-cat`（64×64 程序化像素橘猫）作为兜底形象，
+> 2026-10 已随生成脚本一起移除：真正需要兜底时单帧 `idle` 就够了
+> （回退链保证任何一张图都能跑起来），而像素猫与两个真人形象摆在一起只是噪音。
 
 `xiaoka` 与 `xiaoman` 的关键差别是**渲染目标**：小满刻意避开照片写实
 （见小满文档 §4.2），小卡则**要**照片写实 —— 皮肤有毛孔、布料有经纬、
@@ -821,7 +823,8 @@ python tools/make_walk_strip.py out/strip.png frames/*.png
       `verify_objective.py` 的期望表还留着已废弃的正面 `walk`（永远报 2 项不通过）；
       `check_http_frames.py` 请求 `walk` 被回退链兜成 `idle`（假通过）
 - [x] `resources/pets/xiaoka/pet.json`
-- [x] 与 `default-cat` / `xiaoman` 并列注册为内置形象（`store.py` 的内置目录扫描）
+- [x] 与 `xiaoman` 并列注册为内置形象（`store.py` 的内置目录扫描；
+      原 `default-cat` 已移除，插件现在只有这两个内置形象）
 - [x] **§8 + §8.1 全部校验通过**（见 §9.1 的校验表）
 - [x] 两个侧视行走 sheet 的相邻帧 IoU 全部 < 0.8（0.41–0.55）
 
@@ -871,7 +874,7 @@ python check_seams.py --pack resources/pets/xiaoka --raw <整理目录>
 | 无裁顶 | `check_top_clipping.py` | ✅ 无任何帧顶到画面边缘 |
 | 目标逐条 | `verify_objective.py` | ✅ 12 动作 / 42 帧、无声明外动作 |
 | 端到端取图 | `check_http_frames.py` | ✅ 12/12 逐字节等于该动作自己的 sheet |
-| 内置注册 | `PetStore(builtin_dir='resources/pets').list_pets()` | ✅ 含 `xiaoka`（与 `default-cat` / `xiaoman` 并列） |
+| 内置注册 | `PetStore(builtin_dir='resources/pets').list_pets()` | ✅ 含 `xiaoka`（与 `xiaoman` 并列） |
 | §8.1 相邻帧 IoU | `accept_pack.py` | ✅ 侧视 0.408–0.551，全部 < 0.8 |
 | **退出码可信** | 不加 `PYTHONIOENCODING` 直跑全部验收脚本 | ✅ 全部 exit 0（见 §8 第 5 条） |
 | 管线可复现 | `clean_batch` + `build_pack` 重跑后与交付包比对 | ✅ 13/13 文件哈希一致 |

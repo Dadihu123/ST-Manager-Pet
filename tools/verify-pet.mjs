@@ -150,10 +150,13 @@ async function main() {
     );
 
     // ------------------------------------------------ ⑤ 用的是 spritesheet 而非换 src
+    //
+    // 不写死形象 id：默认形象由 `store.DEFAULT_PET_ID` 决定（小满），
+    // 写死 id 会让「换掉内置形象」把这条断言变成假失败。
     const bg = await page.evaluate('window.__pet.bgImage()');
     record(
       '⑤ 用 spritesheet + background-position（不是换 <img src>）',
-      bg.includes('frame/default-cat/idle'),
+      bg.includes('/frame/') && bg.includes('/idle'),
       bg.slice(0, 120),
     );
 

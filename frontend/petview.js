@@ -183,7 +183,7 @@ export function createPetView(options = {}) {
     const state = machine.state;
     let name = machine.action;
     // 行走用**方向化**动作名：形象提供侧视左右两套时播对应那套，
-    // 没提供时后端已把回退结论算好（对侧镜像 → 正面 walk → idle）。
+    // 没提供时后端已把回退结论算好（对侧镜像 → idle）。
     if (state === STATES.WALK) name = walkActionFor(walkDirection);
     else if (state === STATES.DRAG) name = 'drag';
     else if (state === STATES.FALL) name = 'fall';

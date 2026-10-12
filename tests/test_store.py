@@ -15,6 +15,7 @@ from backend.core.errors import (
     PetError,
 )
 from backend.core.store import (
+    DEFAULT_PET_ID,
     DEFAULT_SETTINGS,
     MANIFEST_FILENAME,
     OVERRIDES_DIRNAME,
@@ -44,7 +45,10 @@ def builtin_pet(store):
     write_pack(
         store.builtin_dir, 'builtin-cat',
         payload=pack(id='builtin-cat', name='内置猫'),
-        sheets={'idle.png': 4, 'walk.png': 6, 'fall.png': 2, 'drag.png': 2},
+        sheets={
+            'idle.png': 4, 'walk-left.png': 4, 'walk-right.png': 4,
+            'fall.png': 2, 'drag.png': 2,
+        },
     )
     return 'builtin-cat'
 
@@ -59,7 +63,10 @@ def user_pet(store):
     write_pack(
         store.user_pets_dir(), 'my-cat',
         payload=pack(id='my-cat', name='我的猫'),
-        sheets={'idle.png': 4, 'walk.png': 6, 'fall.png': 2, 'drag.png': 2},
+        sheets={
+            'idle.png': 4, 'walk-left.png': 4, 'walk-right.png': 4,
+            'fall.png': 2, 'drag.png': 2,
+        },
     )
     return 'my-cat'
 
@@ -216,13 +223,35 @@ def test_list_pets_skips_invalid_directory_names(store):
 
 
 def test_active_pet_id_falls_back_to_first_available(store, builtin_pet):
+    """默认形象不存在时（定制包裁掉了它）仍要回落到列表里第一个可用形象。"""
     assert store.active_pet_id() == 'builtin-cat'
+
+
+def test_active_pet_id_prefers_the_default_pet_on_first_install(store, builtin_pet):
+    """★ 首次安装（设置里还没有 activePetId）默认启用 `DEFAULT_PET_ID`。
+
+    不是「列表第一个」：列表按名称排序，那会让默认形象取决于名字的字典序，
+    换一个内置形象的名字就会悄悄改掉新用户的默认体验。
+    """
+    write_pack(store.builtin_dir, DEFAULT_PET_ID,
+               payload=pack(id=DEFAULT_PET_ID, name='小满'))
+    write_pack(store.builtin_dir, 'aaa-first',
+               payload=pack(id='aaa-first', name='A 排在最前'))
+    assert store.active_pet_id() == DEFAULT_PET_ID
 
 
 def test_active_pet_id_honours_setting(store, builtin_pet):
     write_pack(store.builtin_dir, 'other', payload=minimal_pack(id='other'))
     store.update_settings({'activePetId': 'other'})
     assert store.active_pet_id() == 'other'
+
+
+def test_active_pet_id_setting_beats_the_default_pet(store, builtin_pet):
+    """用户显式选过形象后，默认形象不再插手。"""
+    write_pack(store.builtin_dir, DEFAULT_PET_ID,
+               payload=pack(id=DEFAULT_PET_ID, name='小满'))
+    store.update_settings({'activePetId': 'builtin-cat'})
+    assert store.active_pet_id() == 'builtin-cat'
 
 
 def test_active_pet_id_falls_back_when_setting_points_to_missing(store, builtin_pet):
@@ -276,7 +305,11 @@ def test_runtime_pack_shape(store, builtin_pet):
     payload = store.runtime_pack(builtin_pet)
     assert payload['id'] == builtin_pet
     assert payload['size'] == {'w': 64, 'h': 64}
-    assert set(payload['actions']) >= {'idle', 'walk', 'fall', 'drag'}
+    assert set(payload['actions']) >= {
+        'idle', 'walk-left', 'walk-right', 'fall', 'drag',
+    }
+    # 正面 `walk` 已退役：运行期定义里不该再有这个键
+    assert 'walk' not in payload['actions']
     idle = payload['actions']['idle']
     assert idle['kind'] == 'animated'
     assert idle['url'].startswith('/api/plugins/stm-pet/frame/')
@@ -289,7 +322,7 @@ def test_runtime_pack_single_frame_pack_works(store):
     write_pack(store.builtin_dir, 'single', payload=minimal_pack(id='single'),
                sheets={'idle.png': 1})
     payload = store.runtime_pack('single')
-    for action in ('walk', 'drag', 'fall', 'land', 'happy', 'sleep'):
+    for action in ('walk-left', 'walk-right', 'drag', 'fall', 'land', 'happy', 'sleep'):
         entry = payload['actions'][action]
         assert entry['kind'] == 'animated'
         assert entry['source'] == 'idle', f'{action} 应回退到 idle'
@@ -682,17 +715,17 @@ def test_delete_last_override_prunes_empty_dir(store, user_pet):
 def test_delete_one_of_two_overrides_keeps_dir(store, user_pet):
     """还有别的覆盖时不能删目录。"""
     store.save_action_image(user_pet, 'idle', make_image_bytes(size=(64, 64)))
-    store.save_action_image(user_pet, 'walk', make_image_bytes(size=(64, 64)))
+    store.save_action_image(user_pet, 'walk-left', make_image_bytes(size=(64, 64)))
     store.delete_action_override(user_pet, 'idle')
     override_dir = os.path.join(store.user_pet_dir(user_pet), OVERRIDES_DIRNAME)
     assert os.path.isdir(override_dir)
-    assert os.listdir(override_dir) == ['walk.png']
+    assert os.listdir(override_dir) == ['walk-left.png']
 
 
 def test_overrides_listed_in_describe(store, user_pet):
-    store.save_action_image(user_pet, 'walk', make_image_bytes(size=(64, 64)))
+    store.save_action_image(user_pet, 'walk-left', make_image_bytes(size=(64, 64)))
     item = next(i for i in store.list_pets() if i['id'] == user_pet)
-    assert 'walk' in item['overrides']
+    assert 'walk-left' in item['overrides']
 
 
 # ------------------------------------------------- 内置形象严格只读（契约反转）
@@ -739,10 +772,10 @@ def test_legacy_overrides_are_reported_not_hidden(store, builtin_pet):
     override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
     os.makedirs(override_dir, exist_ok=True)
     write_sheet(os.path.join(override_dir, 'idle.png'), frames=1)
-    write_sheet(os.path.join(override_dir, 'walk.png'), frames=1)
+    write_sheet(os.path.join(override_dir, 'walk-left.png'), frames=1)
 
     payload = store.runtime_pack(builtin_pet)
-    assert sorted(payload['staleOverrides']) == ['idle', 'walk']
+    assert sorted(payload['staleOverrides']) == ['idle', 'walk-left']
     assert payload['writable'] is False
 
     # 用户形象没有这个概念
@@ -756,10 +789,10 @@ def test_clear_pet_overrides_removes_legacy_files(store, builtin_pet):
     override_dir = os.path.join(store.user_pet_dir(builtin_pet), OVERRIDES_DIRNAME)
     os.makedirs(override_dir, exist_ok=True)
     write_sheet(os.path.join(override_dir, 'idle.png'), frames=1)
-    write_sheet(os.path.join(override_dir, 'walk.png'), frames=1)
+    write_sheet(os.path.join(override_dir, 'walk-left.png'), frames=1)
 
     removed = store.clear_pet_overrides(builtin_pet)
-    assert sorted(removed) == ['idle', 'walk']
+    assert sorted(removed) == ['idle', 'walk-left']
     assert store.runtime_pack(builtin_pet)['staleOverrides'] == []
     # 随包资源一个字节都不该被动到
     assert os.path.isfile(os.path.join(store.builtin_pet_dir(builtin_pet), 'idle.png'))

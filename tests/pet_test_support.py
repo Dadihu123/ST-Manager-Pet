@@ -1,4 +1,4 @@
-﻿"""宠物插件测试共用的夹具工具（不以 `test_` 开头，pytest 不会收集）。"""
+"""宠物插件测试共用的夹具工具（不以 `test_` 开头，pytest 不会收集）。"""
 
 import io
 import json
@@ -23,7 +23,8 @@ FULL_PACK = {
     },
     'animations': {
         'idle': {'sheet': 'idle.png', 'frames': 4, 'fps': 6, 'loop': True},
-        'walk': {'sheet': 'walk.png', 'frames': 6, 'fps': 10, 'loop': True},
+        'walk-left': {'sheet': 'walk-left.png', 'frames': 4, 'fps': 8, 'loop': True},
+        'walk-right': {'sheet': 'walk-right.png', 'frames': 4, 'fps': 8, 'loop': True},
         'fall': {'sheet': 'fall.png', 'frames': 2, 'fps': 8, 'loop': True},
         'drag': {'sheet': 'drag.png', 'frames': 2, 'fps': 4, 'loop': True},
         'land': {'sheet': 'land.png', 'frames': 3, 'fps': 12, 'loop': False},

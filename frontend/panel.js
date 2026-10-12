@@ -12,7 +12,6 @@
 
 const ACTION_LABELS = {
   idle: '待机',
-  walk: '行走（正面）',
   'walk-left': '向左走',
   'walk-right': '向右走',
   drag: '被拖动',
@@ -24,21 +23,30 @@ const ACTION_LABELS = {
   sad: '难过',
   angry: '生气',
   look: '张望',
+  // `walk` **不是动作**，而是「行走」这条必要项的**代号**：
+  // 行走只有方向化动作（`walk-left` / `walk-right`），提供任一侧即算满足。
+  // 这里留着它只是为了把后端的 `missingRequired: ['walk']` 翻译成人话。
+  walk: '行走',
 };
 
+/**
+ * 与后端 `pack.REQUIRED_ACTIONS` 一致的「必要动作」名单。
+ *
+ * `walk` 是**需求代号**而不是动作名（见上）。判断某个**真实动作**算不算必要
+ * 必须走 `isRequiredAction()`：`walk-left` / `walk-right` 都算必要，
+ * 因为它们共同承载「行走」这一项需求（提供任一侧即满足）。
+ */
 const REQUIRED_ACTIONS = ['idle', 'walk', 'drag', 'fall'];
 
 /**
  * 新建形象时可上传的动作（按重要性排序，`idle` 必须给）。
  *
- * `walk-left` / `walk-right` 是**可选**的侧视行走：宠物水平移动，
- * 正面行走图看起来像原地踏步，侧视图才像真的在走。
+ * 行走只列**方向化**的两项：宠物是水平移动的，正面行走图看起来像原地踏步。
  * 只给一侧也行——另一侧会自动镜像；但**左右不对称**的形象
  * （例如头饰只在一侧）应当两套都给，否则镜像会把细节翻边。
  */
 const CREATABLE_ACTIONS = [
   { action: 'idle', required: true },
-  { action: 'walk', required: false },
   { action: 'walk-left', required: false },
   { action: 'walk-right', required: false },
   { action: 'drag', required: false },
@@ -504,7 +512,7 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     // 缩略图只显示 **idle 的第一帧**。
     //
     // ⚠️ 不能用 `background-size: contain`：`/frame/<id>/idle` 返回的是
-    // **整条水平 spritesheet**（默认小猫是 256×64 = 4 帧），
+    // **整条水平 spritesheet**（例如 4 帧的 idle 是 256×64），
     // 把 256 宽压进 40px 的方框 → 每帧只剩 10px，看起来像一团乱码（实测）。
     // 正确做法：按「单帧宽 = 帧数 × 方框宽」放大整条，再用
     // `background-position: 0 0` 只露出第 0 帧。
@@ -750,9 +758,22 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     return `${Math.round(number * 100) / 100}×`;
   }
 
+  /**
+   * 这个动作算不算「必要」。
+   *
+   * `walk-left` / `walk-right` 也算：行走是必要动作，而它**只认方向化贴图**
+   * ——提供任一侧即满足需求（`REQUIRED_ACTIONS` 里的 `walk` 就是这个需求的代号）。
+   * 若只按 `REQUIRED_ACTIONS.includes(action)` 判断，两个侧视动作会被标成「可选」，
+   * 与 §3 的动作表不符。
+   */
+  function isRequiredAction(action) {
+    if (REQUIRED_ACTIONS.includes(action)) return true;
+    return action === 'walk-left' || action === 'walk-right';
+  }
+
   function renderActionTile(entry) {
     const tile = el('div', 'pet-action-tile');
-    const required = REQUIRED_ACTIONS.includes(entry.action);
+    const required = isRequiredAction(entry.action);
     const isFallback = entry.kind === 'animated' && entry.source !== entry.action;
     if (isFallback) tile.classList.add('is-fallback');
     if (entry.kind !== 'animated') tile.classList.add('is-missing');

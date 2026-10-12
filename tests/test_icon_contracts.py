@@ -265,7 +265,7 @@ def test_card_thumbnail_shows_only_first_frame():
     """★ 形象卡片的缩略图必须只显示第 0 帧。
 
     真实踩过：`/frame/<id>/idle` 返回的是**整条** spritesheet
-    （默认小猫是 256×64 = 4 帧），而缩略图方框只有 40×40。
+    （例如 4 帧的 idle 是 256×64），而缩略图方框只有 40×40。
     用 `background-size: contain` 会把整条压进去 → 每帧只剩 10px，
     看起来像一团乱码（截图上非常明显，但不是报错，所以不会自己冒出来）。
 

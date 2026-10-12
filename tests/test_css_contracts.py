@@ -382,6 +382,99 @@ def test_panel_has_create_form():
     assert "'新建形象'" in source, '工具栏要有「新建形象」入口'
 
 
+# ------------------------------------------- 动作词表前后端一致性（踩过的坑）
+
+
+def test_frontend_creatable_actions_match_backend_vocabulary():
+    """★ 前端「新建形象」的可上传动作必须与后端词表一致。
+
+    真实踩过：正面 `walk` 已从后端词表删除、内置形象也不再出图，
+    但 `panel.js` 的 `CREATABLE_ACTIONS` 里还留着 `walk` 槽位
+    ——用户能选一张图传上去，得到一个永远播不到的词表外动作。
+    这条把两边的词表钉在一起。
+    """
+    import json as _json
+    import sys
+
+    sys.path.insert(0, REPO_ROOT)
+    from backend.core.pack import ACTION_FALLBACKS, WALK_DIRECTION_ACTIONS
+
+    source = read(os.path.join(REPO_ROOT, 'frontend', 'panel.js'))
+    block = source[source.index('const CREATABLE_ACTIONS = ['):]
+    block = block[:block.index('];')]
+    actions = re.findall(r"action:\s*'([^']+)'", block)
+    assert actions, '解析不出 CREATABLE_ACTIONS'
+
+    assert actions[0] == 'idle', 'idle 必须排第一（唯一硬必要动作）'
+    for name in actions:
+        assert name in ACTION_FALLBACKS, (
+            f'CREATABLE_ACTIONS 里的 {name} 不在后端词表里——传上去也播不到'
+        )
+    # 词表里的动作（除 `walk` 这个需求代号）都要能在新建表单里上传
+    for name in ACTION_FALLBACKS:
+        assert name in actions, f'后端词表里的 {name} 在新建表单里没有槽位'
+    # 方向化行走必须两个方向都在
+    for name in WALK_DIRECTION_ACTIONS:
+        assert name in actions, f'缺少 {name} 的上传槽位'
+    assert 'walk' not in actions, '正面 walk 已退役，不该再有上传槽位'
+
+
+def test_frontend_action_labels_cover_backend_vocabulary():
+    """面板的动作标签表必须覆盖后端词表 + `walk` 这个需求代号。
+
+    漏一个的后果：面板上那个动作直接显示英文 id，用户不知道那是什么。
+    """
+    import sys
+
+    sys.path.insert(0, REPO_ROOT)
+    from backend.core.pack import ACTION_FALLBACKS, REQUIRED_ACTIONS
+
+    source = read(os.path.join(REPO_ROOT, 'frontend', 'panel.js'))
+    block = source[source.index('const ACTION_LABELS = {'):]
+    block = block[:block.index('};')]
+    labels = re.findall(r"^\s*'?([A-Za-z-]+)'?:\s*'", block, flags=re.MULTILINE)
+
+    for name in list(ACTION_FALLBACKS) + list(REQUIRED_ACTIONS):
+        assert name in labels, f'ACTION_LABELS 缺少 {name} 的中文标签'
+
+
+def test_frontend_required_actions_match_backend():
+    """前端「必要动作」名单必须与后端一致（否则徽标/提示会对不上）。"""
+    import sys
+
+    sys.path.insert(0, REPO_ROOT)
+    from backend.core.pack import REQUIRED_ACTIONS
+
+    source = read(os.path.join(REPO_ROOT, 'frontend', 'panel.js'))
+    match = re.search(r'const REQUIRED_ACTIONS = \[([^\]]*)\]', source)
+    assert match, '找不到 REQUIRED_ACTIONS'
+    declared = re.findall(r"'([^']+)'", match.group(1))
+    assert declared == list(REQUIRED_ACTIONS), (
+        f'前端 {declared} 与后端 {list(REQUIRED_ACTIONS)} 不一致'
+    )
+
+
+def test_builtin_pets_directory_holds_only_the_shipped_faces():
+    """随包内置形象目录里只应有 `xiaoman` / `xiaoka`。
+
+    `default-cat` 已随生成脚本一起移除；这条防止它被误加回来
+    （它没有对应的生成脚本了，加回来就是一份没人维护的孤儿资源）。
+    """
+    import sys
+
+    sys.path.insert(0, REPO_ROOT)
+    from backend.core.store import DEFAULT_PET_ID
+
+    pets_dir = os.path.join(REPO_ROOT, 'resources', 'pets')
+    names = sorted(
+        name for name in os.listdir(pets_dir)
+        if os.path.isdir(os.path.join(pets_dir, name))
+    )
+    assert names == ['xiaoka', 'xiaoman'], f'内置形象目录异常: {names}'
+    # 默认形象必须是内置的之一，否则首次安装会落到「列表第一个」
+    assert DEFAULT_PET_ID in names, f'DEFAULT_PET_ID={DEFAULT_PET_ID} 不在内置形象里'
+
+
 # ------------------------------------------------------- 文件输入（真实踩过）
 
 

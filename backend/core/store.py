@@ -82,6 +82,14 @@ from .paths import is_action_name, is_safe_relative_name, safe_join, to_posix
 
 logger = logging.getLogger(__name__)
 
+#: 首次安装（设置里还没有 `activePetId`）时默认启用的形象 id。
+#:
+#: 为什么是「小满」：随包内置的两个真人形象里，小满是**半写实插画**、
+#: 小卡是**照片写实**。照片写实是更窄的偏好（有人喜欢、有人觉得桌面站个真人不适），
+#: 而插画风是更安全的默认脸；想要照片级的用户到面板里切一下即可。
+#: 该形象不存在时（例如被裁掉的定制包）继续回落到列表里第一个可用形象。
+DEFAULT_PET_ID = 'xiaoman'
+
 #: 用户包 id 的字符集：小写字母/数字开头，允许 `-` `_` `.`。
 PET_ID_PATTERN = re.compile(r'^[a-z0-9][a-z0-9._-]{0,63}$')
 
@@ -101,7 +109,10 @@ DEFAULT_SETTINGS = {
     # 标量开关（勿扰、播报…）声明在 manifest 的 `config_schema` 里，
     # 由宿主的插件设置表单渲染、由 `api.get_config()/set_config()` 读写。
     # 两边都存一份会造成「改了宿主表单但插件不生效」这类双写不同步的 bug，
-    # 所以这里只留宿主表单表达不了的东西：当前形象 id、包列表、逐形象倍率。
+    # 所以这里只留宿主表单表达不了的东西：当前形象 id、逐形象倍率与渲染方式。
+
+    #: 当前形象 id。**空串表示「用户还没选过」**，此时 `active_pet_id()` 会用
+    #: `DEFAULT_PET_ID`（首次安装的默认形象）——见该方法。
     'activePetId': '',
     #: 逐形象的**大小倍率**覆盖：`{pet_id: float}`。
     #:
@@ -611,7 +622,11 @@ class PetStore:
         return loads_pack(raw, pack_id=sanitize_pet_id(pet_id))
 
     def active_pet_id(self) -> str:
-        """当前生效的形象 id：设置里指定的那个；不可用时回落到第一个可用形象。"""
+        """当前生效的形象 id：设置里指定的那个；不可用时回落到默认形象。
+
+        回落顺序：**默认形象**（`DEFAULT_PET_ID`，首次安装走这条）→
+        列表里第一个可用形象。两条都不可用才返回空串。
+        """
         settings = self.get_settings()
         wanted = sanitize_pet_id(settings.get('activePetId') or '')
         if wanted:
@@ -620,6 +635,11 @@ class PetStore:
                 return wanted
             except PetError:
                 logger.info('设置里的形象 %s 已不可用，回落到默认形象', wanted)
+        try:
+            self._locate(DEFAULT_PET_ID)
+            return DEFAULT_PET_ID
+        except PetError:
+            pass
         for item in self.list_pets():
             if not item.get('error'):
                 return item['id']
@@ -710,7 +730,7 @@ class PetStore:
 
         # 输出**整个动作词表**，而不是只输出包里声明过的动作。
         #
-        # 为什么：前端按名字取动作（`actions['walk']`、`actions['land']`…）。
+        # 为什么：前端按名字取动作（`actions['walk-left']`、`actions['land']`…）。
         # 只输出包里声明的那些，会让「只有一张单帧图」的包在前端缺键，
         # 回退链就白实现了（§3.3 要求「缺失 → 沿链下溯 → 最终一定落到 idle」）。
         # 在这里把回退结论算完，前端只负责播——回退链是后端领域模型。

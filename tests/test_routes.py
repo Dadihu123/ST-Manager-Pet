@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from backend.core.store import MANIFEST_FILENAME, PetStore
+from backend.core.store import DEFAULT_PET_ID, MANIFEST_FILENAME, PetStore
 from fake_api import FakeApi, build_app
 from pet_test_support import make_image_bytes, minimal_pack, pack, write_pack, write_sheet
 
@@ -23,10 +23,14 @@ def env(tmp_path):
     data_dir.mkdir(parents=True)
     builtin_dir.mkdir(parents=True)
 
-    # 内置形象（完整）
+    # 内置形象（完整）—— 用 `DEFAULT_PET_ID` 这个 id，顺带覆盖「首次安装默认形象」
     write_pack(
-        builtin_dir, 'default-cat', payload=pack(id='default-cat', name='默认小猫'),
-        sheets={'idle.png': 4, 'walk.png': 6, 'fall.png': 2, 'drag.png': 2, 'land.png': 3},
+        builtin_dir, DEFAULT_PET_ID,
+        payload=pack(id=DEFAULT_PET_ID, name='小满'),
+        sheets={
+            'idle.png': 4, 'walk-left.png': 4, 'walk-right.png': 4,
+            'fall.png': 2, 'drag.png': 2, 'land.png': 3,
+        },
     )
     # 内置形象（只有单帧 idle —— 「任何一张单帧图都能跑起来」）
     write_pack(
@@ -36,13 +40,16 @@ def env(tmp_path):
     # 用户自建形象（覆盖类用例要用它 —— 内置形象严格只读）
     write_pack(
         data_dir / 'pets', 'my-cat', payload=pack(id='my-cat', name='我的猫'),
-        sheets={'idle.png': 4, 'walk.png': 6, 'fall.png': 2, 'drag.png': 2},
+        sheets={
+            'idle.png': 4, 'walk-left.png': 4, 'walk-right.png': 4,
+            'fall.png': 2, 'drag.png': 2,
+        },
     )
 
     store = PetStore(str(data_dir), str(builtin_dir))
-    # 显式指定当前形象：否则 `active_pet_id()` 会回落到列表里第一个可用形象，
+    # 显式指定当前形象：否则 `active_pet_id()` 会回落到默认形象，
     # 而排序按名称（中文）——那会让这些用例依赖 locale 细节。
-    store.update_settings({'activePetId': 'default-cat'})
+    store.update_settings({'activePetId': DEFAULT_PET_ID})
 
     api = FakeApi(data_dir=str(data_dir))
     app = build_app(api, store)
@@ -64,8 +71,8 @@ def test_list_pets_shape(env):
     payload = json_of(response)
     assert payload['success'] is True
     ids = [item['id'] for item in payload['items']]
-    assert 'default-cat' in ids and 'solo' in ids
-    assert payload['activePetId'] == 'default-cat'
+    assert 'xiaoman' in ids and 'solo' in ids
+    assert payload['activePetId'] == 'xiaoman'
     assert 'idle' in payload['actions'] and 'land' in payload['actions']
     assert payload['limits']['maxImageBytes'] > 0
 
@@ -86,7 +93,7 @@ def test_runtime_endpoint_returns_resolved_fallback(env):
     payload = json_of(client.get('/api/plugins/stm-pet/pets/solo/runtime'))
     assert payload['success'] is True
     actions = payload['pet']['actions']
-    for action in ('walk', 'drag', 'fall', 'land', 'happy', 'sleep', 'click', 'look'):
+    for action in ('walk-left', 'walk-right', 'drag', 'fall', 'land', 'happy', 'sleep', 'click', 'look'):
         entry = actions[action]
         assert entry['source'] == 'idle', f'{action} 未回退到 idle'
         assert entry['url'], f'{action} 缺少可用图'
@@ -98,8 +105,8 @@ def test_active_runtime_endpoint(env):
     _app, _store, client, _api = env
     payload = json_of(client.get('/api/plugins/stm-pet/runtime'))
     assert payload['success'] is True
-    assert payload['activePetId'] == 'default-cat'
-    assert payload['pet']['id'] == 'default-cat'
+    assert payload['activePetId'] == 'xiaoman'
+    assert payload['pet']['id'] == 'xiaoman'
     assert 'actions' in payload
 
 
@@ -118,7 +125,7 @@ def test_runtime_endpoint_unknown_pet_is_structured_404(env):
 
 def test_frame_endpoint_serves_image(env):
     _app, _store, client, _api = env
-    response = client.get('/api/plugins/stm-pet/frame/default-cat/idle')
+    response = client.get('/api/plugins/stm-pet/frame/xiaoman/idle')
     assert response.status_code == 200
     assert response.headers['Content-Type'].startswith('image/')
     assert response.data.startswith(b'\x89PNG')
@@ -133,11 +140,11 @@ def test_frame_endpoint_cache_depends_on_version_param(env):
     """
     _app, _store, client, _api = env
 
-    versioned = client.get('/api/plugins/stm-pet/frame/default-cat/idle?v=123-456')
+    versioned = client.get('/api/plugins/stm-pet/frame/xiaoman/idle?v=123-456')
     assert 'max-age=604800' in versioned.headers.get('Cache-Control', '')
     assert 'immutable' not in versioned.headers.get('Cache-Control', '')
 
-    unversioned = client.get('/api/plugins/stm-pet/frame/default-cat/idle')
+    unversioned = client.get('/api/plugins/stm-pet/frame/xiaoman/idle')
     cache_control = unversioned.headers.get('Cache-Control', '')
     assert 'no-cache' in cache_control, f'不带 v 的请求应回源校验，实际: {cache_control}'
     # 仍然允许被缓存（靠 ETag 做廉价 304），只是必须校验
@@ -150,7 +157,7 @@ def test_frame_endpoint_reports_source(env):
     内置形象严格只读，因此**只可能**是 builtin——即便磁盘上存在遗留覆盖。
     """
     _app, store, client, _api = env
-    response = client.get('/api/plugins/stm-pet/frame/default-cat/idle')
+    response = client.get('/api/plugins/stm-pet/frame/xiaoman/idle')
     assert response.headers.get('X-Pet-Frame-Source') == 'builtin'
 
     # 用户形象才允许覆盖
@@ -164,12 +171,12 @@ def test_frame_endpoint_reports_source(env):
 def test_frame_endpoint_supports_conditional_request(env):
     """ETag / If-None-Match 必须生效：宠物每秒都在取这张图。"""
     _app, _store, client, _api = env
-    first = client.get('/api/plugins/stm-pet/frame/default-cat/idle')
+    first = client.get('/api/plugins/stm-pet/frame/xiaoman/idle')
     etag = first.headers.get('ETag')
     assert etag, '应返回 ETag'
 
     second = client.get(
-        '/api/plugins/stm-pet/frame/default-cat/idle',
+        '/api/plugins/stm-pet/frame/xiaoman/idle',
         headers={'If-None-Match': etag},
     )
     assert second.status_code == 304
@@ -187,13 +194,13 @@ def test_frame_endpoint_rejects_bad_pet_id(env, pet_id):
 @pytest.mark.parametrize('action', ['../idle', 'a/b', 'idle.png', '', '..'])
 def test_frame_endpoint_rejects_bad_action(env, action):
     _app, _store, client, _api = env
-    response = client.get(f'/api/plugins/stm-pet/frame/default-cat/{action}')
+    response = client.get(f'/api/plugins/stm-pet/frame/xiaoman/{action}')
     assert response.status_code in (404, 308)
 
 
 def test_frame_endpoint_unknown_action_is_404(env):
     _app, _store, client, _api = env
-    response = client.get('/api/plugins/stm-pet/frame/default-cat/teleport')
+    response = client.get('/api/plugins/stm-pet/frame/xiaoman/teleport')
     # 未知动作名会回退到 idle（向前兼容），因此这里是 200 而不是 404
     assert response.status_code == 200
 
@@ -317,24 +324,24 @@ def test_import_pet_rejects_fake_zip_extension(env):
 def test_upload_action_image(env):
     _app, store, client, _api = env
     response = client.post(
-        '/api/plugins/stm-pet/pets/my-cat/actions/walk',
-        data={'file': (io.BytesIO(make_image_bytes(size=(200, 100))), 'walk.png')},
+        '/api/plugins/stm-pet/pets/my-cat/actions/walk-left',
+        data={'file': (io.BytesIO(make_image_bytes(size=(200, 100))), 'walk-left.png')},
         content_type='multipart/form-data',
     )
     assert response.status_code == 200
     payload = json_of(response)
     assert payload['success'] is True
-    assert payload['override']['action'] == 'walk'
+    assert payload['override']['action'] == 'walk-left'
     assert payload['override']['url']
-    assert store.resolve_frame_path('my-cat', 'walk')[1] == 'override'
+    assert store.resolve_frame_path('my-cat', 'walk-left')[1] == 'override'
 
 
 def test_upload_action_image_on_builtin_is_forbidden(env):
     """★ 内置形象严格只读：换图接口直接拒绝（不能只靠 UI 藏按钮）。"""
     _app, store, client, _api = env
     response = client.post(
-        '/api/plugins/stm-pet/pets/default-cat/actions/walk',
-        data={'file': (io.BytesIO(make_image_bytes(size=(64, 64))), 'walk.png')},
+        '/api/plugins/stm-pet/pets/xiaoman/actions/walk-left',
+        data={'file': (io.BytesIO(make_image_bytes(size=(64, 64))), 'walk-left.png')},
         content_type='multipart/form-data',
     )
     assert response.status_code == 403
@@ -343,14 +350,14 @@ def test_upload_action_image_on_builtin_is_forbidden(env):
     assert payload['error'] == 'builtin_readonly'
     assert payload['hint']
     # 磁盘上不该留下覆盖
-    assert store.resolve_frame_path('default-cat', 'walk')[1] == 'builtin'
+    assert store.resolve_frame_path('xiaoman', 'walk-left')[1] == 'builtin'
 
 
 def test_upload_action_image_rejects_non_image(env):
     _app, _store, client, _api = env
     response = client.post(
-        '/api/plugins/stm-pet/pets/my-cat/actions/walk',
-        data={'file': (io.BytesIO(b'%PDF-1.4 fake'), 'walk.png')},
+        '/api/plugins/stm-pet/pets/my-cat/actions/walk-left',
+        data={'file': (io.BytesIO(b'%PDF-1.4 fake'), 'walk-left.png')},
         content_type='multipart/form-data',
     )
     assert response.status_code == 400
@@ -372,17 +379,17 @@ def test_upload_action_image_rejects_bad_action(env):
 def test_delete_action_image_reverts_to_pack(env):
     _app, store, client, _api = env
     client.post(
-        '/api/plugins/stm-pet/pets/my-cat/actions/walk',
-        data={'file': (io.BytesIO(make_image_bytes(size=(64, 64))), 'walk.png')},
+        '/api/plugins/stm-pet/pets/my-cat/actions/walk-left',
+        data={'file': (io.BytesIO(make_image_bytes(size=(64, 64))), 'walk-left.png')},
         content_type='multipart/form-data',
     )
-    assert store.resolve_frame_path('my-cat', 'walk')[1] == 'override'
+    assert store.resolve_frame_path('my-cat', 'walk-left')[1] == 'override'
 
-    response = client.delete('/api/plugins/stm-pet/pets/my-cat/actions/walk')
+    response = client.delete('/api/plugins/stm-pet/pets/my-cat/actions/walk-left')
     assert response.status_code == 200
     payload = json_of(response)
     assert payload['removed'] is True
-    assert store.resolve_frame_path('my-cat', 'walk')[1] == 'pack'
+    assert store.resolve_frame_path('my-cat', 'walk-left')[1] == 'pack'
 
 
 # ------------------------------------------------------------------ 删除形象
@@ -403,10 +410,10 @@ def test_delete_user_pet_endpoint(env):
 def test_delete_builtin_pet_is_refused(env):
     """内置形象不能通过接口删掉。"""
     _app, store, client, _api = env
-    response = client.delete('/api/plugins/stm-pet/pets/default-cat')
+    response = client.delete('/api/plugins/stm-pet/pets/xiaoman')
     assert response.status_code == 404
     assert json_of(response)['success'] is False
-    assert os.path.isdir(os.path.join(store.builtin_dir, 'default-cat'))
+    assert os.path.isdir(os.path.join(store.builtin_dir, 'xiaoman'))
 
 
 # ------------------------------------------------------------------ 设置
@@ -415,7 +422,7 @@ def test_delete_builtin_pet_is_refused(env):
 def test_get_and_update_settings(env):
     _app, _store, client, _api = env
     settings = json_of(client.get('/api/plugins/stm-pet/settings'))['settings']
-    assert settings['activePetId'] == 'default-cat'
+    assert settings['activePetId'] == 'xiaoman'
 
     response = client.post(
         '/api/plugins/stm-pet/settings',
@@ -459,19 +466,23 @@ def test_preview_endpoint_explains_fallbacks(env):
     _app, _store, client, _api = env
     payload = json_of(client.get('/api/plugins/stm-pet/pets/solo/preview'))
     assert payload['success'] is True
+    # `walk` 是**需求代号**（行走只认方向化贴图），所以缺的是它；
+    # 动作列表里出现的是 `walk-left` / `walk-right` 两个真实动作名。
     assert set(payload['missingRequired']) == {'walk', 'drag', 'fall'}
-    walk = next(item for item in payload['actions'] if item['action'] == 'walk')
-    assert walk['source'] == 'idle'
-    assert walk['note'], '回退必须带解释'
+    assert 'walk' not in [item['action'] for item in payload['actions']], \
+        '正面 walk 已退役，不该出现在动作列表里'
+    left = next(item for item in payload['actions'] if item['action'] == 'walk-left')
+    assert left['source'] == 'idle'
+    assert left['note'], '回退必须带解释'
 
 
 def test_preview_marks_overridden_actions(env):
     _app, store, client, _api = env
-    store.save_action_image('my-cat', 'walk', make_image_bytes(size=(64, 64)))
+    store.save_action_image('my-cat', 'walk-left', make_image_bytes(size=(64, 64)))
     payload = json_of(client.get('/api/plugins/stm-pet/pets/my-cat/preview'))
-    walk = next(item for item in payload['actions'] if item['action'] == 'walk')
-    assert walk['overridden'] is True
-    assert walk['frameSource'] == 'override'
+    left = next(item for item in payload['actions'] if item['action'] == 'walk-left')
+    assert left['overridden'] is True
+    assert left['frameSource'] == 'override'
 
 
 def test_preview_exposes_appearance_and_writability(env):
@@ -481,7 +492,7 @@ def test_preview_exposes_appearance_and_writability(env):
     同时**仍然**带上 scale / pixelated——那两项对内置形象也是可调的。
     """
     _app, _store, client, _api = env
-    builtin = json_of(client.get('/api/plugins/stm-pet/pets/default-cat/preview'))
+    builtin = json_of(client.get('/api/plugins/stm-pet/pets/xiaoman/preview'))
     assert builtin['writable'] is False
     assert builtin['source'] == 'builtin'
     assert builtin['scale'] == 1
@@ -508,7 +519,7 @@ def test_export_endpoint_returns_zip(env):
 def test_export_builtin_pet_is_forbidden(env):
     """★ 内置形象不提供导出（用户明确要求）。"""
     _app, _store, client, _api = env
-    response = client.get('/api/plugins/stm-pet/pets/default-cat/export')
+    response = client.get('/api/plugins/stm-pet/pets/xiaoman/export')
     assert response.status_code == 403
     payload = json_of(response)
     assert payload['success'] is False
@@ -523,7 +534,7 @@ def test_update_appearance_saves_scale_and_pixelated(env):
     """★ 倍率与渲染方式**按形象**保存（用户要求应对不同分辨率与形象）。"""
     _app, _store, client, _api = env
     response = client.post(
-        '/api/plugins/stm-pet/pets/default-cat/appearance',
+        '/api/plugins/stm-pet/pets/xiaoman/appearance',
         json={'scale': 2.5, 'pixelated': True},
         content_type='application/json',
     )
@@ -544,7 +555,7 @@ def test_update_appearance_is_allowed_on_builtin(env):
     """
     _app, _store, client, _api = env
     response = client.post(
-        '/api/plugins/stm-pet/pets/default-cat/appearance',
+        '/api/plugins/stm-pet/pets/xiaoman/appearance',
         json={'scale': 0.5},
         content_type='application/json',
     )
@@ -596,15 +607,15 @@ def test_update_appearance_rejects_non_boolean_pixelated(env):
 def test_clear_overrides_endpoint(env):
     """★ 内置形象的「一键清理」：清掉不再生效的遗留覆盖。"""
     _app, store, client, _api = env
-    override_dir = os.path.join(store.user_pet_dir('default-cat'), 'overrides')
+    override_dir = os.path.join(store.user_pet_dir('xiaoman'), 'overrides')
     os.makedirs(override_dir, exist_ok=True)
     write_sheet(os.path.join(override_dir, 'idle.png'), frames=1)
 
-    before = json_of(client.get('/api/plugins/stm-pet/pets/default-cat/runtime'))
+    before = json_of(client.get('/api/plugins/stm-pet/pets/xiaoman/runtime'))
     assert before['pet']['staleOverrides'] == ['idle']
     assert before['pet']['actions']['idle']['frameSource'] == 'builtin'
 
-    response = client.delete('/api/plugins/stm-pet/pets/default-cat/overrides')
+    response = client.delete('/api/plugins/stm-pet/pets/xiaoman/overrides')
     assert response.status_code == 200
     payload = json_of(response)
     assert payload['removed'] == ['idle']
@@ -678,11 +689,11 @@ def test_create_pet_endpoint_supports_multi_frame_sheet(env):
 
 
 def test_create_pet_endpoint_requires_idle(env):
-    """只给 walk 不给 idle → 明确报错（idle 是唯一硬必要动作）。"""
+    """只给 walk-left 不给 idle → 明确报错（idle 是唯一硬必要动作）。"""
     _app, _store, client, _api = env
     response = client.post(
         '/api/plugins/stm-pet/pets/create',
-        data=_create_form('没有待机', {'walk': (make_image_bytes(size=(64, 64)), 1)}),
+        data=_create_form('没有待机', {'walk-left': (make_image_bytes(size=(64, 64)), 1)}),
         content_type='multipart/form-data',
     )
     assert response.status_code == 400

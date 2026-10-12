@@ -8,10 +8,14 @@
 
 「必要动作」的真正含义
 ----------------------
-`idle` / `walk` / `drag` / `fall` 被标为「必要」，但**不是**「不给就报错」，
-而是**「不给就退化为静态位移」**：没有 `walk` 的 sheet 时，宠物照常移动位置，
+`idle` / `drag` / `fall` 被标为「必要」，但**不是**「不给就报错」，
+而是**「不给就退化为静态位移」**：没有行走图的包，宠物照常移动位置，
 只是不播帧。因此解析器对缺动作给出的是 `kind='static'` 的**降级结果**，
 只有「连 `idle` 都没有」才是错误（`pack_animation_idle_missing`）。
+
+行走**只有方向化动作**（`walk-left` / `walk-right`），没有「正面 `walk`」：
+正面视角的行走图看起来是「原地踏步 + 平移」，出戏且与水平移动的语义不符。
+2026-10 已把 `walk` 从词表与内置形象里移除（见 README §3、§11）。
 """
 
 import json
@@ -36,12 +40,12 @@ FORMAT_VERSION = 1
 #: 方向化行走动作 → 对侧动作名。
 #:
 #: 为什么需要：宠物是**水平**移动的，而正面视角的行走图看起来是
-#: 「原地踏步 + 平移」。因此允许形象提供左右两套侧视行走图。
+#: 「原地踏步 + 平移」。因此行走**只认方向化贴图**（左右两套侧视图）。
 #:
 #: 只提供一侧时，另一侧**镜像**复用（见 `ResolvedAction.mirror`），
-#: 对称的形象（例如默认小猫）因此不必画两套。
-#: 但**左右不对称**的形象（例如「小满」的发夹只在单侧）必须自己画两套，
-#: 否则镜像会把发夹翻到另一边——这不是引擎能替作者决定的事。
+#: 对称的形象因此不必画两套。但**左右不对称**的形象（例如「小满」的发夹
+#: 只在单侧、「小卡」的木牌只在左髋）必须自己画两套，否则镜像会把细节翻到另一边
+#: ——这不是引擎能替作者决定的事。
 WALK_DIRECTION_ACTIONS = {
     'walk-left': 'walk-right',
     'walk-right': 'walk-left',
@@ -49,11 +53,13 @@ WALK_DIRECTION_ACTIONS = {
 
 #: 动作词表与「省略时的回退链」（§3.3，照抄为契约）。
 #: `idle` 是唯一硬必要动作；其余缺失时沿链下溯，最终一定落到 `idle`。
+#:
+#: **没有正面 `walk`**：行走只认 `walk-left` / `walk-right`，两侧都没有就退到 `idle`
+#: （只位移容器、不播帧），而不是播一张「原地踏步」的正面图。
 ACTION_FALLBACKS = {
     'idle': (),
-    'walk': ('idle',),
-    'walk-left': ('walk', 'idle'),
-    'walk-right': ('walk', 'idle'),
+    'walk-left': ('idle',),
+    'walk-right': ('idle',),
     'drag': ('idle',),
     'fall': ('idle',),
     'land': ('fall', 'idle'),
@@ -66,6 +72,8 @@ ACTION_FALLBACKS = {
 }
 
 #: 「必要动作」：缺失时**不报错**，而是退化为静态位移（见模块 docstring）。
+#:
+#: 行走算不算「有」，由 `missing_required()` 特判：提供**任一侧**方向化行走即算满足。
 REQUIRED_ACTIONS = ('idle', 'walk', 'drag', 'fall')
 
 #: 只播一遍的动作（其余默认循环）。未显式给 `loop` 时按此判定。
@@ -252,7 +260,7 @@ class PetPack:
 
         方向化行走（`walk-left` / `walk-right`）多一层：
         自己那一侧缺失时，**镜像**对侧复用（`mirror=True`）。
-        镜像之后才轮到正面 `walk`，最后是 `idle`。
+        镜像之后轮到 `idle`——**没有正面 `walk` 这一层**了。
         """
         action = str(action or '').strip()
         if not action:
@@ -310,8 +318,8 @@ class PetPack:
     def missing_required(self) -> list:
         """缺失的「必要动作」列表（**不是错误**，但要告诉用户会怎么降级）。
 
-        `walk` 的特例：提供了**任一侧**方向化行走（`walk-left` / `walk-right`）
-        就算满足——另一侧会自动镜像，正面 `walk` 已不再是必需。
+        `walk` 的特例：行走**只有方向化动作**，因此提供**任一侧**
+        （`walk-left` / `walk-right`）就算满足——另一侧会自动镜像。
         不这样特判的话，只给侧视图的形象会被误报「缺少行走」。
         """
         def satisfied(name: str) -> bool:
