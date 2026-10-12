@@ -27,12 +27,6 @@
       "fps": 4,
       "loop": true
     },
-    "walk": {
-      "sheet": "walk.png",
-      "frames": 6,
-      "fps": 8,
-      "loop": true
-    },
     "walk-left": {
       "sheet": "walk-left.png",
       "frames": 4,

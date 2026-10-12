@@ -1,0 +1,97 @@
+{
+  "format": 1,
+  "id": "xiaoka",
+  "name": "小卡",
+  "author": "ST-Manager",
+  "size": {
+    "w": 384,
+    "h": 576
+  },
+  "anchor": {
+    "x": 0.5,
+    "y": 0.9913
+  },
+  "scale": 0.45,
+  "pixelated": false,
+  "physics": {
+    "gravity": 1800,
+    "walkSpeed": 52,
+    "friction": 0.02,
+    "terminalVelocity": 2400,
+    "bounce": 0.12
+  },
+  "animations": {
+    "idle": {
+      "sheet": "idle.png",
+      "frames": 4,
+      "fps": 4,
+      "loop": true
+    },
+    "walk-left": {
+      "sheet": "walk-left.png",
+      "frames": 4,
+      "fps": 8,
+      "loop": true
+    },
+    "walk-right": {
+      "sheet": "walk-right.png",
+      "frames": 4,
+      "fps": 8,
+      "loop": true
+    },
+    "drag": {
+      "sheet": "drag.png",
+      "frames": 2,
+      "fps": 4,
+      "loop": true
+    },
+    "fall": {
+      "sheet": "fall.png",
+      "frames": 2,
+      "fps": 8,
+      "loop": true
+    },
+    "land": {
+      "sheet": "land.png",
+      "frames": 3,
+      "fps": 12,
+      "loop": false
+    },
+    "sleep": {
+      "sheet": "sleep.png",
+      "frames": 4,
+      "fps": 3,
+      "loop": true
+    },
+    "click": {
+      "sheet": "click.png",
+      "frames": 3,
+      "fps": 12,
+      "loop": false
+    },
+    "happy": {
+      "sheet": "happy.png",
+      "frames": 4,
+      "fps": 6,
+      "loop": false
+    },
+    "sad": {
+      "sheet": "sad.png",
+      "frames": 4,
+      "fps": 4,
+      "loop": true
+    },
+    "angry": {
+      "sheet": "angry.png",
+      "frames": 4,
+      "fps": 6,
+      "loop": true
+    },
+    "look": {
+      "sheet": "look.png",
+      "frames": 4,
+      "fps": 5,
+      "loop": true
+    }
+  }
+}
