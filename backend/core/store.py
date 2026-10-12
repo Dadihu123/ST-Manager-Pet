@@ -138,6 +138,7 @@ CONFIG_KEYS = (
     'auto_roam',
     'scale',
     'sleep_after',
+    'anim_speed',
 )
 
 #: 倍率区间的**兜底**（权威定义在 `pack.SCALE_RANGE`，这里只是取用）。
@@ -558,6 +559,18 @@ class PetStore:
             'overrides': self._overridden_actions(pet_id),
             'staleOverrides': [],
             'error': '',
+            # 缩略图几何：面板要为**每一张**卡片算出「只显示第 0 帧」的
+            # `background-size`，而那需要该形象自己的帧数与排布。
+            # 放在列表接口里，是因为列表渲染时详情还没请求回来——
+            # 早先的实现只好借「当前选中形象」的帧数去算，
+            # 结果是除第一张之外的所有卡片都算错（小满因此没有缩略图）。
+            #
+            # 类型在**成功与失败两条路径上必须一致**（都是 dict）：
+            # 解析失败时给一个空几何，面板照常渲染占位框。
+            # 一处是 `None`、另一处是 dict 的话，前端要么得写两种判空，
+            # 要么会在坏包上抛错——而「一个坏包不该让整个列表打不开」正是
+            # 这个方法存在的意义。
+            'thumb': {'url': '', 'frames': 1, 'layout': 'horizontal'},
         }
         try:
             pack = self.load_pack(pet_id)
@@ -579,8 +592,35 @@ class PetStore:
             'declaredPixelated': bool(pack.pixelated),
             'writable': not builtin_only,
             'staleOverrides': base['overrides'] if builtin_only else [],
+            'thumb': self.thumbnail_spec(pet_id, pack),
         })
         return base
+
+    def thumbnail_spec(self, pet_id: str, pack: PetPack = None) -> dict:
+        """列表缩略图要的几何：`{url, frames, layout}`（取 `idle` 的主变体）。
+
+        `frames <= 1` 时前端用 `contain` 居中显示；多帧时按帧数横向放大、
+        左对齐，只露出第 0 帧（见 `panel.js:applyThumbGeometry`）。
+
+        取不到图时返回 `{'url': ''}`，面板据此显示占位而不是一张破图。
+        """
+        try:
+            pack = pack if pack is not None else self.load_pack(pet_id)
+        except PetError:
+            return {'url': '', 'frames': 1, 'layout': 'horizontal'}
+        resolved = pack.resolve('idle')
+        variants = resolved.variants or []
+        if resolved.kind != KIND_ANIMATED or not variants:
+            return {'url': '', 'frames': 1, 'layout': 'horizontal'}
+        path, _source = self.resolve_frame_path(pet_id, 'idle', variant=0)
+        if not path:
+            return {'url': '', 'frames': 1, 'layout': 'horizontal'}
+        primary = variants[0]
+        return {
+            'url': self.frame_url(pet_id, 'idle', path),
+            'frames': int(primary.frames) or 1,
+            'layout': primary.layout or 'horizontal',
+        }
 
     # ------------------------------------------------------------ 读取
 
@@ -647,16 +687,26 @@ class PetStore:
 
     # ---------------------------------------------------- 覆盖与帧解析
 
-    def resolve_frame_path(self, pet_id: str, action: str) -> tuple:
+    def resolve_frame_path(self, pet_id: str, action: str, *, variant: int = 0) -> tuple:
         """按两层覆盖解析某动作实际该用哪张图。
+
+        Args:
+            pet_id: 形象 id。
+            action: 动作名。
+            variant: 第几套动画（多套动画按权重随机选一套时用；默认第一套）。
 
         Returns:
             `(absolute_path, source)`；`source` ∈ `{'override', 'pack', 'builtin'}`。
-            该动作没有可用图时返回 `('', 'none')`。
+            该动作（或该套动画）没有可用图时返回 `('', 'none')`。
 
         **内置形象只读**（用户要求「插件自带的宠物不应该允许用户修改」）：
         内置形象的解析**直接跳过 `overrides/`**，因此磁盘上遗留的覆盖文件
         不会生效（面板会提示并提供一键清理，见 `list_pet_overrides`）。
+
+        单动作覆盖（`overrides/<action>.<ext>`）**只作用于第一套动画**：
+        覆盖的语义是「这个动作换成我的图」，而不是「这个动作的第 N 套换成我的图」。
+        多套动画的其余几套只能由包自己提供——这样规则简单，也不会出现
+        「上传一张图后另外两套动画静默消失」这种怪事。
 
         Raises:
             PetError: 路径非法。
@@ -670,11 +720,15 @@ class PetStore:
                 user_msg='动作名不合法。',
                 hint='动作名只能是字母、数字、下划线或连字符。',
             )
+        try:
+            index = max(0, int(variant))
+        except (TypeError, ValueError):
+            index = 0
 
         user_dir = self.user_pet_dir(pet_id)
-        # 1) 单动作覆盖 —— 只对**用户形象**生效。内置形象不读覆盖目录，
-        #    否则「不可修改」就只是 UI 层面的假象。
-        if not self._is_builtin_only(pet_id):
+        # 1) 单动作覆盖 —— 只对**用户形象**、且只对**第一套**动画生效。
+        #    内置形象不读覆盖目录，否则「不可修改」就只是 UI 层面的假象。
+        if index == 0 and not self._is_builtin_only(pet_id):
             override_dir = os.path.join(user_dir, OVERRIDES_DIRNAME)
             for extension in _IMAGE_EXTENSIONS:
                 candidate = os.path.join(override_dir, f'{action}{extension}')
@@ -682,7 +736,6 @@ class PetStore:
                     return candidate, 'override'
 
         # 2)/3) 包内自带：用户包优先，然后内置包
-        pack = None
         try:
             pack = self.load_pack(pet_id)
         except PetError:
@@ -691,8 +744,12 @@ class PetStore:
         resolved = pack.resolve(action)
         if resolved.kind != KIND_ANIMATED or not resolved.sheet:
             return '', 'none'
-
-        relative = to_posix(resolved.sheet)
+        variants = resolved.variants or []
+        if not (0 <= index < len(variants)):
+            return '', 'none'
+        relative = to_posix(variants[index].sheet)
+        if not relative:
+            return '', 'none'
         for root, source in ((user_dir, 'pack'), (self.builtin_pet_dir(pet_id), 'builtin')):
             candidate = os.path.join(root, relative.replace('/', os.sep))
             real = os.path.realpath(candidate)
@@ -736,34 +793,12 @@ class PetStore:
         # 在这里把回退结论算完，前端只负责播——回退链是后端领域模型。
         actions = {}
         for action in ACTION_FALLBACKS:
-            resolved = pack.resolve(action)
-            entry = resolved.to_dict()
-            if resolved.kind == KIND_ANIMATED:
-                path, frame_source = self.resolve_frame_path(pet_id, action)
-                entry['url'] = self.frame_url(pet_id, action, path) if path else ''
-                entry['frameSource'] = frame_source
-                if not entry['url']:
-                    # 声明了 sheet 但文件缺失 → 退化为静态，并说明原因
-                    entry['kind'] = 'static'
-                    entry['note'] = '这张图在形象包里找不到，将只移动位置、不播放动画。'
-            else:
-                entry['url'] = ''
-                entry['frameSource'] = 'none'
-            # 词表外的动作（包自己声明的扩展动作）也一并输出
-            actions[action] = entry
-
+            actions[action] = self._runtime_action(pet_id, pack, action)
+        # 词表外的动作（包自己声明的扩展动作）也一并输出
         for action in pack.animations:
             if action in actions:
                 continue
-            resolved = pack.resolve(action)
-            entry = resolved.to_dict()
-            path, frame_source = self.resolve_frame_path(pet_id, action)
-            entry['url'] = self.frame_url(pet_id, action, path) if path else ''
-            entry['frameSource'] = frame_source
-            if entry['kind'] == KIND_ANIMATED and not entry['url']:
-                entry['kind'] = 'static'
-                entry['note'] = '这张图在形象包里找不到，将只移动位置、不播放动画。'
-            actions[action] = entry
+            actions[action] = self._runtime_action(pet_id, pack, action)
 
         # 「遗留覆盖」：内置形象磁盘上有覆盖文件、但按只读规则**不生效**。
         # 必须显式报出来，否则用户看到的是「我明明换过图，怎么没变」——
@@ -796,10 +831,84 @@ class PetStore:
             if source == 'user' else '',
         }
 
-    def frame_url(self, pet_id: str, action: str, path: str = '') -> str:
-        """给某动作的图拼一个**带版本**的 URL（内容变了就换 URL，便于强缓存）。"""
+    def _runtime_action(self, pet_id: str, pack: PetPack, action: str) -> dict:
+        """把一个动作解析成前端直接可播的运行期条目。
+
+        条目形如::
+
+            {
+              "action": "click", "source": "click", "kind": "animated",
+              "frames": 4, "fps": 6, "loop": false, "layout": "horizontal",
+              "frameMs": [], "mirror": false, "chain": [...], "note": "",
+              "url": "...",                    # 主变体的图（兼容旧前端）
+              "frameSource": "builtin",
+              "variants": [ {...}, {...} ],    # 每套动画各自的图与帧参数
+              "idleTrigger": {...},            # 只有 idle 有
+            }
+
+        `url` / `frames` / `fps` 这一组是**主变体**的透传：老前端只认它们，
+        新前端优先读 `variants`。两套并存是有意的——运行期定义是前后端之间的
+        契约，加字段安全、改字段危险。
+        """
+        resolved = pack.resolve(action)
+        entry = resolved.to_dict()
+
+        if resolved.kind != KIND_ANIMATED:
+            entry['url'] = ''
+            entry['frameSource'] = 'none'
+            entry['variants'] = []
+            return entry
+
+        variants = []
+        for index, variant in enumerate(resolved.variants):
+            path, frame_source = self.resolve_frame_path(pet_id, action, variant=index)
+            item = variant.to_dict()
+            # `variant=index` **必须传**：不传的话每套动画都会拼出同一个 URL
+            # （`?v=` 只跟文件内容有关，而 `idle` 的两套动画是两个不同的文件、
+            # 版本号不同，看起来「恰好」是对的——但只要两套指向同一个文件
+            # （例如作者让两套共用一张图、只改帧时长），URL 就会撞在一起，
+            # 前端按 `vi` 区分变体的逻辑随即失效）。
+            item['url'] = (
+                self.frame_url(pet_id, action, path, variant=index) if path else ''
+            )
+            item['frameSource'] = frame_source
+            variants.append(item)
+
+        # 只保留**真的有图**的变体：声明了 sheet 但文件缺失的那套留着，
+        # 前端会拿到一个空 URL 并跳过它（按权重抽取时不能选中空图）。
+        playable = [item for item in variants if item['url']]
+        entry['variants'] = playable
+        if playable:
+            primary = playable[0]
+            entry['url'] = primary['url']
+            entry['frameSource'] = primary['frameSource']
+            # 主变体透传：老前端只读这些字段，因此它们必须与 `variants[0]` 一致
+            entry['frames'] = primary['frames']
+            entry['fps'] = primary['fps']
+            entry['loop'] = primary['loop']
+            entry['layout'] = primary['layout']
+            entry['frameMs'] = list(primary['frameMs'])
+        else:
+            # 声明了 sheet 但一张图都找不到 → 退化为静态，并说明原因
+            entry['kind'] = 'static'
+            entry['url'] = ''
+            entry['frameSource'] = 'none'
+            entry['note'] = '这张图在形象包里找不到，将只移动位置、不播放动画。'
+        return entry
+
+    def frame_url(self, pet_id: str, action: str, path: str = '', *, variant: int = 0) -> str:
+        """给某动作（某套动画）的图拼一个**带版本**的 URL。
+
+        内容变了就换 URL，便于强缓存。`variant` 只影响路径（`?vi=`），
+        版本号仍取自实际文件——两套动画指向同一个文件时 URL 不同，
+        但各自的缓存键都是内容相关的。
+        """
         pet_id = sanitize_pet_id(pet_id)
         action = str(action or '').strip()
+        try:
+            index = max(0, int(variant))
+        except (TypeError, ValueError):
+            index = 0
         version = ''
         if path and os.path.isfile(path):
             try:
@@ -807,8 +916,13 @@ class PetStore:
                 version = f'{int(stat.st_mtime)}-{stat.st_size}'
             except OSError:
                 version = ''
-        query = f'?v={version}' if version else ''
-        return f'/api/plugins/stm-pet/frame/{pet_id}/{action}{query}'
+        query = []
+        if index > 0:
+            query.append(f'vi={index}')
+        if version:
+            query.append(f'v={version}')
+        suffix = f'?{"&".join(query)}' if query else ''
+        return f'/api/plugins/stm-pet/frame/{pet_id}/{action}{suffix}'
 
     # ------------------------------------------------------------ 导入
 
@@ -1175,19 +1289,36 @@ class PetStore:
     def _apply_sheet_renames(manifest: dict, renames: dict) -> None:
         """把 `sheet` 里被转码改名过的路径改写成实际落盘的文件名。
 
-        `renames` 形如 `{'idle.jpg': 'idle.png'}`。支持字符串简写与对象两种写法。
+        `renames` 形如 `{'idle.jpg': 'idle.png'}`。支持字符串简写、对象、
+        以及 `variants`（多套动画）三种写法——**三处都要改**，
+        漏掉 `variants` 的后果是「导入后那套动画的图找不到」，
+        而包本身看起来完全正常（最难查的一类问题）。
         """
+        def rewrite(value):
+            if isinstance(value, str):
+                return renames.get(to_posix(value), value)
+            return value
+
         animations = manifest.get('animations')
         if not isinstance(animations, dict):
             return
-        for action, spec in animations.items():
+        for _action, spec in animations.items():
             if isinstance(spec, str):
-                if to_posix(spec) in renames:
-                    animations[action] = renames[to_posix(spec)]
-            elif isinstance(spec, dict):
-                sheet = spec.get('sheet')
-                if isinstance(sheet, str) and to_posix(sheet) in renames:
-                    spec['sheet'] = renames[to_posix(sheet)]
+                animations[_action] = rewrite(spec)
+                continue
+            if not isinstance(spec, dict):
+                continue
+            sheet = spec.get('sheet')
+            if isinstance(sheet, str) and to_posix(sheet) in renames:
+                spec['sheet'] = renames[to_posix(sheet)]
+            variants = spec.get('variants')
+            if isinstance(variants, list):
+                for variant in variants:
+                    if not isinstance(variant, dict):
+                        continue
+                    nested = variant.get('sheet')
+                    if isinstance(nested, str) and to_posix(nested) in renames:
+                        variant['sheet'] = renames[to_posix(nested)]
 
     @staticmethod
     def _find_manifest(files: dict) -> str:
@@ -1481,9 +1612,11 @@ class PetStore:
 
         names = set()
         for action in pack.animations:
-            resolved = pack.resolve(action)
-            if resolved.sheet:
-                names.add(to_posix(resolved.sheet))
+            # **每一套**动画的图都要带上：只导出主变体的话，
+            # 「导出再导入」会静默丢掉其余几套（用户会以为是自己弄丢的）。
+            for variant in pack.animations[action].variants:
+                if variant.sheet:
+                    names.add(to_posix(variant.sheet))
             # 覆盖图也要带上，否则导出再导入会丢用户改动
             path, source = self.resolve_frame_path(pack.id, action)
             if path and source == 'override':

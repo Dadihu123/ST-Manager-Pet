@@ -130,6 +130,9 @@ export async function activate(api) {
       scale: pack.scale !== undefined ? pack.scale : (Number(config.scale) || 1),
       pixelated: pack.pixelated === true,
       sleepAfter: Number(config.sleep_after) || 120,
+      // 动画速度倍率（越大越慢）。形象包已经按自己的节奏声明了 fps /
+      // 非均匀帧时长，这里只做**整体缩放**——用户觉得「太快了」时不必改包。
+      animSpeed: Number(config.anim_speed) || 1,
       showToast: config.show_toast === true,
       reducedMotion: state.hostState ? state.hostState.reducedMotion : false,
     }, extra);
@@ -397,6 +400,10 @@ export async function activate(api) {
       petId: state.pack ? state.pack.id : '',
       petState: state.petView ? state.petView.state : 'unmounted',
       action: state.petView ? state.petView.action : '',
+      variant: state.petView ? state.petView.variantIndex : -1,
+      idleMode: state.petView ? state.petView.idleMode : '',
+      animSpeed: state.petView ? state.petView.animSpeed : null,
+      gesture: state.petView ? state.petView.gesturePhase : '',
       throttle: state.petView ? state.petView.throttleReason : '',
       reducedMotion: state.hostState ? Boolean(state.hostState.reducedMotion) : null,
       hostState: state.hostState || null,
@@ -411,7 +418,25 @@ export async function activate(api) {
     react: (action = 'happy') => {
       if (state.petView) state.petView.react(action);
     },
+    /** 立刻触发一次 idle 小动作（不必等随机间隔）。 */
+    pokeIdle: () => (state.petView ? state.petView.pokeIdle() : false),
   };
+  /**
+   * 宠物视图本身（**只读**访问器）。
+   *
+   * 验收脚本要读 `gesturePhase` / `idleMode` / `machine` 这类**运行期**内部状态
+   * （它们既不是「配置」也不是「状态快照」，塞进 `stmPet.state()` 只会让那个
+   * 快照越来越难读）。
+   *
+   * 用 `defineProperty` 的取值器而不是一个赋值变量：视图在
+   * `applyPack()` / ambient 重挂载时会被**重建**（换形象、改倍率都会），
+   * 手工同步两处引用迟早会漏——漏掉的表现是「验收脚本读到已经 dispose 的旧视图」，
+   * 而那时它的读数全是陈旧的，看起来却「有值」，最难查。取值器天然不会过期。
+   */
+  Object.defineProperty(globalThis, '__petView', {
+    configurable: true,
+    get: () => state.petView,
+  });
   // 验收脚本用它打开面板（见 tools/verify-upload.mjs）
   globalThis.__petApi = api;
 
@@ -432,6 +457,13 @@ export async function activate(api) {
     // 诊断句柄随插件一起消失，避免禁用后还留着可调用的残留对象
     if (globalThis.stmPet) delete globalThis.stmPet;
     if (globalThis.__petApi === api) delete globalThis.__petApi;
+    // `__petView` 是 defineProperty 装的取值器，要用 delete 摘掉
+    // （它读的是闭包里的 `state`，留着就等于插件卸载后还暴露着一个入口）
+    try {
+      delete globalThis.__petView;
+    } catch {
+      // 不可配置时忽略：宿主重载插件会重建，不影响正确性
+    }
     announcer.dispose();
     panel.dispose();
     // ambient 的 unmount 由宿主强制完成（它会调我们 mount 里返回的清理函数），

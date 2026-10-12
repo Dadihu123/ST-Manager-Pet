@@ -10,6 +10,8 @@
  * 因此这里拿到的每个动作都已经是「最终结论 + 一句解释」。
  */
 
+import { createAnimationPlayer, totalDuration } from './preview.js';
+
 const ACTION_LABELS = {
   idle: '待机',
   'walk-left': '向左走',
@@ -67,6 +69,16 @@ const SCALE_MAX = 4;
 /** 倍率滑块的步长：0.05 足够细，又不至于让用户拖不到整数值。 */
 const SCALE_STEP = 0.05;
 
+/**
+ * 预览速度倍率的区间（与桌面宠物的 `anim_speed` 同区间、同语义：越大越慢）。
+ *
+ * 这里刻意**不复用**宿主的 `anim_speed`：那个是「全局生效」的设置，
+ * 在预览器里顺手改它会让用户以为自己只是试了一下，桌面上的宠物却真的变慢了。
+ * 预览的速度只影响预览。
+ */
+const SPEED_MIN = 0.25;
+const SPEED_MAX = 4;
+
 export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigChanged, onPetChanged }) {
   let root = null;
   let disposed = false;
@@ -88,6 +100,50 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
   let draftPixelated = false;
   /** 面板拿到的限制（倍率区间由后端给，避免两边写死不一致）。 */
   let limits = { scaleMin: SCALE_MIN, scaleMax: SCALE_MAX };
+  /**
+   * 动画预览器（设置页里「播放」具体动作）。
+   *
+   * 用户在**插件管理页里看不到动画效果**，调形象时只能切过去等它真的触发一次
+   * ——而 `click` / `land` 这类动作几乎等不到。因此面板自带一个播放器。
+   */
+  let player = null;
+  /** 预览器当前选的动作名与变体下标。 */
+  let previewAction = 'idle';
+  let previewVariant = 0;
+  /** 预览器的速度倍率（越大越慢），与桌面宠物用的是同一个语义。 */
+  let previewSpeed = 1;
+  /**
+   * 预览器是否处于「播放」状态。
+   *
+   * 必须**独立记录**，不能在渲染时读 `player.playing`：`render()` 一开始就把
+   * 旧播放器 dispose 掉了，而 `renderPreview()` 是在新播放器创建**之前**跑的，
+   * 那时 `player` 还是 null —— 读它会让按钮永远显示「播放」，
+   * 用户点一下看起来毫无反应（实测就是这么发现的）。
+   */
+  let previewPlaying = true;
+  /**
+   * 播放/暂停按钮的引用（就地更新它的文字）。
+   *
+   * **不能**用 `render()` 来刷新按钮状态：`render()` 会重建整个面板，
+   * 而重建又会重新 `load()` 播放器（从头播）。对 `loop: false` 的动作
+   * （`click` / `land` / `happy`）来说，「播完 → onEnd → render → 重新 load →
+   * 又播一遍」是一个**无限循环**——实测就是这个症状：点一下「被点击」，
+   * 它会永远循环播下去，而按钮文字还停在「播放」。
+   */
+  let previewToggle = null;
+
+  /** 就地同步播放/暂停按钮的文字（不重建面板）。 */
+  function syncPreviewToggle() {
+    if (previewToggle) previewToggle.textContent = previewPlaying ? '暂停' : '播放';
+  }
+  /**
+   * 待挂载的预览器信息。
+   *
+   * `render()` 只造节点、不插进文档，而帧几何依赖预览框的**真实宽度**
+   * （`clientWidth` 只有挂上才有值）。因此渲染时先把「要播什么」记在这里，
+   * 由 `render()` 末尾的 `mountPreviewPlayer()` 真正挂载。
+   */
+  let pendingPreview = null;
 
   const config = getConfig || (() => ({}));
   const ownSettings = getOwnSettings || (() => ({}));
@@ -115,42 +171,53 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
   }
 
   /**
-   * 把「只显示第 0 帧」的几何写进缩略图。
+   * 把「只显示第 0 帧」的几何写进**每一张**形象卡片的缩略图。
    *
    * 关键点：帧图是**整条 spritesheet**，缩略图方框只有 40px。
    * 要让第 0 帧刚好填满方框，背景图必须按「单帧宽 × 帧数」放大，
    * 并且**左对齐**（`position 0 0`）——居中会把第 1、2 帧露进来。
    *
-   * 单帧的逻辑尺寸用后端给的 `size`（CSS px，已含用户缩放的原始值），
-   * 帧数用 `frames`；两者都来自 `runtime_pack()`，前端不猜。
+   * ⚠️ **必须逐卡片算，且用每张卡片自己的帧数。** 真实踩过的 bug：
+   * 老实现用 `root.querySelector('.pet-card-thumb')` 只取**第一张**卡片，
+   * 再用 `detail`（**当前选中**那个形象）的帧数去设它的几何。
+   * 两个后果叠加：
+   *
+   * 1. 只有列表里第一张卡片被设了几何，其余卡片停在 CSS 默认值
+   *    （`background-size: auto`）——整条 4 帧的 spritesheet 按原尺寸铺开，
+   *    40px 的方框里只看到**最左边一条透明边**，看起来就是「没有形象展示」；
+   * 2. 第一张卡片用的是**选中形象**的帧数，与它自己的图无关。
+   *
+   * 实测症状正是用户报的那个：小卡（列表第一张）有图，小满没有。
+   * 现在帧数从**列表接口**拿（`list_pets()` 已经把每个形象的帧信息带回来了），
+   * 因此每张卡片都能独立算对，也不依赖「当前选中了谁」。
    */
   function applyThumbGeometry() {
-    if (!root || !detail || !detail.actions) return;
-    const tile = (detail.actions || []).find((entry) => entry.action === 'idle');
-    if (!tile) return;
+    if (!root) return;
+    const boxes = root.querySelectorAll('.pet-card-thumb');
+    for (const box of boxes) {
+      const frames = Math.max(1, Number(box.dataset.frames) || 1);
+      const layout = box.dataset.layout === 'vertical' ? 'vertical' : 'horizontal';
+      const boxWidth = box.clientWidth || 40;
+      const boxHeight = box.clientHeight || 40;
 
-    const box = root.querySelector('.pet-card-thumb');
-    if (!box) return;
+      if (!box.dataset.hasImage || frames <= 1) {
+        // 单帧：整张图就是那一帧，`contain` 是对的
+        box.style.backgroundSize = 'contain';
+        box.style.backgroundPosition = 'center';
+        continue;
+      }
 
-    const frames = Math.max(1, Number(tile.frames) || 1);
-    const boxSize = box.clientWidth || 40;
-
-    if (!tile.url || tile.kind !== 'animated') {
-      box.style.backgroundSize = 'contain';
-      box.style.backgroundPosition = 'center';
-      return;
+      // 多帧：单帧按方框尺寸等比放大；整条宽度 = 帧数 × 单帧宽。
+      // `vertical` 排布同理，换成高度方向。
+      if (layout === 'vertical') {
+        box.style.backgroundSize = `auto ${boxHeight * frames}px`;
+        box.style.backgroundPosition = 'center top';
+      } else {
+        box.style.backgroundSize = `${boxWidth * frames}px auto`;
+        box.style.backgroundPosition = 'left top';
+      }
+      // 图片内容变了（URL 带版本），几何不用跟着变——版本变了浏览器自然会换图
     }
-
-    // 单帧按方框宽度等比放大；整条宽度 = 帧数 × 单帧宽。
-    // `vertical` 排布同理，换成高度方向。
-    if (tile.layout === 'vertical') {
-      box.style.backgroundSize = `auto ${boxSize * frames}px`;
-      box.style.backgroundPosition = 'center top';
-    } else {
-      box.style.backgroundSize = `${boxSize * frames}px auto`;
-      box.style.backgroundPosition = 'left top';
-    }
-    // 图片内容变了（URL 带版本），几何不用跟着变——版本变了浏览器自然会换图
   }
 
   /** 统一的后端调用 + 错误呈现（错误信息由后端给出可读文案）。 */
@@ -204,7 +271,37 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     }
     const data = await call(`/pets/${encodeURIComponent(petId)}/preview`);
     detail = data || null;
+    // 换形象时把预览器切回「待机」：停在别的形象的动作上会让人以为没切成功
+    previewAction = 'idle';
+    previewVariant = 0;
+    previewPlaying = true;
     if (!disposed) render();
+  }
+
+  /** 当前预览的动作条目（从 `detail.actions` 里取）。 */
+  function previewEntry() {
+    const list = (detail && detail.actions) || [];
+    return list.find((item) => item.action === previewAction) || null;
+  }
+
+  /** 当前预览的变体（多套动画时按 `previewVariant` 选）。 */
+  function previewSpec() {
+    const entry = previewEntry();
+    if (!entry) return null;
+    const variants = entry.variants || [];
+    if (variants.length) {
+      return variants[Math.min(Math.max(0, previewVariant), variants.length - 1)];
+    }
+    if (!entry.url) return null;
+    // 老版本后端只给主变体字段，这里兜底构一个
+    return {
+      url: entry.url,
+      frames: entry.frames,
+      fps: entry.fps,
+      loop: entry.loop,
+      layout: entry.layout,
+      frameMs: entry.frameMs || [],
+    };
   }
 
   // ---------------------------------------------------------------- 操作
@@ -447,6 +544,13 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
 
   function render() {
     if (!root || disposed) return;
+    // 重渲染会把预览框的 DOM 换掉，旧播放器必须停掉（否则它还在给已摘除的
+    // 节点写 style，并留下一个永远跑着的定时器）
+    if (player) {
+      player.dispose();
+      player = null;
+    }
+    pendingPreview = null;
     root.textContent = '';
 
     const toolbar = el('div', 'pet-panel-toolbar');
@@ -492,6 +596,8 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     // 缩略图几何依赖「帧数」，而帧数在 `detail` 里 —— 必须在 DOM 挂上、
     // 且 `detail` 已就绪之后再算（`clientWidth` 也只有挂上才有值）。
     applyThumbGeometry();
+    // 动画预览器同理：要在 DOM 挂上之后才知道预览框的真实宽度
+    if (!creating) mountPreviewPlayer();
   }
 
   function renderPetCard(pet) {
@@ -512,13 +618,27 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     // 缩略图只显示 **idle 的第一帧**。
     //
     // ⚠️ 不能用 `background-size: contain`：`/frame/<id>/idle` 返回的是
-    // **整条水平 spritesheet**（例如 4 帧的 idle 是 256×64），
-    // 把 256 宽压进 40px 的方框 → 每帧只剩 10px，看起来像一团乱码（实测）。
+    // **整条水平 spritesheet**（例如 4 帧的 idle 是 1536×576），
+    // 把整条压进 40px 的方框 → 每帧只剩 10px，看起来像一团乱码（实测）。
     // 正确做法：按「单帧宽 = 帧数 × 方框宽」放大整条，再用
     // `background-position: 0 0` 只露出第 0 帧。
-    thumb.style.backgroundImage = `url("/api/plugins/stm-pet/frame/${encodeURIComponent(pet.id)}/idle")`;
-    thumb.style.backgroundRepeat = 'no-repeat';
-    // 几何由 `applyThumbGeometry()` 在数据到位后写入（帧数与单帧尺寸来自后端）
+    //
+    // 几何所需的帧数来自**列表接口**（`pet.thumb`），而不是「当前选中形象的
+    // 详情」——后者只在详情请求回来之后才有，且与本卡片无关。
+    // 帧数写在 `data-` 上，由 `applyThumbGeometry()` 统一算（DOM 挂上后
+    // 才知道方框的真实宽度）。
+    const thumbSpec = pet.thumb || {};
+    if (thumbSpec.url) {
+      thumb.style.backgroundImage = `url("${thumbSpec.url}")`;
+      thumb.style.backgroundRepeat = 'no-repeat';
+      thumb.dataset.petId = pet.id;
+      thumb.dataset.frames = String(Math.max(1, Number(thumbSpec.frames) || 1));
+      thumb.dataset.layout = thumbSpec.layout === 'vertical' ? 'vertical' : 'horizontal';
+      thumb.dataset.hasImage = 'true';
+    } else {
+      // 没有可用的图：留一个空框（面板上仍能看到这个形象存在，而不是破图）
+      thumb.dataset.frames = '1';
+    }
     card.appendChild(thumb);
 
     const copy = el('div', 'pet-card-copy');
@@ -598,6 +718,9 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     wrap.appendChild(header);
 
     wrap.appendChild(renderAppearance());
+
+    // ---- 动画预览（可以直接播具体动作，内置形象同样支持）
+    wrap.appendChild(renderPreview());
 
     // ---- 遗留覆盖提示（内置形象专属）
     if (detail.staleOverrides && detail.staleOverrides.length) {
@@ -733,6 +856,219 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     return section;
   }
 
+  /**
+   * 动画预览区：直接在这里播具体动作，不必切过去等它真的触发。
+   *
+   * 用户报障「插件管理里看不到动画效果」，这一区就是答案。
+   * 对**内置形象同样开放**——只读限制的是「改图」，不是「看效果」。
+   *
+   * 播放规则与桌面上的宠物**完全一致**（帧数 / 帧率 / 非均匀帧时长 /
+   * 排布都按后端的运行期定义走），因此「预览里看到的」就是「桌面上会看到的」。
+   */
+  function renderPreview() {
+    const section = el('div', 'pet-section');
+    const title = el('div', 'pet-section-title');
+    title.appendChild(el('span', null, '动画预览'));
+    title.appendChild(el('span', 'pet-badge', '可播放'));
+    section.appendChild(title);
+    section.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '点任意动作即可在这里播放，用来核对动作效果与节奏。'
+      + '播放规则与桌面上的宠物一致（含每帧时长），因此所见即所得。',
+    ));
+
+    const spec = previewSpec();
+    const entry = previewEntry();
+
+    const stage = el('div', 'pet-preview-stage');
+    const box = el('div', 'pet-preview-box');
+    box.dataset.previewBox = 'true';
+    // 单帧 / 无图时也要有内容，因此图由 `player.load()` 写进 style
+    stage.appendChild(box);
+
+    const side = el('div', 'pet-preview-side');
+    side.appendChild(el('div', 'pet-preview-name', ACTION_LABELS[previewAction] || previewAction));
+
+    // ---- 元信息：帧数 / 节奏 / 变体
+    if (spec) {
+      const frames = Math.max(1, Number(spec.frames) || 1);
+      const total = totalDuration(spec);
+      const uniform = !(Array.isArray(spec.frameMs) && spec.frameMs.length === frames);
+      const pace = uniform
+        ? `${formatNumber(spec.fps)} fps`
+        : `${Math.round(total)}ms / 轮（逐帧不同）`;
+      side.appendChild(el(
+        'div',
+        'pet-preview-meta',
+        `${frames} 帧 · ${pace} · ${spec.loop === false ? '播一遍' : '循环'}`,
+      ));
+      if (entry && entry.kind !== 'animated') {
+        side.appendChild(el('div', 'pet-preview-meta', entry.note || '这个动作没有图'));
+      }
+      if (entry && entry.note && entry.kind === 'animated') {
+        side.appendChild(el('div', 'pet-preview-meta', entry.note));
+      }
+    } else {
+      side.appendChild(el('div', 'pet-preview-meta', '这个动作没有可播的图。'));
+    }
+
+    // ---- 变体切换（多套动画）
+    const variants = (entry && entry.variants) || [];
+    if (variants.length > 1) {
+      const row = el('div', 'pet-preview-variants');
+      row.appendChild(el('span', 'pet-field-hint', '这一动作有多套动画，按权重随机播：'));
+      variants.forEach((variant, at) => {
+        const node = el(
+          'button',
+          `pet-choice ${at === previewVariant ? 'is-active' : ''}`.trim(),
+          `第 ${at + 1} 套（权重 ${formatNumber(variant.weight)}）`,
+        );
+        node.type = 'button';
+        node.dataset.marqueeIgnore = 'true';
+        node.dataset.previewVariant = String(at);
+        node.addEventListener('click', () => {
+          previewVariant = at;
+          previewPlaying = true;
+          render();
+        });
+        row.appendChild(node);
+      });
+      side.appendChild(row);
+    }
+
+    // ---- 播放控制
+    const controls = el('div', 'pet-panel-toolbar');
+    controls.appendChild(button('重播', 'is-primary', () => {
+      previewPlaying = true;
+      if (player) player.play();
+      syncPreviewToggle();
+    }));
+    const toggle = button(previewPlaying ? '暂停' : '播放', '', () => {
+      previewPlaying = !previewPlaying;
+      if (player) {
+        if (previewPlaying) player.play();
+        else player.stop();
+      }
+      syncPreviewToggle();
+    });
+    toggle.dataset.previewToggle = 'true';
+    previewToggle = toggle;
+    controls.appendChild(toggle);
+    controls.appendChild(button('第 1 帧', 'is-icon', () => {
+      previewPlaying = false;
+      if (player) player.reset();
+      syncPreviewToggle();
+    }));
+    side.appendChild(controls);
+
+    // ---- 速度倍率（预览用，只影响预览；桌面宠物走宿主表单的「动画速度」）
+    const speedRow = el('div', 'pet-slider-head');
+    speedRow.appendChild(el('span', 'pet-field-label', '预览速度'));
+    speedRow.appendChild(el('span', 'pet-slider-value', `${formatNumber(previewSpeed)}×`));
+    side.appendChild(speedRow);
+    const slider = el('input', 'pet-slider');
+    slider.type = 'range';
+    slider.min = String(SPEED_MIN);
+    slider.max = String(SPEED_MAX);
+    slider.step = '0.05';
+    slider.value = String(previewSpeed);
+    slider.setAttribute('aria-label', '动画预览速度');
+    slider.dataset.previewSpeed = 'true';
+    slider.addEventListener('input', () => {
+      previewSpeed = Number(slider.value) || 1;
+      if (player) player.setSpeed(previewSpeed);
+      const readout = side.querySelector('.pet-slider-value');
+      if (readout) readout.textContent = `${formatNumber(previewSpeed)}×`;
+    });
+    side.appendChild(slider);
+    side.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '数值越大越慢。桌面上的宠物请用「设置 → 插件」里的「动画速度」统一调。',
+    ));
+
+    // ---- 帧读数
+    const readout = el('div', 'pet-preview-frame');
+    readout.dataset.previewFrame = 'true';
+    side.appendChild(readout);
+
+    stage.appendChild(side);
+    section.appendChild(stage);
+
+    // ---- 动作选择：点一下就能播
+    const picker = el('div', 'pet-preview-picker');
+    for (const item of (detail && detail.actions) || []) {
+      const node = el(
+        'button',
+        `pet-choice ${item.action === previewAction ? 'is-active' : ''}`
+          + `${item.kind !== 'animated' ? ' is-muted' : ''}`.trim(),
+        ACTION_LABELS[item.action] || item.action,
+      );
+      node.type = 'button';
+      node.dataset.marqueeIgnore = 'true';
+      node.dataset.previewAction = item.action;
+      node.title = item.kind === 'animated'
+        ? `播放「${ACTION_LABELS[item.action] || item.action}」`
+        : `${ACTION_LABELS[item.action] || item.action}：没有可播的图`;
+      node.addEventListener('click', () => {
+        previewAction = item.action;
+        previewVariant = 0;
+        previewPlaying = true;
+        render();
+      });
+      picker.appendChild(node);
+    }
+    section.appendChild(picker);
+
+    // 播放器在 DOM 挂上之后才能算帧几何（`clientWidth` 只有挂上才有值），
+    // 因此这里只登记意图，真正 `load()` 由 `mountPreviewPlayer()` 在渲染收尾时做。
+    pendingPreview = { box, spec, readout };
+    return section;
+  }
+
+  /**
+   * 渲染收尾时挂载预览器。
+   *
+   * 必须**在 DOM 挂上之后**：帧几何依赖预览框的真实宽度，
+   * 而 `render()` 只负责造节点，还没插进文档。
+   */
+  function mountPreviewPlayer() {
+    if (player) {
+      player.dispose();
+      player = null;
+    }
+    const pending = pendingPreview;
+    pendingPreview = null;
+    if (!pending || !pending.box) return;
+    player = createAnimationPlayer({
+      box: pending.box,
+      speed: previewSpeed,
+      onFrame: (index, frames) => {
+        const node = pending.readout;
+        if (node) node.textContent = frames > 1 ? `第 ${index + 1} / ${frames} 帧` : '单帧';
+      },
+      onEnd: () => {
+        // 一次性动作播完：**只更新按钮文字**，绝不 `render()`。
+        //
+        // `render()` 会重建面板并重新 `load()` 播放器（从头播），于是
+        // 「播完 → onEnd → render → 又播」形成无限循环（实测：点一下「被点击」
+        // 就永远停不下来）。这里改成就地同步状态。
+        previewPlaying = false;
+        syncPreviewToggle();
+      },
+    });
+    // 尊重「暂停」状态：暂停时只画第 0 帧，不自动播
+    if (pending.spec) player.load(pending.spec, { autoplay: previewPlaying });
+  }
+
+  /** 倍率的短格式（去掉多余的 0）。 */
+  function formatNumber(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '0';
+    return String(Math.round(number * 100) / 100);
+  }
+
   /** 内置形象的遗留覆盖提示 + 一键清理。 */
   function renderLegacyOverrides() {
     const box = el('div', 'pet-notice is-warn');
@@ -779,11 +1115,17 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     if (entry.kind !== 'animated') tile.classList.add('is-missing');
 
     const preview = el('div', 'pet-action-preview');
-    if (entry.url && entry.kind === 'animated') {
-      preview.style.backgroundImage = `url("${entry.url}")`;
-      // 单帧只显示那一帧；多帧显示第一帧（够表达了）
-      preview.style.backgroundSize = 'contain';
-      preview.style.backgroundPosition = 'center';
+    const previewUrl = entry.url;
+    const frames = Math.max(1, Number(entry.frames) || 1);
+    if (previewUrl && entry.kind === 'animated') {
+      preview.style.backgroundImage = `url("${previewUrl}")`;
+      preview.style.backgroundRepeat = 'no-repeat';
+      // 与卡片缩略图同一个坑：这里拿到的是**整条** spritesheet。
+      // 用 `contain` 会把整条压进 56px 的小方框，每帧只剩十几像素。
+      // 因此同样是「按帧数放大 + 左对齐」，只露出第 0 帧。
+      preview.dataset.frames = String(frames);
+      preview.dataset.layout = entry.layout === 'vertical' ? 'vertical' : 'horizontal';
+      preview.dataset.hasImage = 'true';
     }
     tile.appendChild(preview);
 
@@ -1043,7 +1385,11 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
       // 缩略图方框宽度可能随容器变化（`clientWidth` 变化后帧几何要重算），
       // 因此挂上后补一次；ResizeObserver 不可用时跳过（只是缩略图略偏，不影响功能）
       if (typeof ResizeObserver === 'function') {
-        resizeObserver = new ResizeObserver(() => applyThumbGeometry());
+        resizeObserver = new ResizeObserver(() => {
+          applyThumbGeometry();
+          // 预览框的尺寸也可能变（右栏宽度变化），帧几何要跟着重算
+          if (player) player.seek(player.frame);
+        });
         resizeObserver.observe(root);
       }
       // 首屏加载（不阻塞挂载，失败会显示为通知条）
@@ -1053,6 +1399,12 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
           resizeObserver.disconnect();
           resizeObserver = null;
         }
+        // 预览器的定时器必须停掉：面板关掉之后它还在跑就是泄漏
+        if (player) {
+          player.dispose();
+          player = null;
+        }
+        pendingPreview = null;
         if (root && root.parentNode) root.parentNode.removeChild(root);
         root = null;
       };
@@ -1083,6 +1435,11 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
 
     dispose() {
       disposed = true;
+      if (player) {
+        player.dispose();
+        player = null;
+      }
+      pendingPreview = null;
       root = null;
     },
   };

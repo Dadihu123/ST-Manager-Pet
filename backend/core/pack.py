@@ -103,6 +103,52 @@ MAX_FRAMES = 256
 DEFAULT_MAX_SHEET_PIXELS = 4096
 MAX_FPS = 60
 
+#: 帧率下限。允许**小数**（0.5fps = 每帧 2 秒）。
+#:
+#: 为什么 fps 不再是整数：宠物形象的帧数通常只有 2~6 帧，
+#: 整数 fps 的可用档位太粗——「4fps 太快、2fps 太慢」这种情况无解。
+#: 实测：内置形象的走路 8fps 看起来像在快进，而它需要的正是 4fps 这种中间档；
+#: 睡眠呼吸更是需要 1.5fps 这种非整数档才自然。
+MIN_FPS = 0.5
+
+#: 单套动画的最小/最大时长（毫秒），用于**非均匀帧时长** `frameMs`。
+#: 下限对应 `MAX_FPS`（比 60fps 更短的帧在 rAF 下根本显示不出来），
+#: 上限 10 秒是为了拦住「一帧停十秒」这种几乎必然是填错的值。
+MIN_FRAME_MS = 1000.0 / MAX_FPS
+MAX_FRAME_MS = 10000.0
+
+#: 一个动作最多能挂几套动画。
+#: 上限存在的意义：`runtime_pack()` 会把每套动画都算出一个 URL 发给前端，
+#: 不设上限时一个动作可以挂出几百个 URL（包本身很小，代价却在前端）。
+MAX_VARIANTS = 16
+
+#: 权重（`weight`）的合法区间。语义是**相对比例**，不是百分比：
+#: 两个都填 5 → 各 50%；填 1 / 3 / 5 → 分别是 1/9、3/9、5/9。
+#: 因此**新增一套动画时不需要改动原有数字**（这正是用户要求的性质）。
+#: 0 合法：表示「这套动画存在但永不随机选中」（保留素材、暂时停用）。
+MIN_WEIGHT = 0.0
+MAX_WEIGHT = 1000.0
+DEFAULT_WEIGHT = 1.0
+
+#: idle 的触发方式。
+#:
+#: - `random`（**默认**）：平时停在第一帧（静止画面），每隔一段**随机时间**
+#:   播一遍，播完回到静止。这是「成熟做法」：常驻循环的待机动画会让人
+#:   觉得宠物在不停抽搐，而静止 + 偶发小动作才像活着。
+#: - `loop`：旧行为，待机动画一直循环。
+IDLE_TRIGGER_RANDOM = 'random'
+IDLE_TRIGGER_LOOP = 'loop'
+IDLE_TRIGGER_MODES = (IDLE_TRIGGER_RANDOM, IDLE_TRIGGER_LOOP)
+
+#: 随机触发的默认间隔区间（毫秒）。6~18 秒：偶尔动一下，不烦人。
+DEFAULT_IDLE_MIN_MS = 6000
+DEFAULT_IDLE_MAX_MS = 18000
+#: 一次触发连续播几轮。
+DEFAULT_IDLE_PLAYS = 1
+#: 间隔与轮数的上限（拦「填错了」的极端值）。
+MAX_IDLE_INTERVAL_MS = 3600 * 1000
+MAX_IDLE_PLAYS = 20
+
 #: 单帧的默认逻辑尺寸。**只是默认值**——`size.w` 与 `size.h` 完全独立，
 #: 形象可以是任意长宽比（真人立绘常见 2:3、3:4），不必是正方形。
 DEFAULT_SIZE = {'w': 64, 'h': 64}
@@ -169,14 +215,45 @@ _MAX_FRAME_SIZE = 1024
 
 
 @dataclass
-class AnimationSpec:
-    """单个动作的原始声明（已经过类型与范围校验）。"""
+class AnimationVariant:
+    """**一套**动画（一个动作可以有多套，按 `weight` 随机选一套播）。
+
+    为什么一个动作要能有多套：这是「丰富动画数量」的最低成本做法——
+    同一件事（例如「被点击」）画两三个不同的反应，随机播其中之一，
+    观感立刻不像复读机。作者只要多画几张图，不必让引擎理解「语义」。
+    """
 
     sheet: str = ''
     frames: int = 1
-    fps: int = 8
+    #: 帧率。**允许小数**（见 `MIN_FPS`）——帧数少时整数档太粗。
+    fps: float = 8
     loop: bool = True
     layout: str = 'horizontal'
+    #: **非均匀帧时长**（毫秒，每帧一个）。空列表表示「按 `fps` 均匀推进」。
+    #:
+    #: 为什么需要它：真实动画的帧时长本来就不均匀——起手慢、中间快、
+    #: 收尾有个停顿。用单一 fps 播出来是「匀速机械感」，
+    #: 而 `frame_ms` 能让 4 帧的动画表达出「快速抬手 → 定住」这种节奏。
+    frame_ms: list = field(default_factory=list)
+    #: 权重（**相对比例**，不是百分比）。见 `DEFAULT_WEIGHT` 的说明。
+    weight: float = DEFAULT_WEIGHT
+
+    @property
+    def total_ms(self) -> float:
+        """播完一轮的毫秒数（非均匀时长下是逐帧之和）。"""
+        if self.frame_ms:
+            return float(sum(self.frame_ms))
+        if self.fps > 0:
+            return self.frames * 1000.0 / self.fps
+        return 0.0
+
+    @property
+    def effective_fps(self) -> float:
+        """折算出的平均帧率（供 UI 显示「相当于多少 fps」）。"""
+        total = self.total_ms
+        if total <= 0:
+            return float(self.fps)
+        return round(self.frames * 1000.0 / total, 2)
 
     def to_dict(self) -> dict:
         return {
@@ -185,6 +262,127 @@ class AnimationSpec:
             'fps': self.fps,
             'loop': self.loop,
             'layout': self.layout,
+            'frameMs': list(self.frame_ms),
+            'weight': self.weight,
+        }
+
+
+@dataclass
+class IdleTrigger:
+    """idle 动作的**触发方式**（只有 idle 用得上，其余动作由状态机驱动）。
+
+    默认 `random`：平时停在第一帧（静止画面），每隔一段**随机时间**播一遍，
+    播完回到静止。这是常驻桌面宠物的成熟做法——一直循环的待机动画会让
+    宠物看起来在不停抽搐，而「静止 + 偶发小动作」才像活着。
+    """
+
+    mode: str = IDLE_TRIGGER_RANDOM
+    min_ms: int = DEFAULT_IDLE_MIN_MS
+    max_ms: int = DEFAULT_IDLE_MAX_MS
+    #: 一次触发连续播几轮。
+    plays: int = DEFAULT_IDLE_PLAYS
+
+    def to_dict(self) -> dict:
+        return {
+            'mode': self.mode,
+            'minIntervalMs': self.min_ms,
+            'maxIntervalMs': self.max_ms,
+            'plays': self.plays,
+        }
+
+
+@dataclass
+class AnimationSpec:
+    """单个动作的原始声明（已经过类型与范围校验）。
+
+    内部是**一组** `AnimationVariant`；`sheet` / `frames` / `fps` / `loop` /
+    `layout` 这几个属性透传第一套（主变体），这样只写单套动画的包
+    在代码里读起来仍和从前一样。
+    """
+
+    variants: list = field(default_factory=list)
+    #: idle 的触发方式；非 idle 动作上是 `None`（不适用）。
+    idle: IdleTrigger = None
+
+    # ---- 主变体的透传属性（向后兼容的读法）----
+
+    @property
+    def primary(self) -> AnimationVariant:
+        if not self.variants:
+            return AnimationVariant()
+        return self.variants[0]
+
+    @property
+    def sheet(self) -> str:
+        return self.primary.sheet
+
+    @property
+    def frames(self) -> int:
+        return self.primary.frames
+
+    @property
+    def fps(self) -> float:
+        return self.primary.fps
+
+    @property
+    def loop(self) -> bool:
+        return self.primary.loop
+
+    @property
+    def layout(self) -> str:
+        return self.primary.layout
+
+    @property
+    def frame_ms(self) -> list:
+        return self.primary.frame_ms
+
+    @property
+    def weight(self) -> float:
+        return self.primary.weight
+
+    def to_dict(self) -> dict:
+        """序列化成**扁平**写法（单套）或 `variants` 写法（多套）。
+
+        单套动画仍写成扁平形式：那是绝大多数包的形态，也是
+        「最省事的写法」所承诺的样子，不该因为引擎支持多套就变啰嗦。
+        """
+        payload = {}
+        if self.idle is not None:
+            trigger = self.idle
+            payload['trigger'] = trigger.mode
+            payload['intervalMs'] = [trigger.min_ms, trigger.max_ms]
+            payload['plays'] = trigger.plays
+        if len(self.variants) == 1:
+            variant = self.variants[0].to_dict()
+            # 单套时不写 weight（它恒为 1，写出来只是噪音）
+            variant.pop('weight', None)
+            payload.update(variant)
+        else:
+            payload['variants'] = [variant.to_dict() for variant in self.variants]
+        return payload
+
+
+@dataclass
+class ResolvedVariant:
+    """解析后的**一套**动画（图 URL 由 store 层填，这里只有帧参数）。"""
+
+    sheet: str = ''
+    frames: int = 1
+    fps: float = 8
+    loop: bool = True
+    layout: str = 'horizontal'
+    frame_ms: list = field(default_factory=list)
+    weight: float = DEFAULT_WEIGHT
+
+    def to_dict(self) -> dict:
+        return {
+            'sheet': self.sheet,
+            'frames': self.frames,
+            'fps': self.fps,
+            'loop': self.loop,
+            'layout': self.layout,
+            'frameMs': list(self.frame_ms),
+            'weight': self.weight,
         }
 
 
@@ -198,9 +396,11 @@ class ResolvedAction:
     kind: str = KIND_NONE
     sheet: str = ''
     frames: int = 0
-    fps: int = 0
+    fps: float = 0
     loop: bool = True
     layout: str = 'horizontal'
+    #: 非均匀帧时长（毫秒）；空表示按 `fps` 均匀推进。
+    frame_ms: list = field(default_factory=list)
     #: 是否要把 `sheet` **水平镜像**后再播（方向化行走只提供一侧时为 True）。
     #: 前端据此决定 `transform: scaleX(-1)`——注意这**不同于**「按朝向翻转」：
     #: 方向化贴图本身已经画好了朝向，翻转只由这个标记决定。
@@ -209,9 +409,14 @@ class ResolvedAction:
     chain: list = field(default_factory=list)
     #: 面向用户的一句话解释。
     note: str = ''
+    #: 这个动作的**全部**可播变体（多套动画时按 `weight` 随机选一套播）。
+    #: 上面那组字段是**主变体**的透传，方便只关心单套动画的调用方。
+    variants: list = field(default_factory=list)
+    #: idle 的触发方式（只有 idle 有；其余动作由状态机驱动）。
+    idle_trigger: IdleTrigger = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             'action': self.action,
             'source': self.source,
             'kind': self.kind,
@@ -220,10 +425,15 @@ class ResolvedAction:
             'fps': self.fps,
             'loop': self.loop,
             'layout': self.layout,
+            'frameMs': list(self.frame_ms),
             'mirror': self.mirror,
             'chain': list(self.chain),
             'note': self.note,
+            'variants': [variant.to_dict() for variant in self.variants],
         }
+        if self.idle_trigger is not None:
+            payload['idleTrigger'] = self.idle_trigger.to_dict()
+        return payload
 
 
 @dataclass
@@ -282,7 +492,10 @@ class PetPack:
             spec = self.animations.get(candidate)
             if spec is None:
                 continue
-            if spec.sheet:
+            # 只认**真的有图**的变体：多套动画里允许某一套的 sheet 为空
+            # （作者临时撤掉一张图），它不该把整个动作拖成「只位移」。
+            playable = [variant for variant in spec.variants if variant.sheet]
+            if playable:
                 # 命中的是对侧方向化动作 → 需要镜像
                 mirrored = bool(opposite) and candidate == opposite
                 if candidate != action:
@@ -293,12 +506,35 @@ class PetPack:
                         note = f'缺少「{action}」动作，已回退到「{candidate}」。'
                 else:
                     note = ''
+                # 只有**自己**的变体能整套复用；镜像复用时要翻转朝向，
+                # 而「每套动画各自的朝向」无法靠一个 mirror 标记表达，
+                # 因此镜像路径只取主变体（多套动画本就是「同一动作的变体」，
+                # 少播几套不影响正确性，播错朝向才是错的）。
+                variants = playable if not mirrored else playable[:1]
+                primary = variants[0]
                 return ResolvedAction(
                     action=action, source=candidate, kind=KIND_ANIMATED,
-                    sheet=spec.sheet, frames=spec.frames, fps=spec.fps,
-                    loop=spec.loop, layout=spec.layout,
+                    sheet=primary.sheet, frames=primary.frames, fps=primary.fps,
+                    loop=primary.loop, layout=primary.layout,
+                    frame_ms=list(primary.frame_ms),
                     mirror=mirrored,
                     chain=chain, note=note,
+                    variants=[
+                        ResolvedVariant(
+                            sheet=variant.sheet, frames=variant.frames,
+                            fps=variant.fps, loop=variant.loop,
+                            layout=variant.layout,
+                            frame_ms=list(variant.frame_ms),
+                            weight=variant.weight,
+                        )
+                        for variant in variants
+                    ],
+                    # idle 的触发方式跟着**请求的动作**走，而不是命中回退链的那个：
+                    # 请求 `look` 却回退到 idle 时，它仍然是「被状态机驱动的一次播报」，
+                    # 不该因为落到了 idle 的图上就变成「随机小动作」。
+                    idle_trigger=(
+                        (spec.idle or IdleTrigger()) if action == 'idle' else None
+                    ),
                 )
             # 存在但没 sheet → 只位移不播帧（「必要动作」的降级语义）
             if candidate == 'idle':
@@ -306,6 +542,9 @@ class PetPack:
                     action=action, source=candidate, kind=KIND_STATIC,
                     chain=chain,
                     note='没有可用的帧图，将只移动位置、不播放动画。',
+                    idle_trigger=(
+                        (spec.idle or IdleTrigger()) if action == 'idle' else None
+                    ),
                 )
 
         # 连 idle 都没有：解析阶段已经报错（`from_dict` 会拒绝），
@@ -415,6 +654,123 @@ def _read_bool(raw: dict, key: str, default: bool) -> bool:
     )
 
 
+def _read_fps(raw: dict, key: str, default: float) -> float:
+    """读帧率。**接受小数**（帧数少时整数档太粗，见 `MIN_FPS`）。"""
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _field_error(
+            key, '应为数字',
+            hint=f'把 {key} 写成一个数字，例如 4 或 2.5（不要加引号）。',
+        )
+    number = float(value)
+    if not (MIN_FPS <= number <= MAX_FPS):
+        raise _field_error(
+            key, f'应在 {MIN_FPS} ~ {MAX_FPS} 之间，实际为 {value}',
+            hint=f'把 {key} 调整到 {MIN_FPS} ~ {MAX_FPS} 范围内。',
+        )
+    return round(number, 3)
+
+
+def _read_frame_ms(raw: dict, key: str, frames: int) -> list:
+    """读**非均匀帧时长**：一个每帧毫秒数的数组，长度必须等于 `frames`。
+
+    为什么必须等长：长度不符时「第 i 帧该停多久」没有定义。
+    容忍「只给一个数」的写法（等价于均匀帧率），那是作者最容易写出的东西。
+    """
+    value = raw.get(key)
+    if value is None or value == []:
+        return []
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        value = [value] * max(1, frames)
+    if not isinstance(value, list):
+        raise _field_error(
+            key, '应为数字数组',
+            hint=f'把 {key} 写成每帧一个毫秒数，例如 [180, 120, 120, 400]。',
+        )
+    if len(value) != max(1, frames):
+        raise _field_error(
+            key, f'长度应等于 frames（{frames}），实际 {len(value)}',
+            hint=f'{key} 要一帧一个数：{frames} 帧就给 {frames} 个数。',
+        )
+    durations = []
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise _field_error(
+                key, f'第 {index} 项不是数字',
+                hint=f'{key} 里每一项都要是毫秒数（例如 200）。',
+            )
+        number = float(item)
+        if not (MIN_FRAME_MS <= number <= MAX_FRAME_MS):
+            raise _field_error(
+                key,
+                f'第 {index} 项应在 {MIN_FRAME_MS:.1f} ~ {MAX_FRAME_MS:.0f} 毫秒之间，'
+                f'实际为 {item}',
+                hint='一帧至少 17 毫秒（60fps），最多 10000 毫秒（10 秒）。',
+            )
+        durations.append(round(number, 2))
+    return durations
+
+
+def _read_weight(raw: dict, key: str, default: float = DEFAULT_WEIGHT) -> float:
+    """读权重（**相对比例**，不是百分比）。"""
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _field_error(
+            key, '应为数字',
+            hint=f'把 {key} 写成一个数字（相对比例，例如 5）。',
+        )
+    number = float(value)
+    if not (MIN_WEIGHT <= number <= MAX_WEIGHT):
+        raise _field_error(
+            key, f'应在 {MIN_WEIGHT} ~ {MAX_WEIGHT} 之间，实际为 {value}',
+            hint=f'把 {key} 调整到 {MIN_WEIGHT} ~ {MAX_WEIGHT} 范围内。',
+        )
+    return round(number, 4)
+
+
+def _parse_idle_trigger(raw_value: dict, action: str) -> IdleTrigger:
+    """解析 idle 的触发方式（只有 idle 会读它；其它动作忽略这些字段）。"""
+    trigger = IdleTrigger()
+    raw_mode = raw_value.get('trigger', raw_value.get('idleTrigger', IDLE_TRIGGER_RANDOM))
+    if raw_mode is None:
+        raw_mode = IDLE_TRIGGER_RANDOM
+    if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in IDLE_TRIGGER_MODES:
+        allowed = ' / '.join(IDLE_TRIGGER_MODES)
+        raise _field_error(
+            f'animations.{action}.trigger', f'应为 {allowed}',
+            hint=f'trigger 写 "{IDLE_TRIGGER_RANDOM}"（平时静止、偶尔动一下）'
+                 f'或 "{IDLE_TRIGGER_LOOP}"（一直循环）。',
+        )
+    trigger.mode = raw_mode.strip().lower()
+
+    raw_interval = raw_value.get('intervalMs')
+    if raw_interval is not None:
+        if (not isinstance(raw_interval, list) or len(raw_interval) != 2):
+            raise _field_error(
+                f'animations.{action}.intervalMs', '应为 [最小毫秒, 最大毫秒]',
+                hint='例如 [6000, 18000]：每隔 6~18 秒随机播一次。',
+            )
+        low = _read_positive_int(
+            {'v': raw_interval[0]}, 'v', DEFAULT_IDLE_MIN_MS, low=1,
+            high=MAX_IDLE_INTERVAL_MS,
+        )
+        high = _read_positive_int(
+            {'v': raw_interval[1]}, 'v', DEFAULT_IDLE_MAX_MS, low=1,
+            high=MAX_IDLE_INTERVAL_MS,
+        )
+        if high < low:
+            # 写反了不算错误——用户意图明确，直接调正比报错友好
+            low, high = high, low
+        trigger.min_ms, trigger.max_ms = low, high
+
+    raw_plays = raw_value.get('plays')
+    if raw_plays is not None:
+        trigger.plays = _read_positive_int(
+            {'v': raw_plays}, 'v', DEFAULT_IDLE_PLAYS, low=1, high=MAX_IDLE_PLAYS,
+        )
+    return trigger
+
+
 def _validate_sheet_path(sheet: str, *, where: str, allow_source_jpeg: bool = False) -> str:
     """校验 sheet 相对路径：不得绝对、不得 `..`、扩展名在白名单内。"""
     text = to_posix(sheet).strip()
@@ -456,12 +812,64 @@ def _validate_sheet_path(sheet: str, *, where: str, allow_source_jpeg: bool = Fa
     return text
 
 
+def _parse_variant(
+    action: str,
+    raw_value: dict,
+    *,
+    where: str,
+    allow_source_jpeg: bool = False,
+    with_weight: bool = False,
+) -> AnimationVariant:
+    """解析**一套**动画的字段（`sheet` / `frames` / `fps` / `loop` / `layout`
+    / `frameMs` / `weight`）。
+
+    `where` 是报错信息里的字段前缀（`animations.idle` 或
+    `animations.idle.variants[1]`），这样用户能直接知道是**哪一套**写错了。
+    """
+    variant = AnimationVariant()
+
+    raw_sheet = raw_value.get('sheet', '')
+    if raw_sheet is None:
+        raw_sheet = ''
+    if not isinstance(raw_sheet, str):
+        raise _field_error(f'{where}.sheet', '应为字符串', hint='sheet 写文件名文本。')
+    # sheet 可以为空：表示「这套动画存在但只位移不播帧」（回退链的降级语义）
+    variant.sheet = (
+        _validate_sheet_path(raw_sheet, where=action, allow_source_jpeg=allow_source_jpeg)
+        if raw_sheet.strip() else ''
+    )
+
+    variant.frames = _read_positive_int(raw_value, 'frames', 1, low=1, high=MAX_FRAMES)
+    variant.fps = _read_fps(raw_value, 'fps', 8)
+    variant.loop = _read_bool(raw_value, 'loop', action not in ONE_SHOT_ACTIONS)
+    variant.frame_ms = _read_frame_ms(raw_value, 'frameMs', variant.frames)
+
+    layout = raw_value.get('layout', 'horizontal')
+    if not isinstance(layout, str) or layout.strip().lower() not in ('horizontal', 'vertical'):
+        raise _field_error(
+            f'{where}.layout', '应为 "horizontal" 或 "vertical"',
+            hint='水平排布用 "horizontal"（默认），垂直排布用 "vertical"。',
+        )
+    variant.layout = layout.strip().lower()
+
+    if with_weight:
+        variant.weight = _read_weight(raw_value, 'weight')
+    return variant
+
+
 def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False) -> AnimationSpec:
     """解析单个动作声明。
 
-    接受两种写法（都能让「单帧图」用起来最省事）：
-    - 字符串：`"idle": "idle.png"` —— 单帧、默认 fps；
-    - 对象：`"idle": {"sheet": "idle.png", "frames": 4, "fps": 6}`。
+    接受三种写法（前两种是「单帧图最省事」与「多套动画」的落点）：
+
+    - 字符串：`"idle": "idle.png"` —— 单帧、默认帧率；
+    - 对象：`"idle": {"sheet": "idle.png", "frames": 4, "fps": 6}`；
+    - 多套动画：`"click": {"variants": [{"sheet": "a.png"}, {"sheet": "b.png"}]}`
+      —— 每次触发按 `weight` **随机选一套**。
+
+    多套动画里**不允许**在对象顶层再写 `sheet` 等字段：那会引出
+    「顶层的是不是也算一套」这种含糊语义（实测最容易出现的误用），
+    因此直接给出可读错误，而不是猜。
     """
     if isinstance(raw_value, str):
         raw_value = {'sheet': raw_value}
@@ -475,29 +883,57 @@ def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False)
     where = f'animations.{action}'
     spec = AnimationSpec()
 
-    raw_sheet = raw_value.get('sheet', '')
-    if raw_sheet is None:
-        raw_sheet = ''
-    if not isinstance(raw_sheet, str):
-        raise _field_error(f'{where}.sheet', '应为字符串', hint='sheet 写文件名文本。')
-    # sheet 可以为空：表示「该动作存在但只位移不播帧」（回退链的降级语义）
-    spec.sheet = (
-        _validate_sheet_path(raw_sheet, where=action, allow_source_jpeg=allow_source_jpeg)
-        if raw_sheet.strip() else ''
-    )
-
-    default_frames = 1 if not spec.sheet else 1
-    spec.frames = _read_positive_int(raw_value, 'frames', default_frames, low=1, high=MAX_FRAMES)
-    spec.fps = _read_positive_int(raw_value, 'fps', 8, low=1, high=MAX_FPS)
-    spec.loop = _read_bool(raw_value, 'loop', action not in ONE_SHOT_ACTIONS)
-
-    layout = raw_value.get('layout', 'horizontal')
-    if not isinstance(layout, str) or layout.strip().lower() not in ('horizontal', 'vertical'):
-        raise _field_error(
-            f'{where}.layout', '应为 "horizontal" 或 "vertical"',
-            hint='水平排布用 "horizontal"（默认），垂直排布用 "vertical"。',
+    raw_variants = raw_value.get('variants')
+    if raw_variants is None:
+        # ---- 单套写法（绝大多数包）----
+        spec.variants = [
+            _parse_variant(
+                action, raw_value, where=where,
+                allow_source_jpeg=allow_source_jpeg,
+            ),
+        ]
+    else:
+        if not isinstance(raw_variants, list) or not raw_variants:
+            raise _field_error(
+                f'{where}.variants', '应为非空数组',
+                hint='variants 里每一套动画写一个对象，例如 '
+                     '[{"sheet": "a.png", "weight": 5}, {"sheet": "b.png", "weight": 3}]。',
+            )
+        if len(raw_variants) > MAX_VARIANTS:
+            raise _field_error(
+                f'{where}.variants', f'最多 {MAX_VARIANTS} 套，实际 {len(raw_variants)}',
+                hint=f'一个动作最多挂 {MAX_VARIANTS} 套动画。',
+            )
+        # 顶层不该再混写单套字段（见 docstring）
+        stray = sorted(
+            key for key in ('sheet', 'frames', 'fps', 'loop', 'layout', 'frameMs')
+            if key in raw_value
         )
-    spec.layout = layout.strip().lower()
+        if stray:
+            raise _field_error(
+                f'{where}.variants',
+                f'与顶层字段 {"、".join(stray)} 混用',
+                hint='写了 variants 之后，sheet / frames / fps 等要写进每一套里，'
+                     '不要在顶层再写一份。',
+            )
+        parsed = []
+        for index, item in enumerate(raw_variants):
+            if isinstance(item, str):
+                item = {'sheet': item}
+            if not isinstance(item, dict):
+                raise _field_error(
+                    f'{where}.variants[{index}]', '应为对象或字符串',
+                    hint='每一套动画写成 {"sheet": "a.png", "weight": 5}。',
+                )
+            parsed.append(_parse_variant(
+                action, item, where=f'{where}.variants[{index}]',
+                allow_source_jpeg=allow_source_jpeg, with_weight=True,
+            ))
+        spec.variants = parsed
+
+    # idle 的触发方式（只有 idle 读它）
+    if action == 'idle':
+        spec.idle = _parse_idle_trigger(raw_value, action)
     return spec
 
 

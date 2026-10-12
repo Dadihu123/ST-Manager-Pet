@@ -17,18 +17,59 @@
 export const MAX_FPS = 60;
 
 /**
+ * 单帧时长的下限（毫秒）。与 `backend/core/pack.py:MIN_FRAME_MS` 同源。
+ *
+ * 比 60fps 更短的帧在 rAF（通常 60Hz）下根本显示不出来，只会白白推进索引——
+ * 表现是「帧跳过去了」，比慢一点更糟。
+ */
+export const MIN_FRAME_MS = 1000 / MAX_FPS;
+
+/**
+ * 规范化**非均匀帧时长**数组。
+ *
+ * 返回 `null` 表示「不是合法的非均匀时长，请按 fps 均匀推进」——
+ * 调用方据此回退，而不是抛错：一个写坏的 `frameMs` 不该让宠物整个不动。
+ *
+ * @param {*} raw 候选数组（后端给的是毫秒数数组）
+ * @param {number} frames 期望的帧数
+ */
+export function normalizeFrameMs(raw, frames) {
+  const count = Math.max(1, Math.floor(Number(frames) || 1));
+  if (!Array.isArray(raw) || raw.length !== count) return null;
+  const durations = [];
+  for (const item of raw) {
+    const value = Number(item);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    durations.push(Math.max(MIN_FRAME_MS, value) / 1000);
+  }
+  return durations;
+}
+
+/**
  * 帧推进状态机。
  *
- * `spec` 形如 `{ frames, fps, loop }`；`frames <= 1` 表示单帧（不推进）。
+ * `spec` 形如 `{ frames, fps, loop, frameMs }`；`frames <= 1` 表示单帧（不推进）。
+ *
+ * `frameMs` 是**非均匀帧时长**（毫秒，每帧一个）。给出合法数组时按它逐帧推进，
+ * 否则按 `fps` 均匀推进。非均匀时长的价值在于节奏：真实动作的帧时长本来就不
+ * 一样（起手慢、中间快、收尾有停顿），单一 fps 播出来是匀速的机械感。
  */
 export function createFrameClock(spec = {}) {
   let frames = Math.max(1, Math.floor(Number(spec.frames) || 1));
   let fps = Math.min(MAX_FPS, Math.max(1, Number(spec.fps) || 8));
   let loop = spec.loop !== false;
+  /** 非均匀帧时长（秒/帧）；`null` 表示按 fps 均匀。 */
+  let frameMs = normalizeFrameMs(spec.frameMs, frames);
 
   let accumulator = 0;
   let index = 0;
   let finished = frames <= 1;
+
+  /** 第 `at` 帧要停留多久（秒）。 */
+  function durationAt(at) {
+    if (frameMs) return frameMs[Math.min(Math.max(at, 0), frameMs.length - 1)];
+    return 1 / fps;
+  }
 
   return {
     get frames() { return frames; },
@@ -36,8 +77,18 @@ export function createFrameClock(spec = {}) {
     get loop() { return loop; },
     get index() { return index; },
     get finished() { return finished; },
-    /** 单帧时长（秒）。 */
-    get frameDuration() { return 1 / fps; },
+    /** 是否在使用非均匀帧时长。 */
+    get uniform() { return frameMs === null; },
+    get frameMs() { return frameMs ? frameMs.map((value) => value * 1000) : []; },
+    /** 当前帧的时长（秒）。 */
+    get frameDuration() { return durationAt(index); },
+    /** 播完一整轮的秒数。 */
+    get totalDuration() {
+      if (frames <= 1) return 0;
+      let total = 0;
+      for (let at = 0; at < frames; at += 1) total += durationAt(at);
+      return total;
+    },
 
     /**
      * 换一个动作。
@@ -49,11 +100,13 @@ export function createFrameClock(spec = {}) {
       const nextFrames = Math.max(1, Math.floor(Number(next.frames) || 1));
       const nextFps = Math.min(MAX_FPS, Math.max(1, Number(next.fps) || 8));
       const nextLoop = next.loop !== false;
+      const nextFrameMs = normalizeFrameMs(next.frameMs, nextFrames);
 
       const changedAction = nextFrames !== frames || nextLoop !== loop;
       frames = nextFrames;
       fps = nextFps;
       loop = nextLoop;
+      frameMs = nextFrameMs;
 
       if (restart || changedAction) {
         accumulator = 0;
@@ -81,12 +134,17 @@ export function createFrameClock(spec = {}) {
       // 单次调用的 dt 上限：切后台回来时 dt 可能是几十秒，
       // 不能让它一次推进几百帧（那会瞬间跑完所有循环并看起来像"跳变"）。
       const clamped = Math.min(dt, 1);
-      const duration = 1 / fps;
       accumulator += clamped;
 
       let steps = 0;
-      while (accumulator >= duration) {
-        accumulator -= duration;
+      // 每帧的时长可以不同，因此阈值在循环内逐帧取。
+      //
+      // 循环的终止条件只有 `steps >= frames` 一条，它兜住极端 dt 下的空转。
+      // 注意**不能**把「本步消耗的时间」也当成上界：非均匀时长里最长的一帧
+      // （例如收尾的 0.6 秒停顿）会比单次 `dt` 上限（1 秒）以外的任何值都大，
+      // 用时间做上界会让「不循环的动作停在末帧」这条路径永远走不到。
+      while (accumulator >= durationAt(index)) {
+        accumulator -= durationAt(index);
         steps += 1;
         if (index + 1 >= frames) {
           if (loop) {

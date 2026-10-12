@@ -1,11 +1,11 @@
 {
   "id": "stm-pet",
   "name": "桌面宠物",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api_version": 2,
   "manifest_version": 2,
   "author": "ST-Manager",
-  "description": "常驻桌面的宠物：跟随宿主状态活动、可拖动、会下坠与行走、长时间没互动会睡着；支持自己新建形象、导入形象包、按形象调整大小与渲染方式，并在卡片更新与扫描完成时播报。",
+  "description": "常驻桌面的宠物：跟随宿主状态活动、可拖动、会下坠与行走、长时间没互动会睡着；支持自己新建形象、导入形象包、按形象调整大小与渲染方式，并在设置页直接预览每个动作的动画效果。",
   "license": "MIT",
   "min_app_version": "1.0.0",
   "backend": {
@@ -95,6 +95,14 @@
         "default": 120,
         "minimum": 10,
         "maximum": 3600
+      },
+      "anim_speed": {
+        "type": "number",
+        "title": "动画速度（越大越慢）",
+        "description": "统一放慢或加快所有动作的播放。1 为形象自带的速度；2 表示播放时间翻倍（更慢）。每个形象的动画节奏仍由形象包决定，这里只做整体缩放。",
+        "default": 1,
+        "minimum": 0.25,
+        "maximum": 4
       }
     }
   }

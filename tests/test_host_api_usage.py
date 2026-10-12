@@ -196,7 +196,8 @@ def test_all_frontend_modules_are_valid_esm():
         pytest.skip('Node.js 不可用')
 
     names = ['plugin.js', 'petview.js', 'panel.js', 'clock.js', 'physics.js',
-             'statemachine.js', 'announce.js']
+             'statemachine.js', 'announce.js', 'direction.js', 'animation.js',
+             'gesture.js', 'preview.js']
     script = (
         "const { pathToFileURL } = await import('node:url');\n"
         "const { join } = await import('node:path');\n"

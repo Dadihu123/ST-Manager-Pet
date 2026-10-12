@@ -137,16 +137,51 @@ async function main() {
     );
 
     // ------------------------------------------------ ④ 帧动画推进
+    //
+    // ⚠️ 2026-10 起 `idle` 默认是「平时静止 + 随机触发」（见 README §3.7），
+    // 因此**不能**再靠采样 idle 来断言「帧动画在推进」——那会永远是同一个帧位。
+    // 正确做法：主动触发一次 idle 小动作（`pokeIdle`），在它播的那一轮里采样。
+    const poke = await page.evaluate(`(() => {
+      const view = window.__petView;
+      return view ? view.pokeIdle() : false;
+    })()`);
     const frames = [];
-    for (let index = 0; index < 6; index += 1) {
+    for (let index = 0; index < 8; index += 1) {
       frames.push(await page.evaluate('window.__pet.framePos()'));
-      await sleep(200);
+      await sleep(120);
     }
     const distinct = new Set(frames);
     record(
-      '④ 帧动画在推进（background-position 变化）',
-      distinct.size >= 2,
-      `采样 ${frames.length} 次，观察到 ${distinct.size} 个不同帧位: ${[...distinct].slice(0, 4).join(' | ')}`,
+      '④ 帧动画在推进（触发一次 idle 小动作后 background-position 变化）',
+      poke === true && distinct.size >= 2,
+      `pokeIdle=${poke}；采样 ${frames.length} 次，观察到 ${distinct.size} 个不同帧位: ${[...distinct].slice(0, 4).join(' | ')}`,
+    );
+
+    // ④b idle 平时**静止**（这是本轮的核心行为变更）
+    //
+    // 触发间隔最小 6 秒，因此连续采样 3 秒应当看不到帧位变化。
+    //
+    // ⚠️ 必须先等 ④ 触发的那一轮播完：idle 小动作一轮约 1.6 秒，
+    // 而 ④ 的采样只有约 1 秒，直接接着采样会拍到还在播的那一轮（假失败）。
+    await page.evaluate(`(async () => {
+      const view = window.__petView;
+      const deadline = performance.now() + 5000;
+      while (view && view.idleBursting && performance.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      return true;
+    })()`);
+    // 再等一小会儿，确保回到「静止」而不是刚播完的收尾帧
+    await sleep(400);
+    const idleStill = [];
+    for (let index = 0; index < 10; index += 1) {
+      idleStill.push(await page.evaluate('window.__pet.framePos()'));
+      await sleep(300);
+    }
+    record(
+      '④b idle 平时静止（3 秒内帧位不变，不再是时刻触发）',
+      new Set(idleStill).size === 1,
+      `观察到 ${new Set(idleStill).size} 个不同帧位`,
     );
 
     // ------------------------------------------------ ⑤ 用的是 spritesheet 而非换 src
@@ -199,10 +234,16 @@ async function main() {
     // ------------------------------------------------ ⑧ 关闭 reducedMotion 恢复
     await page.send('Emulation.setEmulatedMedia', { features: [] });
     await sleep(1200);
+    // 同样要主动触发（idle 平时静止，见 ④ 的说明）
+    await page.evaluate(`(() => {
+      const view = window.__petView;
+      if (view) view.pokeIdle();
+      return true;
+    })()`);
     const resumedFrames = [];
-    for (let index = 0; index < 6; index += 1) {
+    for (let index = 0; index < 8; index += 1) {
       resumedFrames.push(await page.evaluate('window.__pet.framePos()'));
-      await sleep(200);
+      await sleep(120);
     }
     record(
       '⑧ 关闭 reducedMotion 后动画恢复',
@@ -261,7 +302,11 @@ async function main() {
       type: 'mousePressed', x: startX, y: startY, button: 'left', buttons: 1, clickCount: 1,
     });
     await sleep(50);
-    const dragAction = await page.evaluate(`window.__pet.root().dataset.petAction`);
+    // ⚠️ 2026-10 起「按下」不再立刻进拖拽态（见 README §3.8）：
+    // 0.5 秒内松手且位移小 = 点击。因此这里按下 50ms 时读到的应当是 `idle`
+    // （手势处于 `pending`），而不是 `drag`。
+    const pendingAction = await page.evaluate(`window.__pet.root().dataset.petAction`);
+    const pendingPhase = await page.evaluate(`window.__petView ? window.__petView.gesturePhase : ''`);
     for (let step = 1; step <= 6; step += 1) {
       await page.send('Input.dispatchMouseEvent', {
         type: 'mouseMoved',
@@ -272,11 +317,14 @@ async function main() {
       });
       await sleep(25);
     }
+    // 位移远超阈值 → 应当**立刻**升级成拖拽（不必等满 0.5 秒）
+    const dragAction = await page.evaluate(`window.__pet.root().dataset.petAction`);
     const afterDrag = await page.evaluate('window.__pet.pos()');
     record(
       '⑩ 拖拽跟手（真实指针事件驱动宠物移动）',
       dragAction === 'drag' && (afterDrag.x - beforeDrag.x) > 100,
-      `action=${dragAction}，dx=${(afterDrag.x - beforeDrag.x).toFixed(1)}，dy=${(afterDrag.y - beforeDrag.y).toFixed(1)}`,
+      `按下 50ms 时 action=${pendingAction} / phase=${pendingPhase}（应为 pending）；`
+      + `移动后 action=${dragAction}，dx=${(afterDrag.x - beforeDrag.x).toFixed(1)}，dy=${(afterDrag.y - beforeDrag.y).toFixed(1)}`,
     );
 
     // ------------------------------------------------ ⑪ 松手后下坠

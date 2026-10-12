@@ -226,9 +226,11 @@ def register_routes(api, store: PetStore) -> None:
     @api.route('/frame/<pet_id>/<action>', ['GET'])
     @_handle
     def get_frame(pet_id, action):
-        """返回某动作实际生效的那张图（覆盖 > 包内 > 内置）。
+        """返回某动作**某一套动画**实际生效的那张图（覆盖 > 包内 > 内置）。
 
         走插件自己的路由而不是宿主资产通路，原因见模块 docstring。
+
+        `?vi=<n>` 选第几套动画（多套动画按权重随机选一套时用，默认第 0 套）。
         """
         if not PET_ID_PATTERN.match(str(pet_id or '')):
             raise PetError(
@@ -245,11 +247,18 @@ def register_routes(api, store: PetStore) -> None:
                 http_status=404,
             )
 
-        path, source = store.resolve_frame_path(pet_id, action)
+        try:
+            variant = max(0, int(request.args.get('vi') or 0))
+        except (TypeError, ValueError):
+            # 非法参数按第 0 套处理，而不是 400：这是**图片**路由，
+            # 前端拼 URL 时多一个脏参数不该让整张图取不到。
+            variant = 0
+
+        path, source = store.resolve_frame_path(pet_id, action, variant=variant)
         if not path or not os.path.isfile(path):
             raise PetError(
                 'pack_animation_missing',
-                f'动作 {action} 没有可用的图',
+                f'动作 {action} 没有可用的图（第 {variant} 套）',
                 user_msg='这个动作还没有图。',
                 http_status=404,
             )
@@ -537,10 +546,28 @@ def register_routes(api, store: PetStore) -> None:
     @api.route('/pets/<pet_id>/preview', ['GET'])
     @_handle
     def preview_pet(pet_id):
-        """形象的**预览数据**：每个动作的来源与是否可播，供设置页解释回退。"""
+        """形象的**预览数据**：每个动作的来源与是否可播，供设置页解释回退。
+
+        同时也是**动画预览器**（设置页的「播放」按钮）的数据源：
+        每套动画的图 URL、帧数、帧率、非均匀帧时长与权重都在这里，
+        前端因此不必自己拼 URL，也不必猜帧几何。
+        """
         pack = runtime(pet_id)
         summary = []
         for action, entry in pack['actions'].items():
+            variants = []
+            for index, variant in enumerate(entry.get('variants') or []):
+                variants.append({
+                    'index': index,
+                    'url': variant.get('url', ''),
+                    'frames': variant.get('frames'),
+                    'fps': variant.get('fps'),
+                    'loop': variant.get('loop'),
+                    'layout': variant.get('layout'),
+                    'frameMs': variant.get('frameMs') or [],
+                    'weight': variant.get('weight'),
+                    'frameSource': variant.get('frameSource'),
+                })
             summary.append({
                 'action': action,
                 'kind': entry.get('kind'),
@@ -548,9 +575,14 @@ def register_routes(api, store: PetStore) -> None:
                 'frameSource': entry.get('frameSource'),
                 'frames': entry.get('frames'),
                 'fps': entry.get('fps'),
+                'loop': entry.get('loop'),
+                'layout': entry.get('layout'),
+                'frameMs': entry.get('frameMs') or [],
                 'url': entry.get('url'),
                 'note': entry.get('note'),
                 'overridden': action in pack['overrides'],
+                'variants': variants,
+                'idleTrigger': entry.get('idleTrigger'),
             })
         return jsonify({
             'success': True,

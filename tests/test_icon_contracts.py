@@ -256,22 +256,34 @@ def test_icon_url_is_reachable_from_manifest_path():
 def test_card_thumbnail_shows_only_first_frame():
     """★ 形象卡片的缩略图必须只显示第 0 帧。
 
-    真实踩过：`/frame/<id>/idle` 返回的是**整条** spritesheet
-    （例如 4 帧的 idle 是 256×64），而缩略图方框只有 40×40。
-    用 `background-size: contain` 会把整条压进去 → 每帧只剩 10px，
-    看起来像一团乱码（截图上非常明显，但不是报错，所以不会自己冒出来）。
+    真实踩过两次，第二次是**列表里只有一个形象有图**：
 
-    正确做法：`background-size: (方框宽 × 帧数) auto` + 左对齐。
+    - 第一次：`/frame/<id>/idle` 返回的是**整条** spritesheet，
+      而缩略图方框只有 40×40。用 `background-size: contain` 会把整条压进去
+      → 每帧只剩几像素，看起来像一团乱码。
+    - 第二次（用户报障「小满在列表里没有形象展示」）：几何只算在
+      `root.querySelector('.pet-card-thumb')` 这**第一张**卡片上，
+      并且用的是 `detail`（**当前选中**形象）的帧数。
+      于是除第一张外的卡片都停在 CSS 默认值，整条图铺开在 40px 框里
+      只剩最左边的透明边——看起来就是「没有图」。
+
+    正确做法（两条都要满足）：
+    1. `background-size: (方框宽 × 帧数) auto` + 左对齐；
+    2. **逐卡片**用**它自己**的帧数（来自列表接口的 `pet.thumb`）。
     """
     with open(os.path.join(REPO_ROOT, 'frontend', 'panel.js'), encoding='utf-8') as handle:
         source = handle.read()
 
     assert 'applyThumbGeometry' in source, '缺少缩略图几何计算函数'
     # 必须按帧数放大
-    assert 'boxSize * frames' in source, '缩略图宽度没有乘以帧数'
+    assert 'boxWidth * frames' in source, '缩略图宽度没有乘以帧数'
     # 必须左对齐（居中会露出第 1、2 帧）
     assert "'left top'" in source, '缩略图应左对齐，否则会露出后续帧'
-    # 不能再对 spritesheet 用 contain
+    # ★ 必须逐卡片算：不能只取第一张
+    assert "querySelectorAll('.pet-card-thumb')" in source, (
+        '缩略图几何必须遍历**所有**卡片 —— 只算第一张会让其余形象没有缩略图'
+    )
+    # 不能再对 spritesheet 用 contain 作为多帧的默认路径
     thumb_section = source[source.index('const thumb = el('):]
     thumb_section = thumb_section[:thumb_section.index('applyThumbGeometry')]
     assert "backgroundSize = 'contain'" not in thumb_section, (
@@ -279,14 +291,23 @@ def test_card_thumbnail_shows_only_first_frame():
     )
 
 
-def test_thumbnail_geometry_uses_backend_frame_count():
-    """帧数必须来自后端（`detail.actions`），前端不猜。"""
+def test_thumbnail_geometry_uses_per_card_frame_count():
+    """帧数必须来自**每张卡片自己**的后端数据，而不是「当前选中形象」的详情。
+
+    这是上面那个 bug 的另一半：用 `detail`（选中形象）的帧数去设第一张卡片，
+    几何与图不匹配；而其余卡片根本没被设过。
+    """
     with open(os.path.join(REPO_ROOT, 'frontend', 'panel.js'), encoding='utf-8') as handle:
         source = handle.read()
     section = source[source.index('function applyThumbGeometry'):]
     section = section[:section.index('\n  }\n')]
-    assert 'detail.actions' in section, '缩略图几何应从 detail 里取帧信息'
-    assert 'Number(tile.frames)' in section, '帧数应取自后端给的 frames'
+    # 帧数从**卡片自己的 dataset** 取
+    assert 'box.dataset.frames' in section, '帧数应取自该卡片自己的 data-frames'
+    # 且**不能**再依赖 detail（那正是 bug 的来源）
+    assert 'detail' not in section, (
+        '缩略图几何不该依赖 detail —— 它只在详情请求回来后有值，'
+        '且与「列表里其它形象」无关'
+    )
 
 
 def test_thumbnail_geometry_handles_vertical_layout():
@@ -296,3 +317,29 @@ def test_thumbnail_geometry_handles_vertical_layout():
     section = source[source.index('function applyThumbGeometry'):]
     section = section[:section.index('\n  }\n')]
     assert "'vertical'" in section, '未处理 vertical 排布'
+
+
+def test_list_endpoint_provides_thumbnail_geometry():
+    """★ 列表接口必须为**每个**形象带上缩略图几何。
+
+    面板渲染列表时详情还没请求回来，因此帧数与排布只能由列表接口提供。
+    早先没有这个字段，面板只好借「当前选中形象」的帧数去算 ——
+    那正是「小满没有缩略图」的根因。
+    """
+    import sys
+
+    sys.path.insert(0, REPO_ROOT)
+    from backend.core.store import PetStore
+
+    builtin = os.path.join(REPO_ROOT, 'resources', 'pets')
+    if not os.path.isdir(builtin):
+        return
+    store = PetStore(os.path.join(REPO_ROOT, 'data'), builtin)
+    items = store.list_pets()
+    assert items, '内置形象应当可用'
+    for item in items:
+        thumb = item.get('thumb')
+        assert isinstance(thumb, dict), f'{item["id"]} 缺少 thumb 字段'
+        assert thumb.get('url'), f'{item["id"]} 的 thumb 没有 URL'
+        assert int(thumb.get('frames') or 0) >= 1, f'{item["id"]} 的 thumb 缺少帧数'
+        assert thumb.get('layout') in ('horizontal', 'vertical')

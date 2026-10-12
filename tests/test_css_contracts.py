@@ -571,7 +571,10 @@ def test_frontend_modules_do_not_read_alpine_store(name):
     assert 'window.Alpine' not in body, f'{name} 直接读了 window.Alpine'
 
 
-@pytest.mark.parametrize('name', ['petview.js', 'panel.js'])
+@pytest.mark.parametrize('name', [
+    'petview.js', 'panel.js', 'clock.js', 'physics.js', 'statemachine.js',
+    'direction.js', 'animation.js', 'gesture.js', 'preview.js',
+])
 def test_modules_have_no_bare_window_event_listeners_for_core_events(name):
     """核心事件必须走 `api.on()`，不用 window 事件（§2.2）。"""
     source = read(os.path.join(REPO_ROOT, 'frontend', name))
@@ -580,12 +583,33 @@ def test_modules_have_no_bare_window_event_listeners_for_core_events(name):
 
 
 def test_petview_is_the_only_module_touching_dom():
-    """纯逻辑层必须保持"不碰 DOM"，否则那部分逻辑就没法在 Node 里测。"""
-    for name in ('clock.js', 'physics.js', 'statemachine.js', 'announce.js'):
+    """纯逻辑层必须保持"不碰 DOM"，否则那部分逻辑就没法在 Node 里测。
+
+    `preview.js` 是**有意**的例外：它是设置面板里的播放器，本质就是画帧，
+    因此允许碰 DOM（它的纯计算部分 `frameDurations` / `totalDuration` /
+    `applyFrameGeometry` 都已导出，可以单独测）。`panel.js` 同理。
+    """
+    for name in ('clock.js', 'physics.js', 'statemachine.js', 'announce.js',
+                 'animation.js', 'gesture.js', 'direction.js'):
         source = strip_comments(read(os.path.join(REPO_ROOT, 'frontend', name)))
         for api_name in ('document.', 'window.', 'requestAnimationFrame'):
             assert api_name not in source, (
                 f'{name} 里出现了 {api_name}——纯逻辑层不应触碰 DOM/宿主 API'
+            )
+
+
+def test_animation_and_gesture_modules_have_no_timers():
+    """★ 纯逻辑层也不该自己起定时器。
+
+    `animation.js` 刻意只负责「抽一个随机间隔」，计时由调用方做——
+    因为 `random` 模式下 rAF 是**停着的**，倒计时若放在这里推进就永远不会前进，
+    idle 动画再也触发不了（真实踩过：用 `tick(dt)` 接口时的失败模式）。
+    """
+    for name in ('animation.js', 'gesture.js', 'clock.js'):
+        source = strip_comments(read(os.path.join(REPO_ROOT, 'frontend', name)))
+        for api_name in ('setTimeout', 'setInterval', 'clearTimeout'):
+            assert api_name not in source, (
+                f'{name} 里出现了 {api_name}——计时应由调用方（petview）负责'
             )
 
 

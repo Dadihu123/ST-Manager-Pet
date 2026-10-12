@@ -516,16 +516,22 @@ async function main() {
       `status=${traversal.status}`,
     );
 
-    // ---- ⑭ 宠物在所有这些操作后仍然活着
+    // ---- ⑮ 宠物在所有这些操作后仍然活着
     //
     // ⚠️ 采样**不能只取两点**。第一版是「隔 800ms 采两次，要求不同」，
     // 这在 2 帧动画上会**碰运气**：动画周期恰好是采样间隔的整数倍时，
     // 两次落在同一帧上，于是一个完全正常的宠物被误报成「卡住不动」。
     // （实测就是这样：⑮ 时好时坏，而产品一直是对的。）
     // 改为多采几次、要求出现 ≥2 个不同帧位。
+    //
+    // ⚠️ 2026-10 起还要**主动触发一次**：`idle` 默认是「平时静止 + 随机触发」
+    // （见 README §3.7），触发间隔 6~18 秒，而这里只采样约 1.6 秒——
+    // 不触发就永远只看到一个帧位，会把正确的新行为误报成故障。
     const alive = await page.evaluate(`(async () => {
       const root = document.querySelector('[data-plugin="stm-pet"].pet-root');
       if (!root) return { alive: false };
+      const view = window.__petView;
+      const poked = view ? view.pokeIdle() : false;
       const samples = [];
       for (let i = 0; i < 10; i += 1) {
         samples.push(getComputedStyle(root.querySelector('.pet-sprite')).backgroundPosition);
@@ -533,6 +539,7 @@ async function main() {
       }
       return {
         alive: true,
+        poked,
         distinct: new Set(samples).size,
         action: root.dataset.petAction,
         throttle: root.dataset.petThrottle || '',
@@ -541,7 +548,7 @@ async function main() {
     record(
       '⑮ 历经上传/删除/非法输入后宠物仍正常活动（帧位在变化）',
       alive.alive && alive.distinct >= 2,
-      `不同帧位=${alive.distinct}，action=${alive.action}，throttle=${alive.throttle}`,
+      `不同帧位=${alive.distinct}，pokeIdle=${alive.poked}，action=${alive.action}，throttle=${alive.throttle}`,
     );
 
     // ---- ⑯ 「取消」也要回收文件输入（用户报障的直接机制）

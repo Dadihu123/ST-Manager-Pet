@@ -1,8 +1,9 @@
 /**
- * 宠物视图：把纯逻辑层（时钟 / 物理 / 状态机）接到真实 DOM 上。
+ * 宠物视图：把纯逻辑层（时钟 / 物理 / 状态机 / 动画 / 手势）接到真实 DOM 上。
  *
  * 这是**唯一**碰 DOM 的模块。所有判定（该不该降频、能不能停 rAF、
- * 状态迁移是否合法）都在纯逻辑层做，这里只负责：
+ * 状态迁移是否合法、这次算点击还是拖拽、这次播哪一套动画）都在纯逻辑层做，
+ * 这里只负责：
  * 1. 建元素、按帧写 `transform` / `background-position`；
  * 2. 把宿主事件翻译成逻辑层的调用；
  * 3. 一个 rAF 循环驱动一切（§4.2），并在该停的时候**真的停**。
@@ -13,12 +14,19 @@
  * - 容器整体 `pointer-events: none`，宠物自己必须显式取回 `auto`。
  */
 
+import {
+  animationDuration,
+  createIdleScheduler,
+  playableVariants,
+  pickVariantIndex,
+} from './animation.js';
 import { createFrameClock, createIdleGate, decideThrottle } from './clock.js';
 import {
   mirrorForNonWalkAction,
   resolveWalkVisual,
   walkActionFor,
 } from './direction.js';
+import { createGesture, DEFAULT_HOLD_MS, DEFAULT_SLOP } from './gesture.js';
 import { createPhysics, estimateReleaseVelocity } from './physics.js';
 import { createStateMachine, STATES } from './statemachine.js';
 
@@ -28,12 +36,38 @@ const POINTER_SAMPLE_WINDOW = 120;
 /** 打盹判定轮询间隔（毫秒）——低频，不需要每帧查。 */
 const SLEEP_CHECK_INTERVAL = 1000;
 
-/** 点击与拖拽的判别阈值（像素）。 */
-const CLICK_SLOP = 5;
-
 /** 大小倍率的合法区间（与 `backend/core/pack.py:SCALE_RANGE` 必须一致）。 */
 const SCALE_MIN = 0.25;
 const SCALE_MAX = 4;
+
+/**
+ * 动画速度倍率的合法区间（与 `manifest.json` 的 `anim_speed` 一致）。
+ *
+ * 用户反馈「很多动作默认太快、看起来很奇怪」，而「多快算合适」因人而异
+ * （屏幕大小、形象风格、个人喜好都影响），因此开放成一个倍率：
+ * 数值越大越**慢**（`2` = 播放时间翻倍）。
+ */
+const ANIM_SPEED_MIN = 0.25;
+const ANIM_SPEED_MAX = 4;
+
+/**
+ * 右键菜单打开期间 / 宿主弹层打开时把动画放慢的倍率。
+ *
+ * 用户实测反馈：「右键打开插件菜单后背景中的动画会变慢，效果反而看起来还可以」。
+ * 那其实是 `decideThrottle` 的降频（`rate 0.25`）顺带把帧推进也拖慢了。
+ * 这里把它**变成有意为之的行为**：宿主忙 / 弹层打开时额外放慢，
+ * 让宠物安静下来（既不抢注意力，观感也更从容）。
+ */
+const OCCLUDED_SPEED_FACTOR = 2;
+
+/** 长按进入拖拽的阈值（毫秒）。用户要求「按住 0.5s 后才触发」。 */
+const DRAG_HOLD_MS = DEFAULT_HOLD_MS;
+
+/** 位移超过这么多像素就立刻算拖拽（不必等长按）。 */
+const DRAG_SLOP = DEFAULT_SLOP;
+
+/** 点击后的小弹跳初速度（像素/秒）。 */
+const CLICK_HOP_VELOCITY = -260;
 
 const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
 
@@ -78,6 +112,7 @@ export function createPetView(options = {}) {
     scale: 1,
     sleepAfter: 120,
     reducedMotion: false,
+    animSpeed: 1,
   }, options.config || {});
 
   const actions = pack.actions || {};
@@ -87,6 +122,9 @@ export function createPetView(options = {}) {
   const height = Math.max(8, Math.round(baseSize.h * scale));
   const anchorX = Number(pack.anchor?.x ?? 0.5);
   const anchorY = Number(pack.anchor?.y ?? 1);
+
+  /** 用户设的动画速度倍率（越大越慢）。 */
+  let animSpeed = clamp(Number(config.animSpeed) || 1, ANIM_SPEED_MIN, ANIM_SPEED_MAX);
 
   // ---------------------------------------------------------------- DOM
 
@@ -139,17 +177,34 @@ export function createPetView(options = {}) {
     onChange: (next, prev, meta) => {
       safeHook(hooks.onStateChange, next, prev, meta);
       applyActionForState();
+      onStateEnter(next);
     },
   });
 
   const clock = createFrameClock({ frames: 1, fps: 6, loop: true });
   const gate = createIdleGate();
 
+  /**
+   * idle 的随机触发调度器（见 `animation.js`）。
+   *
+   * 只在**真的处于 idle 且无其它占用**时推进，因此不会影响 sleep：
+   * 睡着之后状态不是 idle，`enabled` 为假，排期被清掉；
+   * 醒来时重新排期，于是「醒来立刻抽一次时间」而不是「补上睡梦中的那一次」。
+   */
+  const idleScheduler = createIdleScheduler();
+  /** 当前 idle 触发是否要求「一直循环」（`trigger: "loop"` 的旧行为）。 */
+  let idleLoops = false;
+
+  const gesture = createGesture({ holdMs: DRAG_HOLD_MS, slop: DRAG_SLOP });
+
   let currentAction = 'idle';
+  /** 当前正在播的**变体**（多套动画里选中的那套）；`null` 表示无图。 */
+  let currentVariant = null;
+  /** idle 的「随机触发」进行中（播完要回静止，而不是留在循环里）。 */
+  let idleBurst = false;
   let rafId = 0;
   let running = false;
   let lastFrameAt = 0;
-  let lastFrameTime = 0;
   let lastSleepCheck = 0;
   let lastInteractionAt = 0;
   let hostState = {};
@@ -166,17 +221,38 @@ export function createPetView(options = {}) {
   let walkDirection = 1;
   let dragSamples = [];
   let pointerId = null;
-  let dragStart = null;
+  /** 最近一次指针位置（长按升级成拖拽时要用它作为拖拽起点）。 */
+  let lastPointer = null;
   let walkTimer = 0;
   let walkTargetX = 0;
   /** 累积的「这段时间该走多少像素」——按帧率无关的方式推进漫游。 */
   let frameAccumulator = 0;
+  /** 一次性动作（land / click / 播报）的定时器。 */
+  let actionTimer = 0;
+  /**
+   * idle 随机触发的定时器。
+   *
+   * 必须是**独立**于 `actionTimer` 的一个：`actionTimer` 管的是
+   * 「当前这次动作什么时候播完」，而这个管的是「下一次什么时候开始」。
+   * 共用一个的后果是「播完回 idle 时把自己的收尾定时器清掉了」——
+   * 表现是 idle 动画播一遍之后再也不会触发。
+   */
+  let idleWakeTimer = 0;
 
   // ---------------------------------------------------------------- 绘制
 
   /** 取某动作的解析结果（后端已算好回退链，这里只取用）。 */
   function actionSpec(name) {
     return actions[name] || null;
+  }
+
+  /** 当前生效的速度倍率（含宿主忙碌 / 弹层打开时的额外放慢）。 */
+  function currentSpeed() {
+    let speed = animSpeed;
+    if (throttle.reason === 'busy' || throttle.reason === 'occluded') {
+      speed *= OCCLUDED_SPEED_FACTOR;
+    }
+    return clamp(speed, ANIM_SPEED_MIN, ANIM_SPEED_MAX * OCCLUDED_SPEED_FACTOR);
   }
 
   function applyActionForState() {
@@ -197,25 +273,56 @@ export function createPetView(options = {}) {
   }
 
   /**
-   * 切换动作。
+   * 状态**进入**时的收尾（在 `onChange` 里调）。
    *
-   * 后端已经把回退链算完（`kind` / `sheet` / `frames` / `url`），
-   * 这里只做「能不能播帧」的判定：`static` 只位移不播帧（§3.3 的降级语义）。
+   * 只做一件事：维护 idle 随机触发的排期。
+   *
+   * 为什么放在这里而不是散在各处调用：排期必须在「离开 idle」时清掉、
+   * 在「进入 idle」时重排，而状态迁移有**十几条**路径
+   * （落地播完、播报播完、漫游停下、被拖走、睡着、醒来…）。
+   * 逐个路径手工维护，漏掉任何一条的表现都是「idle 动画再也不触发了」——
+   * 这类漏改极难发现。集中在一个钩子里就不会漏。
    */
-  function setAction(name, { force = false } = {}) {
+  function onStateEnter(next) {
+    if (next === STATES.IDLE) {
+      // 刚回到 idle：等一段新的随机时间再自己动一下。
+      // `idleBurst` 正在播时不重排——那会在播的过程中插一个定时器进来。
+      if (!idleBurst) scheduleIdleWake();
+    } else {
+      cancelIdleWake();
+    }
+  }
+
+  /** 切换动作。
+   *
+   * 后端已经把回退链算完（`kind` / `variants` / `url`），这里只做：
+   * 1. 多套动画按权重**抽一套**（`pickVariantIndex`）；
+   * 2. 「能不能播帧」的判定：`static` 只位移不播帧（§3.3 的降级语义）。
+   */
+  function setAction(name, { force = false, variantSeed = null } = {}) {
     const next = String(name || 'idle');
     if (!force && next === currentAction) return;
     const spec = actionSpec(next) || actionSpec('idle');
     currentAction = next;
 
-    const animated = spec && spec.kind === 'animated' && spec.url && Number(spec.frames) > 1;
-    root.dataset.petAction = next;
+    const variants = playableVariants(spec);
+    const index = variantSeed === null
+      ? pickVariantIndex(variants)
+      : clamp(Math.floor(Number(variantSeed) || 0), 0, Math.max(0, variants.length - 1));
+    const variant = index >= 0 ? variants[index] : null;
+    currentVariant = variant;
 
-    if (spec && spec.url) {
+    const animated = Boolean(variant) && variant.frames > 1;
+    root.dataset.petAction = next;
+    root.dataset.petVariant = variant ? String(index) : '';
+
+    if (variant) {
       // spritesheet + background-position：换帧只改绘制，不走网络与解码（§2.5）
-      const frameW = spec.layout === 'vertical' ? width : width * Number(spec.frames || 1);
-      const frameH = spec.layout === 'vertical' ? height * Number(spec.frames || 1) : height;
-      sprite.style.backgroundImage = `url("${spec.url}")`;
+      const frameW = variant.layout === 'vertical'
+        ? width : width * Number(variant.frames || 1);
+      const frameH = variant.layout === 'vertical'
+        ? height * Number(variant.frames || 1) : height;
+      sprite.style.backgroundImage = `url("${variant.url}")`;
       sprite.style.backgroundSize = `${frameW}px ${frameH}px`;
       sprite.style.backgroundRepeat = 'no-repeat';
     } else {
@@ -223,25 +330,32 @@ export function createPetView(options = {}) {
     }
 
     if (animated) {
-      clock.setSpec({ frames: spec.frames, fps: spec.fps, loop: spec.loop !== false });
+      clock.setSpec({
+        frames: variant.frames,
+        fps: variant.fps,
+        loop: variant.loop,
+        frameMs: variant.frameMs,
+      });
       drawFrame();
     } else {
       // 单帧 / 静态：停在这一帧，不推进
       clock.setSpec({ frames: 1, fps: 1, loop: true });
       drawFrame();
     }
+    // 动画速度倍率是**播放期**的事：这里只记录，推进时按它折算 dt。
+    root.dataset.petAnimSpeed = String(currentSpeed());
     wake();
   }
 
   /** 把当前帧写进 `background-position`（只改绘制，不触发 layout）。 */
   function drawFrame() {
-    const spec = actionSpec(currentAction) || actionSpec('idle');
-    if (!spec || !spec.url) {
+    const variant = currentVariant;
+    if (!variant) {
       sprite.style.backgroundPosition = '0 0';
       return;
     }
     const index = clock.frames > 1 ? clock.index : 0;
-    if (spec.layout === 'vertical') {
+    if (variant.layout === 'vertical') {
       sprite.style.backgroundPosition = `0 ${-index * height}px`;
     } else {
       sprite.style.backgroundPosition = `${-index * width}px 0`;
@@ -336,24 +450,45 @@ export function createPetView(options = {}) {
     physics.advance(dt);
     const moved = Math.abs(physics.x - before.x) + Math.abs(physics.y - before.y);
 
-    // 2) 状态迁移
+    // 2) 状态迁移（含 idle 随机触发的推进）
     updateStateFromPhysics(dt, now);
 
-    // 3) 帧推进（按 throttle 降频）
+    // 2.5) 长按判定
+    //
+    //      「按住 0.5 秒进入拖拽」这条路径**不会**有 `pointermove` 事件
+    //      （用户按着不动），因此必须由时间驱动。放在 rAF 里而不是
+    //      `setTimeout` 里：`shouldKeepRunning` 已经在 `pending` 期间保持循环，
+    //      两者天然同步，也不会出现「循环停了但长按定时器还在跑」的错位。
+    if (gesture.phase === 'pending' && lastPointer) {
+      if (gesture.tick(now)) beginDrag(lastPointer);
+    }
+
+    // 3) 帧推进
+    //
     //    `paused`（页面不可见 / reducedMotion）时循环根本不会跑，这里不必再判。
+    //
+    //    **动画速度倍率在这里生效**：把流逝时间按倍率折算后再推进帧。
+    //    之所以不在包层面改 fps：倍率是**用户偏好**，改 fps 会让
+    //    「同一次动作在不同倍率下播得不一样长」，而定时器（播完回 idle）
+    //    必须与实际播放时长一致。因此倍率同时作用于「帧推进」与「时长计算」
+    //    （见 `actionDurationMs`），两处用的是同一个 `currentSpeed()`。
     if (dt > 0) {
-      frameAccumulator += dt * throttle.rate;
-      // 一帧最多推进 0.25 秒的动画时间，避免切后台回来一次跳很多帧
-      const advance = Math.min(frameAccumulator, 0.25);
-      frameAccumulator -= advance;
+      const speed = currentSpeed();
+      // 非均匀帧时长下，`frameMs` 是包声明的**绝对**毫秒数，
+      // 因此倍率同样按比例放大每一帧的停留时间。
+      const advance = Math.min(dt / speed, 0.25);
       if (clock.frames > 1) {
         const steps = clock.advance(advance);
-        if (steps > 0) drawFrame();
+        if (steps > 0) {
+          drawFrame();
+          // idle 的随机触发是**有限次数**：播完一轮（`plays` 轮）就回静止。
+          if (idleBurst && clock.finished) finishIdleBurst();
+        }
       }
     }
 
     // 4) 写 DOM
-    if (moved > 0.01 || dragSamples.length) drawPosition();
+    if (moved > 0.01 || gesture.phase !== 'done') drawPosition();
 
     // 5) 省电：决定要不要继续
     if (shouldKeepRunning()) {
@@ -369,17 +504,26 @@ export function createPetView(options = {}) {
     if (disposed) return false;
     // 停绘条件（页面不可见 / reducedMotion）在这里生效：真的不再请求动画帧
     if (throttle.paused) return false;
-    if (physics.dragging) return true;
+    if (physics.dragging || gesture.phase === 'pending') return true;
     if (machine.state === STATES.FALL || machine.state === STATES.WALK) return true;
     if (machine.state === STATES.REACT || machine.state === STATES.LAND) {
       // 一次性动作：播完就停
       return !clock.finished;
     }
-    // idle / sleep：有多帧循环动画在播就继续——这是宠物「活着」的唯一视觉信号，
-    // 停掉它就等于宠物变成一张静止贴图（sleep 的呼吸/呼噜同理）。
-    // 帧率由包声明的 fps 决定（默认形象 idle 是 6fps），因此这里的开销很低。
-    if (clock.frames > 1 && clock.loop) return true;
-    // 单帧 / 静态形象：物理静止就**真的停掉 rAF**（省电，§4.2）
+    if (machine.state === STATES.DRAG) return true;
+    // sleep：呼吸/呼噜的循环动画是「它睡着了」的唯一视觉信号，必须继续。
+    if (machine.state === STATES.SLEEP) {
+      return clock.frames > 1 && clock.loop;
+    }
+    // idle 的一次随机小动作正在播：**必须**继续跑，否则它会冻在第 0 帧。
+    // （`physics.resting` 这时通常为真，不加这一条的话循环会当场停掉。）
+    if (idleBurst) return !clock.finished || clock.frames <= 1;
+    // idle：
+    // - `loop` 模式（作者显式要求一直循环）→ 继续跑；
+    // - `random` 模式（默认）→ **平时不跑**，只等随机触发那一下。
+    //   这正是「平时处于静止画面」的落点：等待期间 rAF 真的停掉，
+    //   触发由 `setTimeout` 安排（见 `scheduleIdleWake`）。
+    if (clock.frames > 1 && clock.loop && idleLoops) return true;
     return !physics.resting;
   }
 
@@ -389,15 +533,13 @@ export function createPetView(options = {}) {
     if (physics.justLanded && (state === STATES.FALL || state === STATES.DRAG)) {
       machine.land({ now });
       // 落地动作播完回 idle（一次性）
-      const spec = actionSpec('land');
-      const duration = spec && spec.frames > 1
-        ? (spec.frames / Math.max(1, spec.fps)) * 1000
-        : 180;
-      clearTimeout(landTimer);
-      landTimer = setTimeout(() => {
+      const duration = actionDurationMs('land', 180);
+      clearTimeout(actionTimer);
+      actionTimer = setTimeout(() => {
         const pending = machine.takePendingReaction();
         if (pending) {
           machine.react(pending, { now: performance.now() });
+          scheduleReactionEnd(pending);
         } else {
           machine.settle({ now: performance.now() });
         }
@@ -414,7 +556,7 @@ export function createPetView(options = {}) {
     }
 
     // 漫游调度
-    if (state === STATES.IDLE && config.autoRoam && !reducedMotion) {
+    if (state === STATES.IDLE && config.autoRoam && !reducedMotion && !idleBurst) {
       walkTimer -= dt * 1000;
       if (walkTimer <= 0) scheduleWalk();
     }
@@ -426,9 +568,135 @@ export function createPetView(options = {}) {
       if (idleFor > Math.max(10, Number(config.sleepAfter) || 120) * 1000
         && (state === STATES.IDLE || state === STATES.WALK)) {
         physics.stopWalking();
+        // `machine.sleep()` 会触发 `onStateEnter`，排期在那里被清掉——
+        // 睡着之后不该再有任何 idle 触发等着执行。
         machine.sleep({ now });
       }
     }
+  }
+
+  // -------------------------------------------------------- idle 随机触发
+  //
+  // 用**定时器**而不是靠 rAF 计时，原因很直接：`random` 模式下平时是静止画面，
+  // rAF 循环**已经停了**（这正是省电的落点）。若把倒计时放在 rAF 里推进，
+  // 它永远不会前进，idle 动画就再也触发不了。
+  //
+  // 因此这里的分工是：
+  // - 平时：无 rAF、只有一个 `setTimeout` 等着；
+  // - 到点：`startIdleBurst()` 唤醒 rAF 播一遍；
+  // - 播完：`finishIdleBurst()` 回到静止帧并重新排下一次。
+
+  /**
+   * 现在**允许**安排一次 idle 小动作吗？
+   *
+   * 条件收得很紧，任何一条不满足就不排期。这不只是「省事」——
+   * 它同时保证了**不影响 sleep**：睡着之后状态不是 idle，排期自然为空。
+   */
+  function idleTriggerEnabled() {
+    return !reducedMotion
+      && !idleLoops
+      && !disposed
+      && !throttle.paused
+      && machine.state === STATES.IDLE
+      && !idleBurst
+      && gesture.phase === 'done'
+      && !physics.dragging;
+  }
+
+  /** 清掉待执行的 idle 触发（任何交互 / 状态变化都要调）。 */
+  function cancelIdleWake() {
+    // 调度器本身是无状态的（只负责抽随机间隔），因此要清的只有定时器。
+    if (idleWakeTimer) {
+      clearTimeout(idleWakeTimer);
+      idleWakeTimer = 0;
+    }
+  }
+
+  /**
+   * 排下一次 idle 触发。
+   *
+   * 每次都是**重新抽**一个随机间隔（而不是固定周期），这样看起来才像
+   * 「它自己想动一下」，而不是一台节拍器。
+   */
+  function scheduleIdleWake() {
+    cancelIdleWake();
+    if (!idleTriggerEnabled()) return;
+    const seconds = idleScheduler.reschedule();
+    idleWakeTimer = setTimeout(() => {
+      idleWakeTimer = 0;
+      // 到点时再确认一次：等待期间用户可能已经把它拖走了 / 让它睡了
+      if (!idleTriggerEnabled()) return;
+      startIdleBurst();
+    }, Math.max(250, Math.round(seconds * 1000)));
+  }
+
+  /** 播一次 idle 小动作（随机抽一套变体）。 */
+  function startIdleBurst() {
+    const spec = actionSpec('idle');
+    if (!spec) return;
+    // 换一套变体：`force` 让「同一动作重播」也能生效，
+    // 否则抽到另一套时 `setAction` 会因为名字没变而直接返回。
+    setAction('idle', { force: true });
+    idleBurst = true;
+    // 只播一轮：idle 的变体在包里通常声明 `loop: true`（它是待机循环），
+    // 但「随机触发」的语义是「播一遍就停」，因此这里显式改成不循环，
+    // 让时钟在末帧 `finished`，由 `finishIdleBurst` 收尾。
+    if (currentVariant) {
+      clock.setSpec({
+        frames: currentVariant.frames,
+        fps: currentVariant.fps,
+        loop: false,
+        frameMs: currentVariant.frameMs,
+      });
+    }
+    wake();
+    // 兜底：单帧变体（`frames <= 1`）的时钟永远不会 finished，
+    // 那时靠这个定时器收尾，否则 `idleBurst` 会永远为真、rAF 永不停。
+    const duration = actionDurationMs('idle', 600);
+    clearTimeout(actionTimer);
+    actionTimer = setTimeout(() => {
+      if (idleBurst) finishIdleBurst();
+    }, duration);
+  }
+
+  /** 结束一次 idle 小动作：回到静止画面，并排下一次。 */
+  function finishIdleBurst() {
+    if (!idleBurst) return;
+    idleBurst = false;
+    clearTimeout(actionTimer);
+    actionTimer = 0;
+    // 回到**静止画面**：保留当前变体的贴图，只把时钟钉成单帧、不推进，
+    // 于是它停在第 0 帧上等下一次触发。
+    //
+    // 这里刻意**不**重新抽变体：静止画面的姿势若每次都换，看起来像瞬移。
+    // 换姿势的时机是「下一次触发开始播」的时候（见 `startIdleBurst`）。
+    clock.setSpec({ frames: 1, fps: 1, loop: true });
+    drawFrame();
+    scheduleIdleWake();
+    wake();
+  }
+
+  /**
+   * 某个动作**实际会播多久**（毫秒，已含动画速度倍率）。
+   *
+   * 状态机用它来安排「播完回 idle」的定时器。**必须**和帧推进用同一套倍率，
+   * 否则倍率大于 1 时动作会被定时器提前打断，看起来像「播到一半就切走了」。
+   *
+   * 对**正在播**的动作优先用 `currentVariant`：多套动画的时长可以差很多
+   * （例如「被点击」有一套是短促的点头、另一套是慢慢的歪头），
+   * 按 `variants[0]` 算会让后者的定时器提前把它掐掉。
+   */
+  function actionDurationMs(name, fallback) {
+    let variant = null;
+    if (name === currentAction && currentVariant) {
+      variant = currentVariant;
+    } else {
+      const variants = playableVariants(actionSpec(name));
+      variant = variants[0] || null;
+    }
+    const base = variant ? animationDuration(variant) : 0;
+    const total = base > 0 ? base : fallback;
+    return Math.max(60, total * currentSpeed());
   }
 
   function scheduleWalk() {
@@ -446,8 +714,6 @@ export function createPetView(options = {}) {
     wake();
   }
 
-  let landTimer = 0;
-
   // ------------------------------------------------------------ 指针交互
 
   function toLocal(event) {
@@ -458,15 +724,17 @@ export function createPetView(options = {}) {
   function onPointerDown(event) {
     if (event.button !== undefined && event.button !== 0) return;
     const point = toLocal(event);
+    const now = event.timeStamp || performance.now();
     pointerId = event.pointerId;
-    dragSamples = [{ x: point.x, y: point.y, t: event.timeStamp || performance.now() }];
-    dragStart = { x: point.x, y: point.y };
+    lastPointer = point;
+    dragSamples = [{ x: point.x, y: point.y, t: now }];
     lastInteractionAt = performance.now();
-
-    machine.beginDrag({ now: lastInteractionAt });
-    physics.beginDrag(point.x, point.y);
-    // 运动期间才加 will-change，停下就摘（常驻会占显存，§4.1）
-    root.classList.add('is-moving');
+    // **不立刻进拖拽态**：先挂起，等「按住 0.5 秒」或「明显移动」再升级。
+    // 这是「点击动画能单独触发」的关键（见 `gesture.js`）。
+    gesture.begin(point.x, point.y, now);
+    // 用户按住了：取消待执行的 idle 触发，免得它在这时候自己动一下
+    cancelIdleWake();
+    if (machine.state === STATES.SLEEP) machine.wake({ now: lastInteractionAt });
     try {
       root.setPointerCapture(pointerId);
     } catch {
@@ -476,22 +744,37 @@ export function createPetView(options = {}) {
     event.preventDefault();
   }
 
+  /** 把手势升级成真正的拖拽。 */
+  function beginDrag(point) {
+    machine.beginDrag({ now: performance.now() });
+    physics.beginDrag(point.x, point.y);
+    // 运动期间才加 will-change，停下就摘（常驻会占显存，§4.1）
+    root.classList.add('is-moving');
+    wake();
+  }
+
   function onPointerMove(event) {
     if (pointerId === null || event.pointerId !== pointerId) return;
     const point = toLocal(event);
-    physics.moveDrag(point.x, point.y);
-    dragSamples.push({ x: point.x, y: point.y, t: event.timeStamp || performance.now() });
+    const now = event.timeStamp || performance.now();
+    lastPointer = point;
+    dragSamples.push({ x: point.x, y: point.y, t: now });
     if (dragSamples.length > 24) dragSamples.shift();
     lastInteractionAt = performance.now();
-    drawPosition();
+
+    if (gesture.move(point.x, point.y, now)) beginDrag(point);
+    if (gesture.dragging) {
+      physics.moveDrag(point.x, point.y);
+      drawPosition();
+    }
     event.preventDefault();
   }
 
   function onPointerUp(event) {
     if (pointerId === null || (event.pointerId !== undefined && event.pointerId !== pointerId)) return;
     const point = toLocal(event);
+    const now = event.timeStamp || performance.now();
     const release = estimateReleaseVelocity(dragSamples);
-    const travel = dragStart ? Math.hypot(point.x - dragStart.x, point.y - dragStart.y) : 0;
 
     try {
       root.releasePointerCapture(pointerId);
@@ -502,30 +785,44 @@ export function createPetView(options = {}) {
     dragSamples = [];
     lastInteractionAt = performance.now();
 
-    if (travel < CLICK_SLOP) {
-      // 位移很小 → 当成点击：回 idle 并播 click 动作
-      physics.endDrag(0, 0);
-      machine.settle({ now: lastInteractionAt });
-      if (actionSpec('click')) {
-        machine.react('click', { now: lastInteractionAt });
-        const spec = actionSpec('click');
-        const duration = spec.frames > 1 ? (spec.frames / spec.fps) * 1000 : 200;
-        clearTimeout(landTimer);
-        landTimer = setTimeout(() => {
-          machine.settle({ now: performance.now() });
-          wake();
-        }, duration);
-      }
-      // 点击后稍微弹一下，是有反馈感的最小代价
-      physics.setVelocity(0, -260);
-      machine.go(STATES.FALL, { reason: 'click-hop', now: lastInteractionAt });
+    const outcome = gesture.end(point.x, point.y, now);
+    lastPointer = null;
+    root.classList.remove('is-moving');
+
+    if (outcome.kind === 'click') {
+      handleClick();
     } else {
       machine.release({ now: lastInteractionAt });
       physics.endDrag(release.vx * scale, release.vy * scale);
     }
-    root.classList.remove('is-moving');
     wake();
     event.preventDefault();
+  }
+
+  /**
+   * 一次真正的「点击」。
+   *
+   * 旧实现里点击几乎触发不到（拖拽抢走了所有按下），现在手势层先把两者分开，
+   * 这里就只管播 `click` 动作 + 一个小弹跳作为反馈。
+   *
+   * 顺序与旧实现一致（`settle` → `react('click')` → 给一个上抛初速度），
+   * 只是多了「清掉 idle 排期」：用户刚点过它，不该马上又自己动一下。
+   */
+  function handleClick() {
+    physics.endDrag(0, 0);
+    machine.settle({ now: lastInteractionAt });
+    cancelIdleWake();
+    if (actionSpec('click')) {
+      machine.react('click', { now: lastInteractionAt });
+      scheduleReactionEnd('click', 200);
+    }
+    // 点击后稍微弹一下，是有反馈感的最小代价。
+    //
+    // 注意这里**不**切到 `fall` 态：`react` 态到 `fall` 不在迁移表里，
+    // 那次 `go()` 会被拒绝（旧实现也是如此）。物理照常推进，因此
+    // 「弹一下」的观感不变，而状态仍是 `react`——这样点击动画能完整播完，
+    // 落回地面也不会把 `land` 插进来打断它。
+    physics.setVelocity(0, CLICK_HOP_VELOCITY);
   }
 
   function onContextMenu(event) {
@@ -581,12 +878,14 @@ export function createPetView(options = {}) {
     root.classList.toggle('is-throttled', throttle.rate < 1 && !throttle.paused);
     root.classList.toggle('is-static-motion', reducedMotion);
     root.dataset.petThrottle = throttle.reason || 'none';
+    root.dataset.petAnimSpeed = String(currentSpeed());
 
     if (throttle.paused) {
       // 停绘：取消所有待执行的循环与定时器，只留一帧静息图
       stopLoop();
-      clearTimeout(landTimer);
-      landTimer = 0;
+      clearTimeout(actionTimer);
+      actionTimer = 0;
+      cancelIdleWake();
       if (reducedMotion) {
         // reducedMotion 的语义是「关掉循环帧动画」而不是降速（§4.5 / §8 陷阱 13）：
         // 把帧定在第 0 帧，并摘掉 will-change（不再有运动）
@@ -600,26 +899,44 @@ export function createPetView(options = {}) {
       // 重新起跳：不让暂停期间的时间一次性补进物理
       lastFrameAt = 0;
       wake();
+      // 从暂停里恢复时重排 idle（暂停期间排期已被清掉）
+      scheduleIdleWake();
     }
+  }
+
+  /**
+   * 安排一次播报动作的结束（播完回 idle）。
+   *
+   * `action` 给了就按它的实际时长（含动画速度倍率），否则用 `fallback`。
+   */
+  function scheduleReactionEnd(action, fallback = 700) {
+    const duration = actionDurationMs(action, fallback);
+    clearTimeout(actionTimer);
+    actionTimer = setTimeout(() => {
+      const pending = machine.takePendingReaction();
+      if (pending) {
+        machine.react(pending, { now: performance.now() });
+        scheduleReactionEnd(pending);
+      } else {
+        machine.settle({ now: performance.now() });
+        // 播报结束、回到 idle：重新排一次随机小动作
+        scheduleIdleWake();
+      }
+      wake();
+    }, Math.max(300, duration));
   }
 
   /** 收到核心事件 → 播报（限流由调用方负责）。 */
   function react(action) {
     lastInteractionAt = performance.now();
+    cancelIdleWake();
     if (machine.state === STATES.SLEEP) {
       // sleep 期间收到事件要唤醒（§4.3 硬要求）
       machine.wake({ now: lastInteractionAt });
     }
     const normalized = action || 'happy';
     if (machine.react(normalized, { now: lastInteractionAt })) {
-      const spec = actionSpec(normalized) || actionSpec('idle');
-      const frames = Number(spec?.frames) || 1;
-      const duration = frames > 1 ? (frames / Math.max(1, Number(spec?.fps) || 8)) * 1000 : 700;
-      clearTimeout(landTimer);
-      landTimer = setTimeout(() => {
-        machine.settle({ now: performance.now() });
-        wake();
-      }, Math.max(300, duration));
+      scheduleReactionEnd(normalized);
       wake();
     }
   }
@@ -627,6 +944,7 @@ export function createPetView(options = {}) {
   /** 任意用户输入都算「互动」，重置打盹计时。 */
   function touch() {
     lastInteractionAt = performance.now();
+    cancelIdleWake();
     if (machine.state === STATES.SLEEP) {
       machine.wake({ now: lastInteractionAt });
       setAction('idle', { force: true });
@@ -639,12 +957,41 @@ export function createPetView(options = {}) {
   lastInteractionAt = performance.now();
   machine.setNow(lastInteractionAt);
   applyFacing();
+  idleLoops = idleTriggerOf('idle').mode === 'loop';
+  idleScheduler.setTrigger(idleTriggerOf('idle'));
   setAction('idle', { force: true });
   drawPosition();
   // 起始位置：站在地面
   physics.setPosition(initialBounds.width * 0.5, initialBounds.height);
   drawPosition();
   walkTimer = 2000;
+  // 起手就排一次：宠物出现后过一段随机时间自己动一下，而不是永远僵着。
+  // 自动漫游（`autoRoam`）与它是两条独立的路子，因此这里不互斥。
+  scheduleIdleWake();
+
+  /** 读某动作的 idle 触发配置（非 idle 动作返回默认值）。 */
+  function idleTriggerOf(name) {
+    const spec = actionSpec(name) || {};
+    const trigger = spec.idleTrigger || {};
+    return {
+      mode: trigger.mode === 'loop' ? 'loop' : 'random',
+      minIntervalMs: trigger.minIntervalMs,
+      maxIntervalMs: trigger.maxIntervalMs,
+      plays: trigger.plays,
+    };
+  }
+
+  /**
+   * 触发一次随机 idle 小动作。
+   *
+   * 用于「让它现在就动一下」这类外部触发（诊断句柄 / 预览）；
+   * 内部的定时触发走 `scheduleIdleWake`。
+   */
+  function pokeIdle() {
+    if (machine.state !== STATES.IDLE || idleLoops || idleBurst) return false;
+    startIdleBurst();
+    return true;
+  }
 
   return {
     element: root,
@@ -659,6 +1006,16 @@ export function createPetView(options = {}) {
     get scale() { return scale; },
     get size() { return { width, height }; },
     get pixelated() { return root.dataset.petPixelated === 'true'; },
+    /** 当前动画速度倍率（越大越慢）。 */
+    get animSpeed() { return animSpeed; },
+    /** 当前选中的变体下标（多套动画时有用）。 */
+    get variantIndex() { return Number(root.dataset.petVariant || -1); },
+    /** idle 是否正在播一次随机小动作。 */
+    get idleBursting() { return idleBurst; },
+    /** 手势阶段（排查「点击没反应 / 一碰就飞」用）。 */
+    get gesturePhase() { return gesture.phase; },
+    /** 当前生效的 idle 触发模式。 */
+    get idleMode() { return idleLoops ? 'loop' : 'random'; },
     setConfig(next = {}) {
       Object.assign(config, next);
       // 渲染方式可以**就地**改：只是换一条 CSS 规则，不涉及几何，
@@ -666,6 +1023,14 @@ export function createPetView(options = {}) {
       if ('pixelated' in next) {
         const flag = next.pixelated === true;
         root.dataset.petPixelated = flag ? 'true' : 'false';
+      }
+      // 动画速度倍率同样可以就地改：它只影响帧推进的折算。
+      if ('animSpeed' in next) {
+        animSpeed = clamp(
+          Number(next.animSpeed) || 1, ANIM_SPEED_MIN, ANIM_SPEED_MAX,
+        );
+        root.dataset.petAnimSpeed = String(currentSpeed());
+        wake();
       }
       // `scale` **不**在这里处理：它会改包围盒尺寸，进而影响物理与切帧几何，
       // 必须重建视图（由 `plugin.js` 的 `applyPack` 负责，并保留当前位置）。
@@ -675,10 +1040,12 @@ export function createPetView(options = {}) {
     react,
     touch,
     wake,
+    pokeIdle,
     dispose() {
       disposed = true;
       stopLoop();
-      clearTimeout(landTimer);
+      clearTimeout(actionTimer);
+      cancelIdleWake();
       if (resizeRaf) window.cancelAnimationFrame(resizeRaf);
       window.removeEventListener('resize', onResize);
       root.removeEventListener('pointerdown', onPointerDown);

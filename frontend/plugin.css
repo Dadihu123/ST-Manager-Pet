@@ -288,6 +288,90 @@
   background: var(--color-warning, #d9a02c);
 }
 
+/* ------------------------------------------------------------ 动画预览 */
+
+/* 预览区：左「舞台」右「信息/控制」。
+ *
+ * 窄屏下自动折成单列（`flex-wrap`），否则右栏在 modal 里会被挤扁。 */
+.plugin-stm-pet .pet-preview-stage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+/* 预览框：固定尺寸的方框，帧位移靠 `background-position`（与宠物本体同规则）。
+ *
+ * `background-size` / `background-position` 由 JS 写入（`preview.js`）——
+ * 因为要按帧数与排布算，CSS 里表达不了。这里只给几何与外观。 */
+.plugin-stm-pet .pet-preview-box {
+  width: 112px;
+  height: 168px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.1));
+  border-radius: 10px;
+  background-color: var(--surface-container-raised, rgba(0, 0, 0, 0.02));
+  background-repeat: no-repeat;
+  /* 默认平滑插值（与宠物本体的默认一致：写实插画硬边会出现块状锯齿） */
+  image-rendering: auto;
+}
+
+.plugin-stm-pet .pet-preview-side {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.plugin-stm-pet .pet-preview-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.plugin-stm-pet .pet-preview-meta {
+  font-size: 11px;
+  opacity: 0.7;
+  line-height: 1.4;
+}
+
+/* 帧读数：用等宽数字，否则数字变化时宽度会跳（看起来像在抖） */
+.plugin-stm-pet .pet-preview-frame {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-color, #7c5cff);
+}
+
+.plugin-stm-pet .pet-preview-variants {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 动作选择：每个动作一个按钮，点一下就在上面播放 */
+.plugin-stm-pet .pet-preview-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.06));
+}
+
+.plugin-stm-pet .pet-preview-picker .pet-choice {
+  flex: 0 0 auto;
+  min-width: 68px;
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+/* 没有可播的图：置灰但仍然可点（点了会显示「这个动作没有图」的说明，
+ * 比直接禁用更有帮助——用户能知道**为什么**没有） */
+.plugin-stm-pet .pet-preview-picker .pet-choice.is-muted {
+  opacity: 0.5;
+}
+
 /* ---------------------------------------------------------------- 按钮 */
 
 .plugin-stm-pet .pet-button {
