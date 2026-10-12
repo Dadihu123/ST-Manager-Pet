@@ -243,7 +243,7 @@ def test_uses_both_scope_roots(css_body):
     实测：宿主的 ambient shell 只带 `data-plugin` 属性、**不带** `plugin-<id>` 类
     （`plugin-<id>` 是 `api.createRoot()` 加的，落点在 plugin-host-root）。
     只写 `.plugin-stm-pet ...` 会整份样式静默匹配不到，
-    症状恰好与 §8 陷阱 1 描述的一致（见 docs/HOST_FEEDBACK.md 第 2 条）。
+    症状恰好是「拖不动 / 点了没反应」（论证见 CHANGELOG「与实施提示词的偏差」第 2 条）。
     """
     assert f'[data-plugin="{PLUGIN_ID}"]' in css_body, (
         '必须用 [data-plugin="stm-pet"] —— 它才是 ambient 容器上真实存在的标记'

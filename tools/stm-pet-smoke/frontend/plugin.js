@@ -32,7 +32,7 @@ export async function activate(api) {
       // 宿主的 ambient shell 只带 `data-plugin`，**不带** `plugin-<id>` 类
       // （那是 `api.createRoot()` 才加的，而 createRoot 挂在 plugin-host-root 上，
       // 不是挂进 ambient 容器）。所以插件自己的根元素要**两个都写**，
-      // 样式才有稳定的作用域根（见 docs/HOST_FEEDBACK.md）。
+      // 样式才有稳定的作用域根。
       box.className = "pet-smoke-box plugin-stm-pet-smoke";
       box.dataset.plugin = "stm-pet-smoke";
       box.textContent = "smoke";

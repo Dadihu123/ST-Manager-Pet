@@ -10,8 +10,8 @@
  *   **不带** `plugin-<id>` 类（`plugin-<id>` 是 `api.createRoot()` 加的，
  *   而 createRoot 的落点在 `#plugin-host-root`，不在 ambient 容器里）。
  *   所以这里**必须**用 `[data-plugin="stm-pet"]` 才能匹配到真实 DOM。
- *   详见 docs/HOST_FEEDBACK.md 第 2 条——只写 `.plugin-stm-pet .pet-body`
- *   会整份样式静默失效，症状恰好是「拖不动 / 点了没反应」。
+ *   只写 `.plugin-stm-pet .pet-body` 会整份样式静默失效，
+ *   症状恰好是「拖不动 / 点了没反应」（实测，论证见 CHANGELOG「与实施提示词的偏差」第 2 条）。
  *
  * 硬约束（§0 判定标准）：
  *   - 本文件里**零个 `position: fixed`**。常驻容器由宿主的 ambient surface

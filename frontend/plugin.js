@@ -173,8 +173,7 @@ export async function activate(api) {
    * 注册常驻环境层。
    *
    * **移动端不挂载**（宿主的产品决策，不要在插件里绕过，§8 陷阱 14）。
-   * 注意：`register()` 在桌面与移动端**都返回 key**（实测，见
-   * docs/HOST_FEEDBACK.md 第 1 条），因此不能靠返回值判可用——
+   * 注意：`register()` 在桌面与移动端**都返回 key**（实测），因此不能靠返回值判可用——
    * 用 `api.surfaces.isOpen()`：移动端 `_mountAmbient` 提前返回、不写 open 表，
    * 所以它会返回 false。
    */

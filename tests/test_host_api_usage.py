@@ -108,7 +108,7 @@ def test_host_api_members_parsed_from_source():
     # `log` **不应该**在顶层（这正是我们踩过的坑）
     assert 'log' not in members, (
         '宿主现在有了顶层 api.log？如果是，本插件的 createLogger 适配层可以简化，'
-        '并请更新 docs/HOST_FEEDBACK.md'
+        '并请更新 CHANGELOG「与实施提示词的偏差」第 3 条'
     )
 
 

@@ -237,14 +237,6 @@ def test_plugin_asset_is_a_valid_toast_icon_path():
     assert os.path.isfile(os.path.join(REPO_ROOT, value)), f'图标文件不存在: {value}'
 
 
-def test_host_feedback_records_the_toast_gap_as_fixed():
-    """宿主反馈文档里那条要标成「已修复」，并写明修复 commit。"""
-    with open(os.path.join(REPO_ROOT, 'docs', 'HOST_FEEDBACK.md'), encoding='utf-8') as handle:
-        feedback = handle.read()
-    assert 'TOAST_ICON_NAMES' in feedback, 'HOST_FEEDBACK 应保留 toast 白名单问题的记录'
-    assert '715d0a8' in feedback, '应写明修复该问题的宿主 commit'
-
-
 def test_icon_url_is_reachable_from_manifest_path():
     """manifest 里的相对路径要真的指向文件（写错名字宿主只会显示占位图标）。"""
     import json

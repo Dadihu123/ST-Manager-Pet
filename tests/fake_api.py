@@ -2,7 +2,7 @@
 
 宿主真实的 `PluginAPI` 需要 Flask app + manifest + registry 一整条链，
 在插件仓库里搭起来成本过高（而且会耦合宿主的内部结构）。这里只实现路由层
-**实际用到**的那几个方法，行为对齐宿主文档（`docs/plugin-api.md`）：
+**实际用到**的那几个方法，行为对齐宿主 API（`ST-Manager/docs/plugin-api.md`）：
 
 - `api.route(rule, methods)` —— 装饰器，把视图函数收进一个蓝图；
 - `api.data_dir()` —— 插件私有数据目录；

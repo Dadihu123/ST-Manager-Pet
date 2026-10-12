@@ -373,7 +373,7 @@ idle → sleep（长时间无操作）→ idle（任何输入）
 判定方式（实测过的一个坑）：宿主的 `surfaces.register()` 在**桌面与移动端都返回
 key**，因此不能靠返回值判可用；插件用 `api.surfaces.isOpen('pet')` 判定——
 移动端 `_mountAmbient` 提前返回、不写 open 表，所以返回 `false`。
-详见 `docs/HOST_FEEDBACK.md`。
+完整论证见 CHANGELOG「与实施提示词的偏差」第 1 条。
 
 ---
 
@@ -549,7 +549,7 @@ python tools/measure_dock_icons.py
 
 图标也用在**宿主轻提示（toast）**里 —— 通知因此是品牌化的。
 这依赖宿主 `ST-Manager@715d0a8` 的修复（该修复由本插件审计发现并提交提示词，
-见 `docs/HOST_TOAST_ICON_FIX_PROMPT.md`）：修复前 toast 的图标位只接受
+论证见 CHANGELOG「已上报并修复的宿主问题」）：修复前 toast 的图标位只接受
 16 个写死的宿主图标名，插件资源路径会被静默丢弃。在**旧宿主**上，
 这个图标会降级为「图标位留空 + 一条 console 警告」，**文案照常显示**。
 

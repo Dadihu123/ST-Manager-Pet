@@ -184,12 +184,13 @@
   `walk-left` / `walk-right` 并说明「`missingRequired` 里的 `walk` 是需求代号」；
   §5.2 补上插件自己的设置文件只有哪三个键；§11 补「没有正面行走动作」
   与「默认形象是硬编码 id」两条已知限制。
-- `docs/CHARACTER_XIAOMAN.md` 动作数改 **12**、删除 `walk` 行与回退链中的 `walk`、
+- `docs/CHARACTER_XIAOMAN.md`（不进版本库）动作数改 **12**、
+  删除 `walk` 行与回退链中的 `walk`、
   打包清单去掉 `walk.png`；新增 **§6.2「4 帧步态怎么摆手臂」**
   （为什么纯侧视无法判断顺拐、用什么指标代替、双参考图路线、
   只许镜像姿态切片不许镜像成品帧）；§8.3 补上地面线取中位数后
   还要按最高帧**夹一下**（否则最高的过渡帧被顶出画面顶边）。
-- 新增 `docs/BUILTIN_PET_XIAOKA_PROMPT.md`：小卡的出图规格书
+- 新增 `docs/BUILTIN_PET_XIAOKA_PROMPT.md`（不进版本库）：小卡的出图规格书
   （角色锁定段、透明背景段、逐动作 Pose 段、清理与打包管线、验收口径）。
   其中 §2.5 是**实测定论**而不是设计意图 —— 模型在侧视行走上有一个极强的
   「近侧手在前、近侧腿在前」先验：i2i、纯文生图、逐肢钉死、换视角
@@ -200,7 +201,7 @@
 
 ## [0.1.0] - 2026-10-11
 
-首个版本。实现实施提示词 `2026-10-11-pet-plugin-implementation-prompt.md` 的全部阶段。
+首个版本。实现实施提示词 `2026-10-11-pet-plugin-implementation-prompt.md`（不进版本库）的全部阶段。
 
 ### 新增
 
@@ -273,7 +274,8 @@
 
 ### 与实施提示词的偏差
 
-以**宿主实际代码**为准，详见 `docs/HOST_FEEDBACK.md`：
+以**宿主实际代码**为准（当初逐条记录在 `docs/HOST_FEEDBACK.md`，该目录现已
+不进版本库，因此把结论留在这里）：
 
 1. `surfaces.register()` 在移动端**不返回空串**（提示词 §2.1 的说法与实测不符）——
    改为用 `api.surfaces.isOpen()` 判定是否真的挂载。
@@ -302,7 +304,6 @@
 写成修复提示词交给主程序仓库后已修复（`ST-Manager@715d0a8`）。
 本插件据此把通知图标换成自带的 `frontend/assets/icon.svg`，通知实现品牌化。
 
-- 完整论证与修复方案：`docs/HOST_TOAST_ICON_FIX_PROMPT.md`
+- 完整论证与修复方案：`docs/HOST_TOAST_ICON_FIX_PROMPT.md`（不进版本库）
 - 当时的实证数据：`tools/check_toast_icons.py`
 - 修复后的验收（5/5）：`tools/verify-toast-icon.mjs`
-- 宿主侧记录：`docs/HOST_FEEDBACK.md` 第 5 条
