@@ -84,7 +84,8 @@
       "frames": 4,
       "fps": 1.43,
       "loop": true,
-      "frameMs": [900, 500, 900, 500]
+      "frameMs": [900, 500, 900, 500],
+      "size": { "w": 627, "h": 353 }
     },
     "click": {
       "sheet": "click.png",
