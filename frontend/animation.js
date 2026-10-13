@@ -121,12 +121,53 @@ export function pickVariantIndex(variants, random = Math.random) {
   return list.length - 1;
 }
 
+/** 单帧尺寸的兜底值（与后端 `DEFAULT_SIZE` 一致）。 */
+export const DEFAULT_FRAME_SIZE = { w: 64, h: 64 };
+
+/**
+ * 取某套动画的单帧**逻辑**尺寸（未乘倍率）。
+ *
+ * 优先级：**变体自带 > 动作条目 > 包级**。
+ *
+ * 为什么动作能自带尺寸：一个动作的画布比例可能和别的动作根本不同。
+ * 典型例子是躺姿睡觉——人物横躺，画布是横构图（1672×941），
+ * 而站立动作是 2:3 竖构图（1024×1536）。若所有动作共用包级 `size`，
+ * 前端会按 `size` 去拉伸贴图，躺姿会被压扁变形。
+ *
+ * 逐级回落而不是只看变体，是为了**版本错配**也能跑：老后端不下发 `size`，
+ * 新前端就自然用包级的值，行为与从前完全一致。
+ *
+ * @param {object} variant 一套动画（可含 `size`）
+ * @param {object} [spec] 动作条目（可含 `size`）
+ * @param {object} [base] 包级 `size`
+ * @returns {{w: number, h: number}} 两个方向都是有限正数
+ */
+export function frameSizeOf(variant, spec, base) {
+  const candidates = [
+    variant && variant.size,
+    spec && spec.size,
+    base,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const w = Number(candidate.w);
+    const h = Number(candidate.h);
+    if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+      return { w, h };
+    }
+  }
+  return { w: DEFAULT_FRAME_SIZE.w, h: DEFAULT_FRAME_SIZE.h };
+}
+
 /**
  * 把「运行期动作条目」规范化成一组可播的变体。
  *
  * 优先读 `variants`（后端多套动画的输出），缺失时回退到条目本身的
  * `url` / `frames` / `fps` —— 老版本后端只给这些字段，而前后端是**可以
  * 各自升级**的（宿主缓存、用户手动替换插件目录都会造成版本错配）。
+ *
+ * `size` 一并带上（可能为 `undefined`，表示沿用包级）：几何必须和帧参数
+ * 一起流到播放处，否则换动作时会出现「帧参数换了、尺寸没换」的错位。
  *
  * @param {object} entry 运行期动作条目
  * @returns {Array} 至少一项；完全没有图时返回 `[]`
@@ -144,6 +185,7 @@ export function playableVariants(entry) {
       layout: item.layout === 'vertical' ? 'vertical' : 'horizontal',
       frameMs: Array.isArray(item.frameMs) ? item.frameMs.slice() : [],
       weight: normalizeWeight(item.weight),
+      size: item.size || undefined,
     }));
   }
   if (!source.url) return [];
@@ -155,6 +197,7 @@ export function playableVariants(entry) {
     layout: source.layout === 'vertical' ? 'vertical' : 'horizontal',
     frameMs: Array.isArray(source.frameMs) ? source.frameMs.slice() : [],
     weight: DEFAULT_WEIGHT,
+    size: source.size || undefined,
   }];
 }
 
@@ -182,6 +225,16 @@ export function stillFrame(pack) {
     // 是否由作者显式声明（`false` = 回落自 idle 首帧）。面板据此提示。
     declared: still.declared === true,
     source: String(still.source || 'idle'),
+    // 这一帧所在 sheet 的单帧尺寸；`undefined` = 沿用包级。
+    //
+    // 为什么标准图像也要带尺寸：它可以取自**任意一条** sheet（例如把躺姿
+    // `sleep.png` 的某一帧当门面），而那条 sheet 的画布比例可能与当前动作
+    // 完全不同。不带的话，`drawStill()` 只能用**当前动作**的 `width` / `height`
+    // 去铺它——横构图的图会被按竖构图拉伸（实测失真 62%）。
+    //
+    // 这个问题只有「标准图像」与「逐动作尺寸」同时存在时才出现，
+    // 因此是两条分支合并时才补上的。
+    size: still.size || undefined,
   };
 }
 

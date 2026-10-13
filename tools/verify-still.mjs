@@ -14,16 +14,84 @@
  * - 「重名不冲突」要真的建两个同名形象才看得出。
  */
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import zlib from 'node:zlib';
+
 import { launch } from './cdp.mjs';
 
 const BASE = process.env.PET_HOST_URL || `http://127.0.0.1:${process.env.PET_SANDBOX_PORT || 5099}`;
 const API = `${BASE}/api/plugins/stm-pet`;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * 影子宿主里插件的**用户形象目录**。
+ *
+ * 有一段验收要造一个「横构图与竖构图共存」的形象，而新建表单刻意把所有动作
+ * 对齐到同一尺寸（见 `store.create_pet`），因此只能直接落盘一个 pet.json——
+ * 这也正是作者表达这种包的实际做法（手写或导入 zip）。
+ */
+const userPetsDir = process.env.PET_USER_PETS_DIR || path.join(
+  os.tmpdir(), 'st-manager-pet-sandbox', 'data', 'plugins', 'stm-pet', 'data', 'pets',
+);
+
 const results = [];
 function record(name, ok, detail = '') {
   results.push({ name, ok, detail });
   process.stdout.write(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `\n        ${detail}` : ''}\n`);
+}
+
+/** 造一张纯色 PNG（不引图像库：仓库不新增依赖）。 */
+function solidPng(width, height, [r, g, b]) {
+  const raw = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y += 1) {
+    const row = y * (1 + width * 3);
+    raw[row] = 0; // filter: None
+    for (let x = 0; x < width; x += 1) {
+      const at = row + 1 + x * 3;
+      raw[at] = r;
+      raw[at + 1] = g;
+      raw[at + 2] = b;
+    }
+  }
+  const crcTable = (() => {
+    const table = new Int32Array(256);
+    for (let index = 0; index < 256; index += 1) {
+      let value = index;
+      for (let bit = 0; bit < 8; bit += 1) {
+        value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+      }
+      table[index] = value;
+    }
+    return table;
+  })();
+  const crc32 = (buffer) => {
+    let crc = -1;
+    for (let index = 0; index < buffer.length; index += 1) {
+      crc = (crc >>> 8) ^ crcTable[(crc ^ buffer[index]) & 0xff];
+    }
+    return crc ^ -1;
+  };
+  const chunk = (type, data) => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length, 0);
+    const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body) >>> 0, 0);
+    return Buffer.concat([length, body, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2; // truecolor
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
 }
 
 /** 从 `url("...")` 里取出 URL。 */
@@ -362,12 +430,130 @@ async function main() {
       `hasInput=${builtinAuthor.hasInput}，含「官方」=${builtinAuthor.text.includes('官方')}`,
     );
 
-    // ============================================== ④ 重名
+    // ============================================== ④ ★ 标准图像 × 逐动作尺寸
     //
-    // 建两个**同名**形象，确认：
-    //   a) 两个都在列表里；
-    //   b) 都能用（不是「后一个把前一个顶掉了」）；
-    //   c) 面板上靠 id 定位卡片（`data-pet-id`），不靠名字。
+    // 这是「标准图像」与「逐动作尺寸」两个特性**合到一起**才暴露的几何问题
+    // （两条分支各自单独存在时都看不出，因此是合并时才发现并修的）。
+    //
+    // 场景：把**横构图**（躺姿）那一帧设为标准图像。若标准图像不带自己的尺寸，
+    // `drawStill()` 只能用当前动作的竖构图几何去铺它 —— 图会被拉伸变形。
+    //
+    // 判定必须看**真实渲染**：根节点与 sprite 的 `background-size` 是否按
+    // 横构图的比例铺（宽 > 高），而不是按竖构图（高 > 宽）。
+    //
+    // 这个形象直接写进**用户形象目录**：新建表单刻意把所有动作对齐到同一尺寸
+    // （见 `store.create_pet` 的说明），因此「横竖构图共存」这个场景只能靠
+    // 手写 pet.json 或导入 zip 表达——那正是作者的实际做法。
+    const packDir = path.join(userPetsDir, 'landscape-still');
+    fs.rmSync(packDir, { recursive: true, force: true });
+    fs.mkdirSync(packDir, { recursive: true });
+    fs.writeFileSync(path.join(packDir, 'idle.png'), solidPng(64, 96, [0x44, 0xaa, 0x88]));
+    fs.writeFileSync(path.join(packDir, 'sleep.png'), solidPng(192, 108, [0x88, 0x44, 0xaa]));
+    fs.writeFileSync(path.join(packDir, 'pet.json'), JSON.stringify({
+      format: 1,
+      id: 'landscape-still',
+      name: '横构图标准图像',
+      author: '验收脚本',
+      size: { w: 384, h: 576 },
+      animations: {
+        idle: { sheet: 'idle.png', frames: 1 },
+        sleep: { sheet: 'sleep.png', frames: 1, size: { w: 400, h: 225 } },
+      },
+      // ★ 标准图像取自**横构图**的 sleep，且**不写** size（靠反推）
+      still: { sheet: 'sleep.png', frames: 1, frame: 0 },
+    }, null, 2), 'utf8');
+    created.push('landscape-still');
+
+    const landscape = await page.evaluate(`(async () => {
+      // 让插件重新读一遍形象列表（后端每次请求都会重新解析 pet.json）
+      const switched = await (await fetch('${API}/pets/active', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ petId: 'landscape-still' }),
+      })).json();
+      const runtime = await (await fetch('${API}/runtime')).json();
+      const pet = runtime.pet || {};
+      return {
+        id: pet.id || '',
+        switched: switched.success === true,
+        stillSize: pet.still ? pet.still.size : null,
+        sleepSize: pet.actions && pet.actions.sleep ? pet.actions.sleep.size : null,
+        packSize: pet.size,
+      };
+    })()`);
+
+    if (landscape.id) created.push(landscape.id);
+
+    record(
+      '④ ★ 标准图像从来源 sheet 反推出尺寸（横构图）',
+      landscape.switched && Boolean(landscape.stillSize)
+        && landscape.stillSize.w === 400 && landscape.stillSize.h === 225,
+      `id=${landscape.id}，still.size=${JSON.stringify(landscape.stillSize)}，sleep.size=${JSON.stringify(landscape.sleepSize)}，包级=${JSON.stringify(landscape.packSize)}`,
+    );
+
+    // 刷新页面让桌面的宠物换成新形象。
+    //
+    // 为什么不直接调 `/pets/active`：那个接口只改后端的设置，**不会**通知
+    // 已经在运行的宠物（真实的切换路径是面板点卡片 → 前端重新取运行期定义）。
+    // 刷新是最贴近「用户下次打开就生效」的验法，也顺带覆盖了启动路径。
+    await page.navigate(BASE, { timeout: 30000 });
+    await page.waitFor('Boolean(window.__petApi)', { timeout: 20000, label: '刷新后激活' });
+    await page.waitFor(`Boolean(window.__petView)`, { timeout: 15000, label: '宠物视图' });
+    await sleep(1500);
+
+    // 等它回到静止（静止时画的才是标准图像）
+    await page.evaluate(`(async () => {
+      const view = window.__petView;
+      const deadline = performance.now() + 12000;
+      while (performance.now() < deadline) {
+        if (view && view.state === 'idle' && !view.idleBursting) break;
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      return true;
+    })()`);
+    await sleep(800);
+
+    const rendered = await page.evaluate(`(() => {
+      const root = document.querySelector('[data-plugin="stm-pet"].pet-root');
+      const sprite = root.querySelector('.pet-sprite');
+      const size = getComputedStyle(sprite).backgroundSize.split(' ');
+      const rootBox = root.getBoundingClientRect();
+      const view = window.__petView;
+      return {
+        bg: getComputedStyle(sprite).backgroundImage,
+        bgW: parseFloat(size[0]) || 0,
+        bgH: parseFloat(size[1]) || 0,
+        rootW: Math.round(rootBox.width),
+        rootH: Math.round(rootBox.height),
+        viewStillSize: view && view.still ? view.still.size : null,
+      };
+    })()`);
+
+    record(
+      '④ ★ 静止时按**横构图**铺标准图像（宽 > 高，没被拉伸成竖构图）',
+      rendered.bg.includes('/still')
+        && rendered.bgW > rendered.bgH
+        && rendered.rootW > rendered.rootH,
+      `background-size=${rendered.bgW}x${rendered.bgH}，根节点=${rendered.rootW}x${rendered.rootH}，still.size=${JSON.stringify(rendered.viewStillSize)}`,
+    );
+
+    // 切回内置形象，免得后面的检查受它影响
+    // （列表里内置形象的特征是 `writable: false`）
+    await page.evaluate(`(async () => {
+      const list = await (await fetch('${API}/pets')).json();
+      const builtin = (list.items || []).find((i) => i.writable === false);
+      if (builtin) {
+        await fetch('${API}/pets/active', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ petId: builtin.id }),
+        });
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+      return true;
+    })()`);
+
+    // ============================================== ⑤ 重名
     const dup = await page.evaluate(`(async () => {
       const mk = async (label) => {
         const canvas = document.createElement('canvas');
@@ -402,14 +588,14 @@ async function main() {
     if (dup.secondId) created.push(dup.secondId);
 
     record(
-      '④ ★ 允许重名：两个同名形象并存，各有独立 id 且都能用',
+      '⑤ ★ 允许重名：两个同名形象并存，各有独立 id 且都能用',
       dup.count === 2 && dup.firstId !== dup.secondId
         && dup.ids.length === 2 && dup.errors.every((e) => !e),
       `ids=${JSON.stringify(dup.ids)}，authors=${JSON.stringify(dup.authors)}，errors=${JSON.stringify(dup.errors)}`,
     );
 
     record(
-      '④ 同名形象靠**作者**区分（署名让重名不再含糊）',
+      '⑤ 同名形象靠**作者**区分（署名让重名不再含糊）',
       dup.authors.length === 2 && dup.authors.every((a) => a === '验收脚本'),
       JSON.stringify(dup.authors),
     );
@@ -426,7 +612,7 @@ async function main() {
       };
     })()`);
     record(
-      '④ 面板上两张同名卡片都在，且各自带 data-pet-id（可精确定位）',
+      '⑤ 面板上两张同名卡片都在，且各自带 data-pet-id（可精确定位）',
       dupCards.count === 2 && dupCards.ids.every(Boolean),
       JSON.stringify(dupCards),
     );
@@ -434,7 +620,7 @@ async function main() {
     // ============================================== 无控制台错误
     const relevant = consoleErrors.filter((line) => !line.includes('favicon'));
     record(
-      '⑤ 运行期无未捕获异常 / 错误日志',
+      '⑥ 运行期无未捕获异常 / 错误日志',
       relevant.length === 0,
       relevant.slice(0, 4).join('\n        '),
     );

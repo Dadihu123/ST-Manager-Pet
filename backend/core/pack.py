@@ -304,6 +304,16 @@ class AnimationVariant:
     frame_ms: list = field(default_factory=list)
     #: 权重（**相对比例**，不是百分比）。见 `DEFAULT_WEIGHT` 的说明。
     weight: float = DEFAULT_WEIGHT
+    #: **这一套动画自己的单帧尺寸**（逻辑像素）；`None` 表示沿用包级 `size`。
+    #:
+    #: 为什么需要它：一个动作的画布比例可能和别的动作根本不同。典型例子是
+    #: 「躺下睡觉」——人物横躺，画布自然是**横构图**（例如 1672×941），
+    #: 而站立动作是 2:3 竖构图（1024×1536）。若强行共用一个 `size`，
+    #: 前端会按 `size` 去拉伸贴图，躺姿会被压扁变形。
+    #:
+    #: 挂在这一层（而不是动作层）是因为「画布尺寸」是**图本身的属性**：
+    #: 多套动画可以各自是不同尺寸的图，前端换套播时几何要跟着换。
+    size: dict = None
 
     @property
     def total_ms(self) -> float:
@@ -323,7 +333,7 @@ class AnimationVariant:
         return round(self.frames * 1000.0 / total, 2)
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             'sheet': self.sheet,
             'frames': self.frames,
             'fps': self.fps,
@@ -332,6 +342,10 @@ class AnimationVariant:
             'frameMs': list(self.frame_ms),
             'weight': self.weight,
         }
+        # 只在**真的声明了**独立尺寸时才写这个字段：绝大多数包不该多出噪音
+        if self.size:
+            payload['size'] = dict(self.size)
+        return payload
 
 
 @dataclass
@@ -458,9 +472,11 @@ class ResolvedVariant:
     layout: str = 'horizontal'
     frame_ms: list = field(default_factory=list)
     weight: float = DEFAULT_WEIGHT
+    #: 这一套动画自己的单帧尺寸；`None` 表示沿用包级 `size`（见 `AnimationVariant.size`）。
+    size: dict = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             'sheet': self.sheet,
             'frames': self.frames,
             'fps': self.fps,
@@ -469,6 +485,9 @@ class ResolvedVariant:
             'frameMs': list(self.frame_ms),
             'weight': self.weight,
         }
+        if self.size:
+            payload['size'] = dict(self.size)
+        return payload
 
 
 @dataclass
@@ -497,6 +516,12 @@ class ResolvedAction:
     #: 这个动作的**全部**可播变体（多套动画时按 `weight` 随机选一套播）。
     #: 上面那组字段是**主变体**的透传，方便只关心单套动画的调用方。
     variants: list = field(default_factory=list)
+    #: 主变体自己的单帧尺寸；`None` 表示沿用包级 `size`。
+    #:
+    #: 与「节奏」是两件不同的事：尺寸是**图本身的属性**（躺姿是横构图），
+    #: 因此留在动作层；而节奏上移到了形象级 `schedule`（`roam` 不是动作，
+    #: 挂不到动作下面）。两者都在本轮里落地，互不影响。
+    size: dict = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -514,6 +539,8 @@ class ResolvedAction:
             'note': self.note,
             'variants': [variant.to_dict() for variant in self.variants],
         }
+        if self.size:
+            payload['size'] = dict(self.size)
         return payload
 
 
@@ -547,9 +574,19 @@ class StillImage:
     declared: bool = False
     #: 来源动作名（`'still'` 或 `'idle'`），供 UI 解释与排查。
     source: str = 'idle'
+    #: 这一帧所在 sheet 的**单帧尺寸**；`None` 表示沿用包级 `size`。
+    #:
+    #: 为什么标准图像也需要它：标准图像可以取自**任意一条** sheet
+    #: （例如把躺姿 `sleep.png` 的某一帧当门面），而那条 sheet 的画布比例
+    #: 可能与当前动作完全不同。不带尺寸的话，前端会用**当前动作**的
+    #: `width` / `height` 去铺它——横构图的图被按竖构图拉伸（实测失真 62%）。
+    #:
+    #: 这个问题只有「标准图像」与「逐动作尺寸」两个功能**同时存在**时才出现，
+    #: 因此两条分支各自都测不出来，是合并时才发现并补上的。
+    size: dict = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             'sheet': self.sheet,
             'frames': self.frames,
             'frame': self.frame,
@@ -557,6 +594,9 @@ class StillImage:
             'declared': self.declared,
             'source': self.source,
         }
+        if self.size:
+            payload['size'] = dict(self.size)
+        return payload
 
 
 @dataclass
@@ -654,6 +694,7 @@ class PetPack:
                     sheet=primary.sheet, frames=primary.frames, fps=primary.fps,
                     loop=primary.loop, layout=primary.layout,
                     frame_ms=list(primary.frame_ms),
+                    size=dict(primary.size) if primary.size else None,
                     mirror=mirrored,
                     chain=chain, note=note,
                     variants=[
@@ -663,6 +704,9 @@ class PetPack:
                             layout=variant.layout,
                             frame_ms=list(variant.frame_ms),
                             weight=variant.weight,
+                            # 每套动画可以各自不同尺寸（横构图 / 竖构图共存），
+                            # 前端换套播时几何要跟着换，因此必须逐套透传。
+                            size=dict(variant.size) if variant.size else None,
                         )
                         for variant in variants
                     ],
@@ -698,9 +742,13 @@ class PetPack:
             action=STILL_ACTION, source=still.source, kind=KIND_ANIMATED,
             sheet=still.sheet, frames=still.frames, fps=1, loop=False,
             layout=still.layout, chain=[STILL_ACTION],
+            # 标准图像自己的尺寸（来自它所在的 sheet）要一并透传：
+            # `ResolvedAction.size` 是「主变体的尺寸」，而标准图像就是它的主变体。
+            size=dict(still.size) if still.size else None,
             variants=[ResolvedVariant(
                 sheet=still.sheet, frames=still.frames, fps=1, loop=False,
                 layout=still.layout,
+                size=dict(still.size) if still.size else None,
             )],
         )
 
@@ -716,9 +764,22 @@ class PetPack:
         动画（内置形象的「张望」就是第二套），而「标准图像」的语义是
         **一个固定的标准姿势**——与「这次随机抽到了哪一套」无关。
         回落只保证「作者没声明时不会崩」，不保证它一定好看。
+
+        尺寸的处理（与「逐动作尺寸」这个特性的交叉点）：
+
+        - 标准图像自己声明了 `size` → 用它；
+        - 没声明 → 尝试**从它引用的 sheet 反推**（见 `_size_for_sheet`）：
+          作者写 `still: {"sheet": "sleep.png"}` 时，`sleep` 动作的尺寸
+          就是这张图的尺寸，两者必然一致；
+        - 反推不到 → `None`，前端回落到包级 `size`。
+
+        为什么要反推：不推的话，作者从横构图 sheet 里挑一帧当门面时
+        必须**记得**再写一遍 `size`，忘了就会被按竖构图拉伸——而那正是
+        「逐动作尺寸」这个特性要解决的同一个问题。
         """
         still = self.still
         if still is not None and still.sheet:
+            size = dict(still.size) if still.size else self._size_for_sheet(still.sheet)
             return StillImage(
                 sheet=still.sheet,
                 frames=max(1, int(still.frames)),
@@ -726,6 +787,7 @@ class PetPack:
                 layout=still.layout,
                 declared=True,
                 source=STILL_ACTION,
+                size=size,
             )
 
         # 回落：idle 的主变体首帧
@@ -738,8 +800,30 @@ class PetPack:
                 layout=resolved.layout,
                 declared=False,
                 source=resolved.source or 'idle',
+                # ★ 回落路径必须**继承 idle 那条 sheet 的尺寸**：
+                # idle 自己声明了 `size` 时（少见但合法），标准图像与它同源，
+                # 几何必须一致，否则静止画面与待机动画会互相错位。
+                size=dict(resolved.size) if resolved.size else None,
             )
         return StillImage()
+
+    def _size_for_sheet(self, sheet: str) -> dict:
+        """从「哪条 sheet」反推单帧尺寸；找不到返回 `None`。
+
+        只在作者**没写** `still.size` 时兜底。匹配的是 sheet 路径
+        （规范化之后比较，`./idle.png` 与 `idle.png` 视为同一条），
+        遍历所有动作的所有变体——标准图像完全可能取自某个变体。
+        """
+        target = to_posix(sheet).strip()
+        if not target:
+            return None
+        for spec in self.animations.values():
+            for variant in spec.variants:
+                if not variant.sheet or not variant.size:
+                    continue
+                if to_posix(variant.sheet).strip() == target:
+                    return dict(variant.size)
+        return None
 
     def missing_required(self) -> list:
         """缺失的「必要动作」列表（**不是错误**，但要告诉用户会怎么降级）。
@@ -1126,6 +1210,16 @@ def _parse_still(raw_value, *, allow_source_jpeg: bool = False) -> StillImage:
         layout=layout.strip().lower(),
         declared=True,
         source=STILL_ACTION,
+        # 可选：标准图像所在 sheet 的单帧尺寸。不写就是「沿用包级」。
+        #
+        # 为什么标准图像需要自己的尺寸：它可以取自**任意一条** sheet
+        # （例如把躺姿 `sleep.png` 的某一帧当门面），而那条 sheet 的比例
+        # 可能与当前动作完全不同。没有它，前端只能拿当前动作的几何去铺，
+        # 横构图的图会被按竖构图拉伸。
+        #
+        # 复用 `_parse_variant_size`：语义与报错提示（「这是逻辑尺寸、
+        # 不是源图像素尺寸」）与动作级 `size` 完全一致，作者不必记两套规则。
+        size=_parse_variant_size(raw_value.get('size'), 'still'),
     )
 
 
@@ -1217,9 +1311,59 @@ def _parse_variant(
         )
     variant.layout = layout.strip().lower()
 
+    # 这一套动画**自己的**单帧尺寸（可选）。不写就沿用包级 `size`。
+    variant.size = _parse_variant_size(raw_value.get('size'), where)
+
     if with_weight:
         variant.weight = _read_weight(raw_value, 'weight')
     return variant
+
+
+def _parse_variant_size(raw, where: str) -> dict:
+    """解析某一套动画自己的单帧尺寸（可选字段）。
+
+    返回值：`None` 表示「没声明，沿用包级 `size`」；否则是 `{'w': int, 'h': int}`。
+
+    为什么要单独写一个解析器而不是复用 `_parse_mapping`：那个函数是给**包级**
+    `size` 用的，它把缺省值当默认，而这里的语义是「没写就是没有」——
+    必须能区分「作者没声明」和「作者声明了和包级一样的值」，否则
+    `to_dict()` 会凭空给每个包都补上一个 `size` 字段。
+
+    ⚠️ 这里的是**逻辑显示尺寸**，不是源图的像素尺寸。既有形象的做法是
+    源图 1024×1536 配逻辑 384×576（密度 8/3）。作者若直接写源图像素尺寸，
+    多数情况会撞上 1024 的上限——因此上限报错里明确点出这个区别。
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise _field_error(
+            f'{where}.size', '应为对象',
+            hint='写成 {"w": 627, "h": 353} 这种形式。',
+        )
+
+    # 自己校验两个方向的取值，而不是复用 `_parse_mapping`：
+    # 那个函数报错时用的是裸键名（`w`），看不出「这是动作级 size」，
+    # 更没法附上「逻辑尺寸 vs 源图像素尺寸」这条最关键的提示。
+    result = {}
+    for key, default in (('w', DEFAULT_SIZE['w']), ('h', DEFAULT_SIZE['h'])):
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise _field_error(
+                f'{where}.size.{key}', '应为数字',
+                hint=f'把 {key} 写成一个数字，例如 {{"w": 627, "h": 353}}。',
+            )
+        number = float(value)
+        if not (_MIN_FRAME_SIZE <= number <= _MAX_FRAME_SIZE):
+            raise _field_error(
+                f'{where}.size.{key}',
+                f'应在 {_MIN_FRAME_SIZE} ~ {_MAX_FRAME_SIZE} 之间，实际为 {value}',
+                hint=f'这里填的是**逻辑显示尺寸**，不是源图像素尺寸。'
+                     f'既有形象的做法是源图 1024px 配逻辑 384px（密度 8/3），'
+                     f'请照此换算：源 1672px 宽 → 填 {round(1672 * 3 / 8)}。'
+                     f'上限为 {_MAX_FRAME_SIZE}。',
+            )
+        result[key] = int(round(number))
+    return result
 
 
 def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False) -> AnimationSpec:
@@ -1286,7 +1430,7 @@ def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False)
             )
         # 顶层不该再混写单套字段（见 docstring）
         stray = sorted(
-            key for key in ('sheet', 'frames', 'fps', 'loop', 'layout', 'frameMs')
+            key for key in ('sheet', 'frames', 'fps', 'loop', 'layout', 'frameMs', 'size')
             if key in raw_value
         )
         if stray:

@@ -1120,6 +1120,9 @@ class PetStore:
             'name': pack.name,
             'author': pack.author,
             'size': dict(pack.size),
+            # 包级 `size` 是**默认值**；每个动作可以在自己的动画声明里覆盖它
+            # （`animations.<动作>.size`）。躺姿这类横构图的动作必须能覆盖，
+            # 否则前端会按竖构图的 `size` 把贴图拉伸变形。
             'anchor': dict(pack.anchor),
             'physics': dict(pack.physics),
             # 生效值（已按「用户设置 > 包内声明 > 默认」算好）——前端直接用，

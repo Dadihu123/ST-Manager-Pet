@@ -134,6 +134,47 @@ def test_petview_can_update_the_schedule_in_place(petview):
     assert 'walkTimer' in body, '改完要重排漫游定时器'
 
 
+def test_still_frame_carries_its_own_size(animation):
+    """★ 标准图像的几何要**跟着它自己那条 sheet** 走。
+
+    这是「标准图像」与「逐动作尺寸」合到一起才暴露的问题：标准图像可以取自
+    任意一条 sheet（例如躺姿 `sleep.png` 的某一帧），而那条 sheet 的比例
+    可能与当前动作完全不同。不带尺寸的话，`drawStill()` 只能用当前动作的
+    `width` / `height` 去铺它——横构图的图被按竖构图拉伸（实测失真 62%）。
+    """
+    assert 'size: still.size || undefined' in animation, (
+        'stillFrame 必须透传 size'
+    )
+
+
+def test_still_getter_exposes_size(petview):
+    """诊断句柄要能读到标准图像的尺寸。
+
+    几何算错时界面**看着有图**，只是显示的是被拉伸的那一张——
+    没有这个值就只能靠量像素去猜（实测踩过：`viewStillSize` 读出来是
+    `undefined`，于是「后端对了没有、前端用了没有」两件事分不清）。
+    """
+    body = petview[petview.index('get still()'):]
+    body = body[:body.index('\n    },')]
+    assert 'size: still.size' in body, '标准图像的 size 要能被读到'
+
+
+def test_draw_still_applies_its_own_geometry(petview):
+    """★ `drawStill()` 要**先切几何再绘制**，并在尺寸变化时重算位移。
+
+    只写 `background-size` 而不改 `width` / `height` 是不够的：
+    那两处同时进了「包围盒中心 → 左上角」的换算，不重算宠物会偏出去一段。
+    """
+    body = petview[petview.index('function drawStill()'):]
+    body = body[:body.index('\n  }')]
+    assert 'applyFrameSize(' in body, '要先应用标准图像自己的几何'
+    assert 'drawPosition()' in body, '尺寸变了要立刻重算位移'
+    # 顺序：几何必须在写 background-size 之前
+    assert body.index('applyFrameSize(') < body.index('backgroundSize'), (
+        '几何必须在写 background-size 之前切好，否则会按旧尺寸铺一帧'
+    )
+
+
 def test_plugin_pushes_the_schedule_to_the_running_pet(plugin):
     """`plugin.js` 要在**视图重建后**把节奏重新灌进去。
 

@@ -28,6 +28,7 @@ from backend.core.pack import (  # noqa: E402
     SCHEDULE_BEHAVIORS,
     STILL_ACTION,
 )
+from backend.core.errors import PetError  # noqa: E402
 from backend.core.store import PetStore  # noqa: E402
 from fake_api import FakeApi, build_app  # noqa: E402
 from pet_test_support import make_image_bytes, write_pack  # noqa: E402
@@ -149,6 +150,145 @@ def test_effective_pixelated_survives_a_broken_pack(tmp_path):
     store = PetStore(str(data), str(builtin))
     # 不抛异常即可（值本身是默认的平滑渲染）
     assert store.effective_pixelated('broken') is False
+
+
+def test_still_inherits_size_from_its_source_sheet(env):
+    """★ 标准图像的**几何**必须跟着它自己那条 sheet 走。
+
+    这是「标准图像」与「逐动作尺寸」两个特性**合到一起**才暴露的问题：
+    各自单独存在时都看不出——因此它是在合并两条分支时才被发现并修掉的。
+
+    场景：作者把躺姿（横构图 627×353）的某一帧设为标准图像。若不带尺寸，
+    前端只能用**当前动作**的几何（竖构图 384×576）去铺它，横构图的图
+    会被按竖构图拉伸（实测失真 62%）。
+
+    这里验的是「作者没写 `size` 时能**从 sheet 反推**」——反推不成立的话，
+    作者从横构图 sheet 里挑一帧时就必须记得再写一遍 `size`，忘了就变形，
+    而那正是「逐动作尺寸」这个特性要解决的同一个问题。
+    """
+    _app, store, _client, _api = env
+    write_pack(store.user_pets_dir(), 'cross', payload={
+        'id': 'cross',
+        'name': '交叉',
+        'size': {'w': 384, 'h': 576},
+        'animations': {
+            'idle': {'sheet': 'idle.png', 'frames': 1},
+            # 躺姿：横构图，且**声明了自己的尺寸**
+            'sleep': {'sheet': 'sleep.png', 'frames': 1, 'size': {'w': 627, 'h': 353}},
+        },
+        # 标准图像取自躺姿那条 sheet，但**没写** size
+        'still': {'sheet': 'sleep.png', 'frames': 1, 'frame': 0},
+    }, sheets={'idle.png': 1, 'sleep.png': 1})
+
+    runtime = store.runtime_pack('cross')
+    assert runtime['still']['size'] == {'w': 627, 'h': 353}, (
+        '标准图像应当从来源 sheet 反推出尺寸'
+    )
+    # 没有 size 的动作仍然不写字段（老行为不变）
+    assert 'size' not in runtime['actions']['idle']
+
+
+def test_still_explicit_size_wins_over_inference(env):
+    """作者**显式**写了 `still.size` 时以它为准（反推只是兜底）。"""
+    _app, store, _client, _api = env
+    write_pack(store.user_pets_dir(), 'explicit', payload={
+        'id': 'explicit',
+        'name': '显式',
+        'animations': {
+            'idle': {'sheet': 'idle.png', 'frames': 1, 'size': {'w': 627, 'h': 353}},
+        },
+        'still': {'sheet': 'idle.png', 'frames': 1, 'size': {'w': 200, 'h': 300}},
+    }, sheets={'idle.png': 1})
+
+    runtime = store.runtime_pack('explicit')
+    assert runtime['still']['size'] == {'w': 200, 'h': 300}
+
+
+def test_still_fallback_inherits_idle_size(env):
+    """回落路径（没声明 still）要**继承 idle 那条 sheet 的尺寸**。
+
+    idle 声明了自己的 `size` 时，标准图像与它同源，几何必须一致——
+    否则静止画面与待机动画会互相错位（一个按包级铺、一个按动作级铺）。
+    """
+    _app, store, _client, _api = env
+    write_pack(store.user_pets_dir(), 'fallback', payload={
+        'id': 'fallback',
+        'name': '回落',
+        'size': {'w': 384, 'h': 576},
+        'animations': {
+            'idle': {'sheet': 'idle.png', 'frames': 1, 'size': {'w': 500, 'h': 250}},
+        },
+    }, sheets={'idle.png': 1})
+
+    runtime = store.runtime_pack('fallback')
+    assert runtime['still']['declared'] is False
+    assert runtime['still']['size'] == {'w': 500, 'h': 250}, (
+        '回落自 idle 的标准图像要继承 idle 的尺寸'
+    )
+
+
+def test_still_without_any_size_stays_absent(env):
+    """完全没有尺寸信息时**不写** `size` 字段（前端回落到包级）。
+
+    凭空补一个包级尺寸进 payload 会让「作者到底声明了没有」变得不可知，
+    也会让老前端的输出对比测试全部失效。
+    """
+    _app, store, _client, _api = env
+    write_pack(store.user_pets_dir(), 'plain', payload={
+        'id': 'plain',
+        'name': '朴素',
+        'animations': {'idle': {'sheet': 'idle.png', 'frames': 1}},
+        'still': {'sheet': 'idle.png', 'frames': 1},
+    }, sheets={'idle.png': 1})
+
+    runtime = store.runtime_pack('plain')
+    assert 'size' not in runtime['still']
+
+
+def test_still_size_survives_pack_roundtrip(env):
+    """`still.size` 要能原样写回 `pet.json`（导出形象包时不能丢）。"""
+    _app, store, _client, _api = env
+    write_pack(store.user_pets_dir(), 'round', payload={
+        'id': 'round',
+        'name': '往返',
+        'animations': {'idle': {'sheet': 'idle.png', 'frames': 1}},
+        'still': {'sheet': 'idle.png', 'frames': 1, 'size': {'w': 627, 'h': 353}},
+    }, sheets={'idle.png': 1})
+
+    with open(os.path.join(store.user_pets_dir(), 'round', 'pet.json'),
+              encoding='utf-8') as handle:
+        stored = json.load(handle)
+    assert stored['still']['size'] == {'w': 627, 'h': 353}
+
+
+def test_still_size_is_optional_and_validated(env):
+    """`still.size` 的取值校验与动作级 `size` 一致（复用同一个解析器）。
+
+    注意校验发生在**加载**时（`write_pack` 只写文件、不解析），
+    因此这里要真的去读一次运行期定义。
+    """
+    _app, store, _client, _api = env
+    # 非对象 → 报错
+    write_pack(store.user_pets_dir(), 'bad1', payload={
+        'id': 'bad1',
+        'animations': {'idle': {'sheet': 'idle.png', 'frames': 1}},
+        'still': {'sheet': 'idle.png', 'size': 'big'},
+    }, sheets={'idle.png': 1})
+    with pytest.raises(PetError) as info:
+        store.runtime_pack('bad1')
+    assert 'still.size' in str(info.value)
+
+    # 超过单帧上限 → 报错（并提示「这是逻辑尺寸、不是源图像素尺寸」）
+    write_pack(store.user_pets_dir(), 'bad2', payload={
+        'id': 'bad2',
+        'animations': {'idle': {'sheet': 'idle.png', 'frames': 1}},
+        'still': {'sheet': 'idle.png', 'size': {'w': 4000, 'h': 4000}},
+    }, sheets={'idle.png': 1})
+    with pytest.raises(PetError) as info:
+        store.runtime_pack('bad2')
+    # 提示在 `hint` 里（面向作者的补充说明），不拼进 `msg`
+    assert '逻辑显示尺寸' in info.value.hint
+    assert '源图像素尺寸' in info.value.hint
 
 
 def test_builtin_still_geometry_is_pixel_exact():

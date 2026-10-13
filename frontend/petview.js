@@ -17,6 +17,7 @@
 import {
   animationDuration,
   createBehaviorScheduler,
+  frameSizeOf,
   playableVariants,
   pickVariantIndex,
   stillFrame,
@@ -119,8 +120,11 @@ export function createPetView(options = {}) {
   const actions = pack.actions || {};
   const baseSize = pack.size || { w: 64, h: 64 };
   const scale = clamp(Number(config.scale) || 1, SCALE_MIN, SCALE_MAX);
-  const width = Math.max(8, Math.round(baseSize.w * scale));
-  const height = Math.max(8, Math.round(baseSize.h * scale));
+  // 单帧的**显示**尺寸。它是 `let` 而不是 `const`：动作可以自带画布尺寸
+  // （见 `frameSizeOf`），换动作时这三处几何要一起换——根节点尺寸、切帧几何、
+  // 物理包围盒。留成同名变量，所有既有用法不必改。
+  let width = Math.max(8, Math.round(baseSize.w * scale));
+  let height = Math.max(8, Math.round(baseSize.h * scale));
   const anchorX = Number(pack.anchor?.x ?? 0.5);
   const anchorY = Number(pack.anchor?.y ?? 1);
 
@@ -252,6 +256,30 @@ export function createPetView(options = {}) {
     return actions[name] || null;
   }
 
+  /**
+   * 把「当前这一套动画」的几何同步到四处：根节点尺寸、物理包围盒、贴图铺法、切帧偏移。
+   *
+   * 这四处**必须一起改**：只改其中一部分的后果分别是
+   * 「宠物框住一大片空白」「切帧错位露出邻帧」「脚底悬空/陷进地面」。
+   * 返回是否真的变了，没变就不做多余的 DOM 写入。
+   *
+   * 尺寸取自 `animation.js:frameSizeOf`（**变体自带 > 动作条目 > 包级**）。
+   */
+  function applyFrameSize(variant, spec) {
+    const logical = frameSizeOf(variant, spec, baseSize);
+    const nextWidth = Math.max(8, Math.round(logical.w * scale));
+    const nextHeight = Math.max(8, Math.round(logical.h * scale));
+    if (nextWidth === width && nextHeight === height) return false;
+    width = nextWidth;
+    height = nextHeight;
+    root.style.width = `${width}px`;
+    root.style.height = `${height}px`;
+    // 物理包围盒：`setSize` 会把 x 夹回可见区，y（脚底）不动——
+    // 于是换动作时脚仍然踩在同一处地面，不会因为换了尺寸而跳一下。
+    physics.setSize({ width, height });
+    return true;
+  }
+
   /** 当前生效的速度倍率（含宿主忙碌 / 弹层打开时的额外放慢）。 */
   function currentSpeed() {
     let speed = animSpeed;
@@ -322,6 +350,19 @@ export function createPetView(options = {}) {
     root.dataset.petAction = next;
     root.dataset.petVariant = variant ? String(index) : '';
 
+    // 换动作可能同时换**画布尺寸**（例如躺姿的 sleep 是横构图）。
+    // 必须在写 `background-size` 与 `drawPosition()` **之前**完成：
+    // 下面两处都用 `width` / `height` 算铺法与位移，顺序反了会按旧尺寸铺一帧。
+    // 尺寸没变时它是空操作，因此绝大多数动作切换没有额外开销。
+    const sizeChanged = applyFrameSize(variant, spec);
+    if (sizeChanged) {
+      // 尺寸变了就**立刻**重算位移。不能只靠 rAF 里的 `drawPosition()`：
+      // 那个调用受 `moved > 0.01` 门控，而静息状态（宠物站着不动、循环已停）
+      // 正好不满足条件——于是换到不同尺寸的动作后，宠物会一直停在
+      // 按旧尺寸算出的位移上，看起来是「换动作后瞬移了一段」。
+      drawPosition();
+    }
+
     if (variant) {
       // spritesheet + background-position：换帧只改绘制，不走网络与解码（§2.5）
       const frameW = variant.layout === 'vertical'
@@ -366,12 +407,27 @@ export function createPetView(options = {}) {
    * 于是随机播到「张望」之后，宠物就卡在**抬头看**的姿势上不动了。
    * 正确语义是「不播动画时显示一个固定的标准姿势」，与刚刚播过什么无关。
    *
+   * ⚠️ **几何必须跟着标准图像自己走**，不能沿用当前动作的 `width` / `height`：
+   * 标准图像可以取自任意一条 sheet（例如躺姿 `sleep.png` 的某一帧），
+   * 而那条 sheet 的比例可能与当前动作完全不同。用当前动作的几何去铺它，
+   * 横构图的图会被按竖构图拉伸（实测失真 62%）。
+   *
+   * 这也是「标准图像」与「逐动作尺寸」两个特性**合到一起**才暴露的问题：
+   * 各自单独存在时都看不出——所以修在合并时。
+   *
    * `still` 为 `null`（后端一张图都没给）时保持当前绘制不动，
    * 而不是清空背景——清空会让宠物凭空消失。
    */
   function drawStill() {
     if (!still) return;
     currentVariant = null;
+    // 切到标准图像的几何（变体自带 > 包级）。`applyFrameSize` 会一并处理
+    // 根节点尺寸与物理包围盒——与换动作走的是同一条路径，避免两处漂移。
+    if (applyFrameSize({ size: still.size }, null)) {
+      // 尺寸真的变了就必须立刻重算位移：`width` / `height` 同时进了
+      // 「包围盒中心 → 左上角」的换算，不重算的话宠物会偏出去一段。
+      drawPosition();
+    }
     sprite.style.backgroundImage = `url("${still.url}")`;
     sprite.style.backgroundRepeat = 'no-repeat';
     const frameW = still.layout === 'vertical'
@@ -1065,6 +1121,10 @@ export function createPetView(options = {}) {
         layout: still.layout,
         declared: still.declared,
         source: still.source,
+        // 标准图像自己的单帧尺寸（`undefined` = 沿用包级）。
+        // 暴露它是为了可诊断：几何算错时界面「看着有图」，只是显示的是
+        // 被拉伸的那一张——没有这个值就只能靠量像素去猜。
+        size: still.size,
         /** 当前 sprite 上的背景图是否就是标准图像。 */
         showing: sprite.style.backgroundImage.includes(still.url),
       };
