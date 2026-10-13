@@ -18,12 +18,14 @@ import { test } from 'node:test';
 
 import {
   animationDuration,
+  createBehaviorScheduler,
   createIdleScheduler,
-  DEFAULT_IDLE_MAX_MS,
-  DEFAULT_IDLE_MIN_MS,
+  DEFAULT_SCHEDULE_MS,
   normalizeWeight,
   pickVariantIndex,
   playableVariants,
+  SCHEDULE_BEHAVIORS,
+  stillFrame,
 } from '../../frontend/animation.js';
 import { createFrameClock, MAX_FPS, normalizeFrameMs } from '../../frontend/clock.js';
 import {
@@ -268,59 +270,135 @@ test('动作时长：非法输入返回 0（调用方自己兜底，而不是 Na
   assert.equal(animationDuration({ frames: 4, fps: 0, frameMs: [] }), 0);
 });
 
-// ================================================== idle 随机触发（第 1 项）
+// ============================== 时间驱动行为的触发节奏（本轮新增）
 
-
-test('idle 调度：抽出的间隔落在配置区间内', () => {
-  const scheduler = createIdleScheduler({
-    minMs: 6000, maxMs: 18000, random: () => 0,
-  });
-  assert.equal(scheduler.reschedule(), 6, 'random=0 → 取下界');
-  const high = createIdleScheduler({ minMs: 6000, maxMs: 18000, random: () => 0.999999 });
-  assert.ok(high.reschedule() <= 18 && high.reschedule() >= 6);
+test('节奏调度：抽出的间隔落在配置区间内', () => {
+  const scheduler = createBehaviorScheduler({ random: () => 0 });
+  scheduler.setSchedule({ idle: { minIntervalMs: 6000, maxIntervalMs: 18000 } });
+  assert.equal(scheduler.reschedule('idle'), 6, 'random=0 → 取下界');
+  const high = createBehaviorScheduler({ random: () => 0.999999 });
+  high.setSchedule({ idle: { minIntervalMs: 6000, maxIntervalMs: 18000 } });
+  assert.ok(high.reschedule('idle') <= 18 && high.reschedule('idle') >= 6);
 });
 
-test('idle 调度：每次都是**重新抽**（不是固定周期）', () => {
+test('节奏调度：每次都是**重新抽**（不是固定周期）', () => {
   // 固定周期看起来像节拍器；「它自己想动一下」才像活着
   let call = 0;
   const rolls = [0, 0.5, 1, 0.25];
-  const scheduler = createIdleScheduler({
-    minMs: 1000, maxMs: 2000, random: () => rolls[call++ % rolls.length],
-  });
-  const first = scheduler.reschedule();
-  const second = scheduler.reschedule();
+  const scheduler = createBehaviorScheduler({ random: () => rolls[call++ % rolls.length] });
+  scheduler.setSchedule({ idle: { minIntervalMs: 1000, maxIntervalMs: 2000 } });
+  const first = scheduler.reschedule('idle');
+  const second = scheduler.reschedule('idle');
   assert.notEqual(first, second, '两次抽出的间隔应当不同');
 });
 
-test('idle 调度：默认区间是 6~18 秒（不烦人）', () => {
-  const scheduler = createIdleScheduler();
-  assert.equal(scheduler.minMs, DEFAULT_IDLE_MIN_MS);
-  assert.equal(scheduler.maxMs, DEFAULT_IDLE_MAX_MS);
+test('节奏调度：默认区间是 idle 6~18 秒、roam 3~9 秒（不烦人）', () => {
+  const scheduler = createBehaviorScheduler();
+  assert.equal(scheduler.get('idle').minMs, DEFAULT_SCHEDULE_MS.idle.min);
+  assert.equal(scheduler.get('idle').maxMs, DEFAULT_SCHEDULE_MS.idle.max);
+  assert.equal(scheduler.get('roam').minMs, DEFAULT_SCHEDULE_MS.roam.min);
+  assert.equal(scheduler.get('roam').maxMs, DEFAULT_SCHEDULE_MS.roam.max);
 });
 
-test('idle 调度：setTrigger 采用后端的配置', () => {
-  const scheduler = createIdleScheduler();
-  scheduler.setTrigger({ minIntervalMs: 3000, maxIntervalMs: 4000, plays: 2 });
-  assert.equal(scheduler.minMs, 3000);
-  assert.equal(scheduler.maxMs, 4000);
-  assert.equal(scheduler.plays, 2);
+test('节奏调度：★ 漫游的间隔也能配置（用户要求「调整不同动作的触发时间」）', () => {
+  const scheduler = createBehaviorScheduler({ random: () => 0 });
+  scheduler.setSchedule({ roam: { minIntervalMs: 1000, maxIntervalMs: 2000 } });
+  assert.equal(scheduler.get('roam').minMs, 1000);
+  assert.equal(scheduler.reschedule('roam'), 1);
+  // 没给的行为仍然拿默认值（调用方不必判空）
+  assert.equal(scheduler.get('idle').minMs, DEFAULT_SCHEDULE_MS.idle.min);
 });
 
-test('idle 调度：区间写反了自动调正（不报错）', () => {
-  const scheduler = createIdleScheduler();
-  scheduler.setTrigger({ minIntervalMs: 9000, maxIntervalMs: 2000 });
-  assert.equal(scheduler.minMs, 2000);
-  assert.equal(scheduler.maxMs, 9000);
+test('节奏调度：两个行为互相独立', () => {
+  const scheduler = createBehaviorScheduler({ random: () => 0 });
+  scheduler.setSchedule({
+    idle: { minIntervalMs: 5000, maxIntervalMs: 6000 },
+    roam: { minIntervalMs: 1000, maxIntervalMs: 2000 },
+  });
+  assert.equal(scheduler.reschedule('idle'), 5);
+  assert.equal(scheduler.reschedule('roam'), 1);
 });
 
-test('idle 调度：缺失/非法配置回落到默认值', () => {
+test('节奏调度：采用后端下发的 schedule', () => {
+  const scheduler = createBehaviorScheduler();
+  scheduler.setSchedule({
+    idle: { minIntervalMs: 3000, maxIntervalMs: 4000, plays: 2, mode: 'random' },
+    roam: { minIntervalMs: 800, maxIntervalMs: 900 },
+  });
+  assert.equal(scheduler.get('idle').minMs, 3000);
+  assert.equal(scheduler.get('idle').maxMs, 4000);
+  assert.equal(scheduler.get('idle').plays, 2);
+  assert.equal(scheduler.get('roam').minMs, 800);
+});
+
+test('节奏调度：区间写反了自动调正（不报错）', () => {
+  const scheduler = createBehaviorScheduler();
+  scheduler.setSchedule({ idle: { minIntervalMs: 9000, maxIntervalMs: 2000 } });
+  assert.equal(scheduler.get('idle').minMs, 2000);
+  assert.equal(scheduler.get('idle').maxMs, 9000);
+});
+
+test('节奏调度：缺失/非法配置回落到默认值', () => {
+  const scheduler = createBehaviorScheduler();
+  scheduler.setSchedule({});
+  assert.equal(scheduler.get('idle').minMs, DEFAULT_SCHEDULE_MS.idle.min);
+  scheduler.setSchedule(null);
+  assert.equal(scheduler.get('idle').maxMs, DEFAULT_SCHEDULE_MS.idle.max);
+  scheduler.setSchedule({ idle: { minIntervalMs: -5, maxIntervalMs: 'x' } });
+  assert.equal(scheduler.get('idle').minMs, DEFAULT_SCHEDULE_MS.idle.min);
+});
+
+test('节奏调度：mode 只认 loop，其余一律 random', () => {
+  const scheduler = createBehaviorScheduler();
+  scheduler.setSchedule({ idle: { mode: 'loop' } });
+  assert.equal(scheduler.get('idle').mode, 'loop');
+  scheduler.setSchedule({ idle: { mode: '什么鬼' } });
+  assert.equal(scheduler.get('idle').mode, 'random', '非法值必须回落到 random');
+});
+
+test('节奏调度：可设置的行为名单与后端一致（只有 idle / roam）', () => {
+  // 事件驱动的动作（click / fall / happy…）没有「多久触发一次」可言，
+  // 因此名单里**不能**出现它们——前端多认一个就会让面板渲染出一个
+  // 后端会拒绝的滑块。
+  assert.deepEqual([...SCHEDULE_BEHAVIORS].sort(), ['idle', 'roam']);
+});
+
+test('节奏调度：旧名 createIdleScheduler 仍可用（别名，避免验收脚本失效）', () => {
   const scheduler = createIdleScheduler();
-  scheduler.setTrigger({});
-  assert.equal(scheduler.minMs, DEFAULT_IDLE_MIN_MS);
-  scheduler.setTrigger(null);
-  assert.equal(scheduler.maxMs, DEFAULT_IDLE_MAX_MS);
-  scheduler.setTrigger({ minIntervalMs: -5, maxIntervalMs: 'x' });
-  assert.equal(scheduler.minMs, DEFAULT_IDLE_MIN_MS);
+  scheduler.setSchedule({ idle: { minIntervalMs: 1000, maxIntervalMs: 2000 } });
+  assert.equal(scheduler.get('idle').minMs, 1000);
+});
+
+// ==================================== 标准图像（本轮新增，修「卡在抬头帧」）
+
+test('标准图像：取后端算好的 url / 帧号 / 排布', () => {
+  const still = stillFrame({
+    still: { url: '/api/plugins/stm-pet/frame/x/still?v=1', frames: 4, frame: 2, layout: 'horizontal' },
+  });
+  assert.equal(still.url, '/api/plugins/stm-pet/frame/x/still?v=1');
+  assert.equal(still.frames, 4);
+  assert.equal(still.frame, 2);
+  assert.equal(still.layout, 'horizontal');
+});
+
+test('标准图像：帧号越界时夹回范围内（脏数据不该画出框外）', () => {
+  const still = stillFrame({
+    still: { url: 'u', frames: 4, frame: 99 },
+  });
+  assert.equal(still.frame, 3, '越界要夹到末帧');
+  const negative = stillFrame({ still: { url: 'u', frames: 4, frame: -3 } });
+  assert.equal(negative.frame, 0);
+});
+
+test('标准图像：没有图时返回 null（调用方保持当前绘制，而不是清空）', () => {
+  assert.equal(stillFrame(null), null);
+  assert.equal(stillFrame({}), null);
+  assert.equal(stillFrame({ still: { url: '' } }), null);
+});
+
+test('标准图像：透出 declared，让面板能提示「建议显式设一张」', () => {
+  assert.equal(stillFrame({ still: { url: 'u', declared: true } }).declared, true);
+  assert.equal(stillFrame({ still: { url: 'u' } }).declared, false);
 });
 
 // ================================================ 点击 / 拖拽手势（第 5 项）

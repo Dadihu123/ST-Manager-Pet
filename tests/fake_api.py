@@ -6,6 +6,7 @@
 
 - `api.route(rule, methods)` —— 装饰器，把视图函数收进一个蓝图；
 - `api.data_dir()` —— 插件私有数据目录；
+- `api.get_config()` —— 宿主 `config_schema` 的当前值（路由层用它取全局兜底倍率）；
 - `api.log(level, message)` —— 写日志。
 
 注册完调用 `finalize(app)` 把蓝图挂到测试用的 Flask app 上，
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 class FakeApi:
     """`PluginAPI` 的最小替身。"""
 
-    def __init__(self, plugin_id='stm-pet', data_dir=None, root=None):
+    def __init__(self, plugin_id='stm-pet', data_dir=None, root=None, config=None):
         self.plugin_id = plugin_id
         self._data_dir = data_dir or tempfile.mkdtemp(prefix='pet-api-')
         self._root = root
@@ -33,6 +34,11 @@ class FakeApi:
         )
         self.logs = []
         self.manifest = None
+        #: 宿主 `config_schema` 的当前值。真实宿主一定有这个方法
+        #: （路由层用它取全局兜底倍率），因此替身也必须实现——
+        #: 缺了它会让「所有取运行期定义的接口」一起 500/404，
+        #: 而失败原因看起来像是包坏了。
+        self._config = dict(config or {})
 
     # ---- 宿主契约 ----
 
@@ -49,6 +55,14 @@ class FakeApi:
     def data_dir(self) -> str:
         os.makedirs(self._data_dir, exist_ok=True)
         return self._data_dir
+
+    def get_config(self) -> dict:
+        """读宿主 `config_schema` 的当前值（标量配置的唯一来源是宿主）。"""
+        return dict(self._config)
+
+    def set_config(self, patch: dict) -> dict:
+        self._config.update(patch or {})
+        return dict(self._config)
 
     def log(self, level, message, **extra):
         self.logs.append((str(level), str(message)))

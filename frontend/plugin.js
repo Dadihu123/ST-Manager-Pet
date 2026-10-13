@@ -90,6 +90,14 @@ export async function activate(api) {
     mounted: false,
     pack: null,
     config: {},
+    /**
+     * 宠物是否被用户**关闭**了（隐藏）。
+     *
+     * 语义是「不显示宠物」，**不是**「停用插件」：插件仍然加载、
+     * 设置面板仍能打开、坞入口仍然在——否则用户关掉之后就没有任何入口
+     * 把它开回来了。
+     */
+    hidden: false,
   };
 
   // ------------------------------------------------------------ 配置
@@ -99,7 +107,7 @@ export async function activate(api) {
    *
    * 标量配置的唯一来源是宿主的 `config_schema`
    * （`GET /api/plugins/stm-pet/config` 由宿主提供，前端走 `api.api('/config')`）；
-   * 结构化状态（当前形象 id）走插件自己的 `/settings`。
+   * 结构化状态（当前形象 id、显示开关）走插件自己的 `/settings`。
    */
   async function loadConfig() {
     const [hostConfig, ownSettings] = await Promise.all([
@@ -113,6 +121,9 @@ export async function activate(api) {
     state.config = config;
     if (ownSettings && ownSettings.success && ownSettings.settings) {
       state.ownSettings = ownSettings.settings;
+      // ★ 显示开关**必须在注册 ambient 之前**读到：`register()` 是
+      // 「注册即挂载」，晚一步就会先闪出一只宠物再把它收掉。
+      state.hidden = ownSettings.settings.petHidden === true;
     }
     return config;
   }
@@ -136,6 +147,18 @@ export async function activate(api) {
       showToast: config.show_toast === true,
       reducedMotion: state.hostState ? state.hostState.reducedMotion : false,
     }, extra);
+  }
+
+  /**
+   * 把后端下发的**触发节奏**同步到正在运行的宠物上（就地生效，不必重建视图）。
+   *
+   * 节奏的权威值在后端（它按「用户设置 > 包内声明 > 默认」算好了，
+   * 见 `store.effective_schedule`），前端只取用——自己再算一遍会出现
+   * 「两边结论不一致」这种最难查的问题。
+   */
+  function applySchedule(pack) {
+    if (!state.petView || !pack) return;
+    state.petView.setSchedule(pack.schedule);
   }
 
   // ------------------------------------------------------------ 数据
@@ -184,6 +207,16 @@ export async function activate(api) {
     state.surfaceKey = api.surfaces.register('pet', {
       type: 'ambient',
       mount(container) {
+        // 用户把宠物关掉了：**不创建视图**。
+        //
+        // ambient 是「注册即挂载」，宿主没有「隐藏但不卸载」的接口，
+        // 因此这里自己判断。不建视图（而不是建完再藏）的好处是
+        // 一点 rAF、一点监听都不留——关掉就是真的关掉。
+        state.container = container;
+        if (state.hidden) {
+          logger.info('宠物已被用户关闭，ambient 容器保持为空');
+          return () => { state.mounted = false; };
+        }
         // 挂载期先把宠物画出来（用默认形象），形象数据是异步取的，
         // 拿到后再替换——这样启动时不会有一段时间「什么都没有」。
         state.petView = createPetView({
@@ -214,11 +247,22 @@ export async function activate(api) {
       },
     });
 
-    // `isOpen` 是判定「真的挂上了」的可靠方式（返回值恒为真，见上）
-    state.mounted = Boolean(state.surfaceKey) && api.surfaces.isOpen('pet');
+    // `isOpen` 是判定「真的挂上了」的可靠方式（返回值恒为真，见上）。
+    //
+    // ⚠️ 用户**关掉了宠物**时容器是故意留空的：那时 `isOpen` 为真（surface
+    // 确实注册并挂载了），但 `state.mounted` 应当是 `false`——它表达的是
+    // 「屏幕上有没有宠物」，而不是「容器在不在」。混为一谈的话，
+    // 诊断句柄会报出「已挂载」而用户明明看不到它。
+    state.mounted = Boolean(state.surfaceKey)
+      && api.surfaces.isOpen('pet')
+      && !state.hidden;
     if (!state.mounted) {
-      // 移动端 / 不支持：降级形态。不 throw、不 toast 报错（§2.1）。
-      logger.info('ambient 不可用（移动端），宠物降级为仅设置面板');
+      if (state.hidden) {
+        logger.info('宠物已被用户关闭（插件仍启用）');
+      } else {
+        // 移动端 / 不支持：降级形态。不 throw、不 toast 报错（§2.1）。
+        logger.info('ambient 不可用（移动端），宠物降级为仅设置面板');
+      }
     }
   }
 
@@ -230,10 +274,44 @@ export async function activate(api) {
       size: { w: 64, h: 64 },
       anchor: { x: 0.5, y: 1 },
       physics: {},
+      // 节奏留空 → 前端用与后端一致的默认值（见 `animation.js`）。
+      // 写死一份在这里的后果是「两份默认值迟早不一致」。
+      schedule: {},
+      still: { url: '', frames: 1, frame: 0, layout: 'horizontal' },
       actions: {
         idle: { action: 'idle', kind: 'static', source: 'idle', url: '', frames: 1, fps: 1, loop: true },
       },
     };
+  }
+
+  /**
+   * 在容器里建一个宠物视图（`applyPack` 与「重新显示」共用）。
+   *
+   * @param {HTMLElement} container 宿主的 ambient 容器
+   * @param {object} pack 运行期形象定义
+   * @param {object} [position] 要恢复的位置；不给就由视图自己决定（屏幕中央地面）
+   */
+  async function mountPetView(container, pack, position = null) {
+    state.petView = createPetView({
+      container,
+      pack,
+      config: viewConfig(),
+      hooks: {
+        onStateChange: (next, previous) => {
+          logger.debug(`宠物状态 ${previous} → ${next}`);
+        },
+        onContextMenu: () => {
+          api.surfaces.open('pet-settings', { source: 'pet-contextmenu' });
+        },
+      },
+    });
+    if (position) state.petView.physics.setPosition(position.x, position.y);
+    if (state.hostState) state.petView.applyThrottle(state.hostState);
+    state.mounted = true;
+    // 节奏**不重建视图**（它只影响两个定时器的下次取值），但必须在重建后
+    // 重新灌进去：新建的视图拿的是构造时的 `pack.schedule`，而用户可能
+    // 刚在面板上改过节奏、这次重建是改倍率触发的。
+    applySchedule(pack);
   }
 
   /** 把后端解析好的形象应用到正在运行的宠物上。 */
@@ -249,24 +327,86 @@ export async function activate(api) {
     // 而「改个大小」不该让宠物瞬移。
     const position = { x: bounds.x, y: bounds.y };
     state.petView.dispose();
-    state.petView = createPetView({
-      container,
-      pack,
-      config: viewConfig(),
-      hooks: {
-        onStateChange: (next, previous) => {
-          logger.debug(`宠物状态 ${previous} → ${next}`);
-        },
-        onContextMenu: () => {
-          api.surfaces.open('pet-settings', { source: 'pet-contextmenu' });
-        },
-      },
-    });
-    state.petView.physics.setPosition(position.x, position.y);
-    if (state.hostState) state.petView.applyThrottle(state.hostState);
+    await mountPetView(container, pack, position);
   }
 
-  // ------------------------------------------------------------ 设置面板
+  // ------------------------------------------------------------ 显示开关
+  //
+  // 用户要求：「插件应该支持关闭宠物，目前好像只有卸载或者停用宠物插件
+  // 才能关闭，不太合理」。
+  //
+  // 实现上的关键约束：宿主的 ambient surface 是**注册即挂载**，没有
+  // 「隐藏但不卸载」的接口。因此开关只能由插件自己实现——做法是
+  // **销毁 / 重建宠物视图**，而不是往容器上加一个 `display: none`：
+  // 后者留着 rAF、定时器与全局监听在空转，而用户关掉宠物的意图正是
+  // 「让它彻底安静下来」。
+
+  /**
+   * 切到「显示」状态：在当前容器里重建宠物视图。
+   *
+   * 幂等：已经显示时直接返回。
+   */
+  async function showPet() {
+    if (!state.hidden && state.petView) return;
+    state.hidden = false;
+    if (!state.container) return;
+    // 数据可能是关掉期间改的（用户在面板里换了形象），因此重新取一次
+    const pack = await fetchRuntime();
+    if (pack) state.pack = pack;
+    await mountPetView(state.container, state.pack || fallbackPack());
+    logger.info('宠物已显示');
+  }
+
+  /**
+   * 切到「隐藏」状态：销毁宠物视图。
+   *
+   * 幂等：已经隐藏时直接返回。
+   *
+   * **不卸载 ambient surface，也不动宿主的插件启用状态**——
+   * 插件要留着，否则用户就没有入口把它开回来了。
+   */
+  function hidePet() {
+    if (state.hidden) return;
+    state.hidden = true;
+    if (state.petView) {
+      state.petView.dispose();
+      state.petView = null;
+    }
+    state.mounted = false;
+    logger.info('宠物已关闭（插件仍启用，可从设置面板重新打开）');
+  }
+
+  /**
+   * 把开关同步到后端（持久化）。
+   *
+   * 先**改变本地状态**再发请求：用户点开关必须立刻看到反应，
+   * 不能等一次网络往返（那也是「点了没反应」这类报障的常见成因）。
+   * 请求失败时回滚并提示。
+   */
+  async function setHidden(hidden) {
+    const next = Boolean(hidden);
+    if (next === state.hidden) return next;
+    if (next) hidePet();
+    else await showPet();
+    try {
+      const data = await api.api('/visibility', {
+        method: 'POST',
+        body: { hidden: next },
+      });
+      if (!data || !data.success) throw new Error('保存失败');
+      state.hidden = data.hidden === true;
+      if (panel && typeof panel.setHiddenState === 'function') {
+        panel.setHiddenState(state.hidden);
+      }
+      return state.hidden;
+    } catch (error) {
+      // 回滚：不能留下「界面与实际不一致」的状态
+      logger.warning(`保存显示开关失败：${error && error.message}`);
+      if (next) await showPet();
+      else hidePet();
+      throw error;
+    }
+  }
 
   const panel = createSettingsPanel({
     api,
@@ -277,6 +417,8 @@ export async function activate(api) {
       if (state.petView) state.petView.setConfig(viewConfig());
     },
     onPetChanged: async (petId) => {
+      // 宠物被关掉了：形象变了也不该让它冒出来
+      if (state.hidden) return;
       const pack = await fetchRuntime();
       if (pack) await applyPack(pack);
       else if (petId === '') {
@@ -284,6 +426,9 @@ export async function activate(api) {
         await applyPack(fallbackPack());
       }
     },
+    // 面板上的「显示宠物」开关
+    getHidden: () => state.hidden,
+    onHiddenChange: (hidden) => setHidden(hidden),
   });
 
   function registerSettingsSurface() {
@@ -397,12 +542,18 @@ export async function activate(api) {
     state: () => ({
       pluginId: api.id,
       mounted: state.mounted,
+      /** 宠物是否被用户**关闭**了（插件仍启用）。 */
+      hidden: state.hidden,
       petId: state.pack ? state.pack.id : '',
       petState: state.petView ? state.petView.state : 'unmounted',
       action: state.petView ? state.petView.action : '',
       variant: state.petView ? state.petView.variantIndex : -1,
       idleMode: state.petView ? state.petView.idleMode : '',
       animSpeed: state.petView ? state.petView.animSpeed : null,
+      /** 标准图像（不播动画时显示的那一帧）与当前是否正画着它。 */
+      still: state.petView ? state.petView.still : null,
+      /** 生效的触发节奏（idle 小动作 / 自动漫游）。 */
+      schedule: state.petView ? state.petView.schedule : null,
       gesture: state.petView ? state.petView.gesturePhase : '',
       throttle: state.petView ? state.petView.throttleReason : '',
       reducedMotion: state.hostState ? Boolean(state.hostState.reducedMotion) : null,
@@ -410,6 +561,10 @@ export async function activate(api) {
       config: state.config,
       activePetId: (state.ownSettings || {}).activePetId || '',
     }),
+    /** 关闭宠物（等价于用户点面板上的开关）。 */
+    hide: () => setHidden(true),
+    /** 重新显示宠物。 */
+    show: () => setHidden(false),
     /** 打开设置面板（等价于用户点击入口）。 */
     openSettings: () => api.surfaces.open('pet-settings', { source: 'debug-handle' }),
     /** 关闭设置面板。 */

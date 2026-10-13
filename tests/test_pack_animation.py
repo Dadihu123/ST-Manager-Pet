@@ -1,22 +1,24 @@
 """宠物包格式的**动画节奏**扩展：多套动画（`variants` + `weight`）、
-非均匀帧时长（`frameMs`）、idle 的随机触发（`trigger` / `intervalMs` / `plays`）。
+非均匀帧时长（`frameMs`）、**时间驱动行为的触发节奏**（顶层 `schedule`）、
+**标准图像**（顶层 `still`）。
 
-这三项对应用户明确提出的第 6、7 项优化，以及第 1 项（idle 不再时刻触发）。
-
-设计上的两条硬约束（都在这里钉住）：
+设计上的三条硬约束（都在这里钉住）：
 1. **向前兼容**：老包（只有 `sheet` / `frames` / `fps` / `loop`）行为**完全不变**；
-2. **写错要能读懂**：非法值给可读错误，而不是静默取默认值或崩掉。
+2. **写错要能读懂**：非法值给可读错误，而不是静默取默认值或崩掉；
+3. **做不到的事要明说**：给事件驱动的动作设「触发时间」是**报错**而不是
+   静默忽略——作者会以为设好了，而它永远不会生效。
 """
 
 import pytest
 
 from backend.core.pack import (
-    DEFAULT_IDLE_MAX_MS,
-    DEFAULT_IDLE_MIN_MS,
+    DEFAULT_SCHEDULE_MS,
     DEFAULT_WEIGHT,
     MAX_VARIANTS,
     IDLE_TRIGGER_LOOP,
     IDLE_TRIGGER_RANDOM,
+    SCHEDULE_BEHAVIORS,
+    STILL_ACTION,
     from_dict,
 )
 from backend.core.errors import CODE_PACK_FIELD_INVALID
@@ -27,6 +29,12 @@ def _pack(**anims):
     base = {'idle': 'idle.png'}
     base.update(anims)
     return from_dict({'id': 'anim', 'animations': base})
+
+
+def _scheduled(schedule, **anims):
+    base = {'idle': 'idle.png'}
+    base.update(anims)
+    return from_dict({'id': 'anim', 'animations': base, 'schedule': schedule})
 
 
 # ==================================================== 向后兼容（最重要的一条）
@@ -60,8 +68,10 @@ def test_legacy_pack_still_parses_exactly_as_before():
     assert resolved.fps == 6
     assert resolved.frame_ms == []
     assert len(resolved.variants) == 1
-    # 老包没声明 trigger → 默认是 random（新的默认行为）
-    assert resolved.idle_trigger.mode == IDLE_TRIGGER_RANDOM
+    # 老包没声明 schedule → 默认是 random（新的默认行为）
+    assert parsed.schedule_for('idle').mode == IDLE_TRIGGER_RANDOM
+    # 老包没声明 still → 回落 idle 首帧（也是老行为）
+    assert parsed.resolve_still().declared is False
 
 
 def test_string_shorthand_still_means_single_frame():
@@ -277,9 +287,9 @@ def test_variants_missing_sheet_falls_back_to_next_playable():
 def test_variants_to_dict_round_trips():
     payload = {
         'id': 'rt',
+        'schedule': {'idle': {'intervalMs': [3000, 9000], 'plays': 2}},
         'animations': {
             'idle': {
-                'trigger': 'random', 'intervalMs': [3000, 9000], 'plays': 2,
                 'variants': [
                     {'sheet': 'a.png', 'frames': 3, 'fps': 5, 'weight': 5,
                      'frameMs': [100, 100, 200]},
@@ -291,12 +301,14 @@ def test_variants_to_dict_round_trips():
     first = from_dict(payload)
     dumped = first.to_dict()
     second = from_dict({
-        'id': dumped['id'], 'animations': dumped['animations'],
+        'id': dumped['id'],
+        'animations': dumped['animations'],
+        'schedule': dumped['schedule'],
     }, pack_id=dumped['id'])
     assert len(second.animations['idle'].variants) == 2
     assert second.animations['idle'].variants[0].frame_ms == [100, 100, 200]
     assert second.animations['idle'].variants[1].weight == 3
-    assert second.animations['idle'].idle.plays == 2
+    assert second.schedule_for('idle').plays == 2
 
 
 def test_single_variant_serializes_flat_not_as_variants():
@@ -309,90 +321,254 @@ def test_single_variant_serializes_flat_not_as_variants():
     assert 'weight' not in dumped, '单套时权重恒为 1，写出来只是噪音'
 
 
-# ============================================================ idle 的随机触发
+# ================================================ 时间驱动行为的触发节奏
 
 
-def test_idle_defaults_to_random_trigger():
+def test_idle_defaults_to_random_mode():
     """★ 默认**不是**一直循环，而是「平时静止、偶尔动一下」。
 
     用户报障「idle 动画时刻触发看起来有点鬼畜」，这正是修法。
     """
     parsed = _pack(idle={'sheet': 'idle.png', 'frames': 4, 'fps': 6})
-    trigger = parsed.animations['idle'].idle
+    trigger = parsed.schedule_for('idle')
     assert trigger.mode == IDLE_TRIGGER_RANDOM
-    assert trigger.min_ms == DEFAULT_IDLE_MIN_MS
-    assert trigger.max_ms == DEFAULT_IDLE_MAX_MS
+    assert trigger.min_ms == DEFAULT_SCHEDULE_MS['idle'][0]
+    assert trigger.max_ms == DEFAULT_SCHEDULE_MS['idle'][1]
     assert trigger.plays == 1
 
 
-def test_idle_trigger_can_be_set_to_loop():
-    """想回到旧行为的作者可以显式声明 `trigger: "loop"`。"""
-    parsed = _pack(idle={
-        'sheet': 'idle.png', 'frames': 4, 'trigger': IDLE_TRIGGER_LOOP,
-    })
-    assert parsed.animations['idle'].idle.mode == IDLE_TRIGGER_LOOP
-    assert parsed.resolve('idle').idle_trigger.mode == IDLE_TRIGGER_LOOP
+def test_idle_mode_can_be_set_to_loop():
+    """想回到旧行为的作者可以显式声明 `mode: "loop"`。"""
+    parsed = _scheduled({'idle': {'mode': IDLE_TRIGGER_LOOP}})
+    assert parsed.schedule_for('idle').mode == IDLE_TRIGGER_LOOP
 
 
-def test_idle_trigger_interval_and_plays_are_parsed():
-    parsed = _pack(idle={
-        'sheet': 'idle.png', 'frames': 4,
-        'trigger': 'random', 'intervalMs': [3000, 9000], 'plays': 3,
-    })
-    trigger = parsed.animations['idle'].idle
+def test_schedule_interval_and_plays_are_parsed():
+    parsed = _scheduled({'idle': {'intervalMs': [3000, 9000], 'plays': 3}})
+    trigger = parsed.schedule_for('idle')
     assert trigger.min_ms == 3000
     assert trigger.max_ms == 9000
     assert trigger.plays == 3
 
 
-def test_idle_trigger_interval_written_backwards_is_auto_corrected():
+def test_schedule_interval_written_backwards_is_auto_corrected():
     """区间写反了意图明确，直接调正比报错友好。"""
-    parsed = _pack(idle={
-        'sheet': 'idle.png', 'frames': 4, 'intervalMs': [9000, 3000],
-    })
-    trigger = parsed.animations['idle'].idle
+    parsed = _scheduled({'idle': {'intervalMs': [9000, 3000]}})
+    trigger = parsed.schedule_for('idle')
     assert (trigger.min_ms, trigger.max_ms) == (3000, 9000)
 
 
-def test_idle_trigger_invalid_mode_is_readable_error():
+def test_schedule_invalid_mode_is_readable_error():
     with pytest.raises(Exception) as info:
-        _pack(idle={'sheet': 'idle.png', 'trigger': 'sometimes'})
+        _scheduled({'idle': {'mode': 'sometimes'}})
     message = str(info.value)
-    assert 'trigger' in message
+    assert 'mode' in message
     assert IDLE_TRIGGER_RANDOM in message and IDLE_TRIGGER_LOOP in message, (
         '错误信息要告诉用户有哪些合法取值'
     )
 
 
-def test_idle_trigger_bad_interval_shape_is_rejected():
+def test_schedule_bad_interval_shape_is_rejected():
     with pytest.raises(Exception):
-        _pack(idle={'sheet': 'idle.png', 'intervalMs': 5000})
+        _scheduled({'idle': {'intervalMs': 5000}})
     with pytest.raises(Exception):
-        _pack(idle={'sheet': 'idle.png', 'intervalMs': [1, 2, 3]})
+        _scheduled({'idle': {'intervalMs': [1, 2, 3]}})
 
 
-def test_only_idle_gets_a_trigger():
-    """其余动作由状态机驱动，不该有「随机触发」这回事。"""
-    parsed = _pack(
-        idle={'sheet': 'idle.png', 'trigger': 'random'},
-        click={'sheet': 'click.png', 'frames': 3},
-    )
-    assert parsed.animations['idle'].idle is not None
-    assert parsed.animations['click'].idle is None
-    # 非 idle 动作的解析结果里没有 idleTrigger 字段
-    assert 'idleTrigger' not in parsed.resolve('click').to_dict()
-    assert 'idleTrigger' in parsed.resolve('idle').to_dict()
+def test_roam_interval_is_configurable():
+    """★ 自动漫游也要能设触发时间（用户要求「调整不同动作的触发时间」）。
 
-
-def test_idle_trigger_follows_the_requested_action_not_the_fallback_source():
-    """★ 请求 `look` 却回退到 idle 的图时，它仍是「一次播报」，不是随机小动作。
-
-    否则「张望」会变成随机待机动画，语义就错了。
+    漫游不是动作（它没有自己的图），因此它的节奏只能挂在顶层 `schedule` 下。
     """
-    parsed = _pack(idle={'sheet': 'idle.png', 'frames': 4, 'trigger': 'random'})
-    resolved = parsed.resolve('look')
-    assert resolved.source == 'idle', '确实回退到了 idle'
-    assert resolved.idle_trigger is None, '但它不是 idle 请求，不该带触发配置'
+    parsed = _scheduled({'roam': {'intervalMs': [1000, 2000]}})
+    assert parsed.schedule_for('roam').min_ms == 1000
+    assert parsed.schedule_for('roam').max_ms == 2000
+    # 没声明的行为拿默认值（调用方不必判空）
+    assert parsed.schedule_for('idle').min_ms == DEFAULT_SCHEDULE_MS['idle'][0]
+
+
+def test_schedule_defaults_cover_every_behavior():
+    """每个行为都要有默认值——否则前端会拿到 undefined 并算出 NaN 间隔。"""
+    parsed = _pack(idle={'sheet': 'idle.png'})
+    for behavior in SCHEDULE_BEHAVIORS:
+        trigger = parsed.schedule_for(behavior)
+        assert trigger.min_ms > 0, behavior
+        assert trigger.max_ms >= trigger.min_ms, behavior
+
+
+def test_schedule_rejects_event_driven_actions():
+    """★ 给**事件驱动**的动作设触发时间是**报错**，不是静默忽略。
+
+    `click` 要有人点、`fall` 要松手——这些事做不到「每 5 秒自己发生一次」。
+    静默忽略的后果是作者以为设好了，却永远不生效（最难查的一类问题）。
+    """
+    for action in ('click', 'fall', 'happy', 'land', 'sleep', 'walk-left'):
+        with pytest.raises(Exception) as info:
+            _scheduled({action: {'intervalMs': [1000, 2000]}})
+        message = str(info.value)
+        assert action in message, f'错误信息要点出是哪个键有问题: {message}'
+        assert 'idle' in message and 'roam' in message, (
+            '错误信息要告诉用户**哪些**行为能设'
+        )
+
+
+def test_schedule_rejects_fields_a_behavior_does_not_support():
+    """`roam` 没有 `plays` / `mode`（它的时长由物理决定）。
+
+    写它就是错误：静默忽略会让作者以为设好了。
+    """
+    for field in ('plays', 'mode'):
+        with pytest.raises(Exception) as info:
+            _scheduled({'roam': {field: 2}})
+        assert field in str(info.value)
+
+
+def test_schedule_legacy_location_is_a_readable_error():
+    """★ 节奏字段已从 `animations.idle` 上移到顶层 `schedule`。
+
+    插件未发布，因此不做兼容读取；但**也不能静默忽略**——
+    作者按老写法设了间隔，包能读、宠物能跑，只是那个间隔永远不生效。
+    """
+    for legacy in ('intervalMs', 'plays', 'trigger', 'idleTrigger'):
+        with pytest.raises(Exception) as info:
+            _pack(idle={'sheet': 'idle.png', 'frames': 4, legacy: [1, 2]})
+        message = str(info.value)
+        assert legacy in message
+        assert 'schedule' in message, '错误信息要告诉作者新写法在哪'
+
+
+def test_schedule_is_not_dumped_inside_animations():
+    """`to_dict` 不能把节奏塞回动作里——两处都能写同一件事，迟早不一致。"""
+    parsed = _scheduled({'idle': {'intervalMs': [3000, 9000]}})
+    dumped = parsed.to_dict()
+    idle = dumped['animations']['idle']
+    for key in ('trigger', 'intervalMs', 'plays'):
+        assert key not in idle, f'动作里不该有 {key}'
+    assert dumped['schedule']['idle']['minIntervalMs'] == 3000
+    assert dumped['schedule']['roam']['minIntervalMs'] == DEFAULT_SCHEDULE_MS['roam'][0]
+
+
+# ==================================================== 标准图像（顶层 still）
+
+
+def test_still_falls_back_to_idle_first_frame():
+    """没声明 `still` → 回落 idle 首帧，并标明 `declared=False`。
+
+    回落值必须存在：它是历史行为（那时 idle 只有一套动画，首帧就是对的姿势）。
+    """
+    parsed = _pack(idle={'sheet': 'idle.png', 'frames': 4})
+    still = parsed.resolve_still()
+    assert still.sheet == 'idle.png'
+    assert still.frames == 4
+    assert still.frame == 0
+    assert still.declared is False
+    assert still.source == 'idle'
+
+
+def test_still_declared_wins_over_idle():
+    """★ 声明了 `still` 就用它——这正是「宠物卡在抬头帧」的修法。
+
+    内置形象的 idle 挂了第二套动画（「张望」），而「静止」若沿用
+    「上一次抽到的变体的第 0 帧」，随机播到张望之后就会卡在**抬头看**的姿势上。
+    """
+    parsed = from_dict({
+        'id': 'anim',
+        'still': {'sheet': 'idle.png', 'frames': 4, 'frame': 0},
+        'animations': {
+            'idle': {'variants': [
+                {'sheet': 'idle.png', 'frames': 4, 'weight': 5},
+                {'sheet': 'look.png', 'frames': 4, 'weight': 2},
+            ]},
+        },
+    })
+    still = parsed.resolve_still()
+    assert still.declared is True
+    assert still.source == STILL_ACTION
+    assert still.sheet == 'idle.png', '必须是作者指定的那张，而不是「张望」'
+
+
+def test_still_can_point_at_a_specific_frame():
+    """`frame` 让作者从多帧 sheet 里挑一帧，不必为此单独切一张图。"""
+    parsed = from_dict({
+        'id': 'anim',
+        'still': {'sheet': 'idle.png', 'frames': 4, 'frame': 2},
+        'animations': {'idle': 'idle.png'},
+    })
+    still = parsed.resolve_still()
+    assert still.frame == 2
+    assert still.frames == 4
+
+
+def test_still_accepts_the_string_shorthand():
+    """与动作的 `sheet` 写法对齐：作者不必记两套规则。"""
+    parsed = from_dict({
+        'id': 'anim',
+        'still': 'still.png',
+        'animations': {'idle': 'idle.png'},
+    })
+    assert parsed.resolve_still().sheet == 'still.png'
+    assert parsed.resolve_still().frames == 1
+
+
+def test_still_frame_out_of_range_is_rejected():
+    with pytest.raises(Exception) as info:
+        from_dict({
+            'id': 'anim',
+            'still': {'sheet': 'idle.png', 'frames': 2, 'frame': 5},
+            'animations': {'idle': 'idle.png'},
+        })
+    assert 'frame' in str(info.value)
+
+
+def test_still_empty_sheet_falls_back_instead_of_erroring():
+    """「先占个位、图后面再补」是合理的编辑过程，不该因此报错。"""
+    parsed = from_dict({
+        'id': 'anim',
+        'still': {'sheet': ''},
+        'animations': {'idle': 'idle.png'},
+    })
+    assert parsed.resolve_still().declared is False
+
+
+def test_still_sheet_path_is_validated():
+    """标准图像走与动作**同一套**路径校验（不允许绝对路径 / `..`）。"""
+    for bad in ('/abs/still.png', '../still.png', 'still.jpg'):
+        with pytest.raises(Exception):
+            from_dict({
+                'id': 'anim',
+                'still': {'sheet': bad},
+                'animations': {'idle': 'idle.png'},
+            })
+
+
+def test_still_is_a_reserved_action_name():
+    """`still` 是保留名（它不是动作），写进 `animations` 要报错。
+
+    否则「标准图像」与「一个叫 still 的动作」两套语义会打架。
+    """
+    with pytest.raises(Exception) as info:
+        from_dict({
+            'id': 'anim',
+            'animations': {'idle': 'idle.png', 'still': 'still.png'},
+        })
+    assert STILL_ACTION in str(info.value)
+
+
+def test_still_resolves_through_the_action_pipeline():
+    """★ 标准图像走**同一条**解析通路，因此前端的切帧几何可以直接复用。
+
+    否则「覆盖优先级」「路径安全复核」这些已经有测试钉住的事要再写一遍。
+    """
+    parsed = from_dict({
+        'id': 'anim',
+        'still': {'sheet': 'idle.png', 'frames': 4, 'frame': 3},
+        'animations': {'idle': 'idle.png'},
+    })
+    resolved = parsed.resolve(STILL_ACTION)
+    assert resolved.kind == 'animated'
+    assert resolved.sheet == 'idle.png'
+    assert resolved.frames == 4, '帧数要带上，前端才知道怎么切'
+    assert resolved.loop is False, '标准图像是静止的，不循环'
 
 
 # ============================================== 内置形象的节奏（防回归）
@@ -417,7 +593,15 @@ def test_builtin_pets_have_slower_non_uniform_rhythm():
     for pet_id in ('xiaoman', 'xiaoka'):
         pack = store.load_pack(pet_id)
         # idle 默认随机触发
-        assert pack.animations['idle'].idle.mode == IDLE_TRIGGER_RANDOM, pet_id
+        assert pack.schedule_for('idle').mode == IDLE_TRIGGER_RANDOM, pet_id
+        # ★ 内置形象必须**显式声明标准图像**：它们的 idle 挂了两套动画
+        #（待机 + 张望），回落值会是「张望」的首帧（一个抬头姿势）。
+        still = pack.resolve_still()
+        assert still.declared is True, f'{pet_id} 没有显式声明标准图像'
+        assert still.sheet == 'idle.png', f'{pet_id} 的标准图像应是待机图'
+        assert still.frame == 0, f'{pet_id} 的标准图像应是待机首帧'
+        # 作者署名：内置形象的作者写「官方」（用户明确要求）
+        assert pack.author == '官方', f'{pet_id} 的作者应是「官方」，实际 {pack.author!r}'
         # 关键动作都要有非均匀帧时长（这才是「更自然」的落点）
         for action in ('idle', 'walk-left', 'walk-right', 'sleep', 'land', 'click'):
             variant = pack.animations[action].variants[0]

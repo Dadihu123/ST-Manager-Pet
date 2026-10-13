@@ -5,7 +5,7 @@
   "api_version": 2,
   "manifest_version": 2,
   "author": "ST-Manager",
-  "description": "常驻桌面的宠物：跟随宿主状态活动、可拖动、会下坠与行走、长时间没互动会睡着；支持自己新建形象、导入形象包、按形象调整大小与渲染方式，并在设置页直接预览每个动作的动画效果。",
+  "description": "常驻桌面的宠物：跟随宿主状态活动、可拖动、会下坠与行走、长时间没互动会睡着；支持自己新建形象（可署名作者、指定标准图像、调触发节奏）、导入形象包、按形象调整大小与渲染方式，并在设置页直接预览每个动作的动画效果；不想看到它时可以一键关闭，不必卸载插件。",
   "license": "MIT",
   "min_app_version": "1.0.0",
   "backend": {
@@ -24,7 +24,7 @@
         "id": "pet-dock",
         "kind": "dock",
         "label": "桌面宠物",
-        "description": "打开桌面宠物设置：形象管理、动作覆盖、播报与勿扰。",
+        "description": "打开桌面宠物设置：显示开关、形象管理、作者署名、标准图像、触发时间、播报与勿扰。",
         "icon": "frontend/assets/icon.svg",
         "surface": {
           "id": "pet-settings",
@@ -36,7 +36,7 @@
         "id": "pet-settings",
         "kind": "settings",
         "label": "桌面宠物设置",
-        "description": "形象管理与导入、动作覆盖、播报与勿扰。",
+        "description": "显示开关、形象管理与导入、作者署名、标准图像、触发时间、播报与勿扰。",
         "icon": "frontend/assets/icon.svg",
         "surface": {
           "id": "pet-settings",
@@ -77,7 +77,7 @@
       "auto_roam": {
         "type": "boolean",
         "title": "自动漫游",
-        "description": "空闲时宠物会自己在屏幕底部走动。",
+        "description": "空闲时宠物会自己在屏幕底部走动。走动的间隔在「桌面宠物设置 → 触发时间」里按形象调。",
         "default": true
       },
       "scale": {

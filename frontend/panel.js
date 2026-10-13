@@ -10,6 +10,7 @@
  * 因此这里拿到的每个动作都已经是「最终结论 + 一句解释」。
  */
 
+import { DEFAULT_SCHEDULE_MS } from './animation.js';
 import { createAnimationPlayer, totalDuration } from './preview.js';
 
 const ACTION_LABELS = {
@@ -39,6 +40,37 @@ const ACTION_LABELS = {
  * 因为它们共同承载「行走」这一项需求（提供任一侧即满足）。
  */
 const REQUIRED_ACTIONS = ['idle', 'walk', 'drag', 'fall'];
+
+/**
+ * **可设置触发时间**的行为（与后端 `pack.SCHEDULE_BEHAVIORS` 必须一致）。
+ *
+ * 用户要求「支持调整不同动作的触发时间」，而真正**由时间驱动**的只有这两个：
+ *
+ * - `idle`：闲着的时候偶尔动一下；
+ * - `roam`：闲着的时候自己在屏幕底部走一走。
+ *
+ * 其余动作由**事件**触发（`click` 要有人点、`fall` 要松手、`happy` 要有播报），
+ * 给它们设「多久一次」没有意义——后端会明确拒绝，因此面板也不渲染它们的滑块。
+ */
+const SCHEDULE_BEHAVIORS = [
+  {
+    key: 'idle',
+    label: '待机小动作',
+    hint: '闲着的时候偶尔动一下。数值越小越活泼，越大越安静。',
+  },
+  {
+    key: 'roam',
+    label: '自动漫游',
+    hint: '闲着的时候自己在屏幕底部走一走。关掉「自动漫游」开关后这项不生效。',
+  },
+];
+
+/**
+ * 触发节奏的**兜底**区间（毫秒）。权威值由后端 `/pets` 的 `limits` 给，
+ * 这里只是「接口还没回来」时的初值，避免滑块渲染成 NaN。
+ */
+const SCHEDULE_FALLBACK_MIN_MS = 200;
+const SCHEDULE_FALLBACK_MAX_MS = 3600 * 1000;
 
 /**
  * 新建形象时可上传的动作（按重要性排序，`idle` 必须给）。
@@ -79,7 +111,10 @@ const SCALE_STEP = 0.05;
 const SPEED_MIN = 0.25;
 const SPEED_MAX = 4;
 
-export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigChanged, onPetChanged }) {
+export function createSettingsPanel({
+  api, getConfig, getOwnSettings, onConfigChanged, onPetChanged,
+  getHidden, onHiddenChange,
+}) {
   let root = null;
   let disposed = false;
   let pets = [];
@@ -88,6 +123,13 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
   let detail = null;
   let busy = false;
   let notice = null;
+  /**
+   * 宠物是否被用户关闭了（隐藏）。
+   *
+   * 权威值在 `plugin.js`（它管着宠物视图的生与死），这里只是它的一份镜像。
+   * 初值从 `getHidden()` 取——面板可能在宠物已被关闭的情况下才第一次打开。
+   */
+  let hiddenState = typeof getHidden === 'function' ? Boolean(getHidden()) : false;
   /** 缩略图几何的观察者（容器宽度变化时重算帧几何）。 */
   let resizeObserver = null;
   /** 当前是否处于「新建形象」视图（而不是形象详情）。 */
@@ -96,8 +138,29 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
   let draft = {};
   /** 新建表单的标量字段。 */
   let draftName = '';
+  /** 新建表单的**作者署名**（用户要求：自定义宠物应能设作者名，便于发布）。 */
+  let draftAuthor = '';
   let draftScale = 1;
   let draftPixelated = false;
+  /**
+   * 新建表单的**标准图像**声明。
+   *
+   * 三种状态：
+   * - `null`：不声明 → 后端回落到 idle 首帧；
+   * - `{action, frame}`：复用某个已上传动作的某一帧（面板上最常见的选择）；
+   * - `{file, frames, frame}`：单独上传一张。
+   *
+   * 为什么不总是强制用户设一张：它**不是必填**。强制会让「我就想用 idle
+   * 第一帧」这个最常见的情况变得啰嗦，而回落值在只给一套 idle 时本来就是对的。
+   */
+  let draftStill = null;
+  /**
+   * 新建表单的**触发节奏**（毫秒区间）。
+   *
+   * `{idle: {min, max}, roam: {min, max}}`；`null` 表示「用默认值」，
+   * 提交时不写进 `pet.json`（后端与前端都用同一套默认值）。
+   */
+  let draftSchedule = null;
   /** 面板拿到的限制（倍率区间由后端给，避免两边写死不一致）。 */
   let limits = { scaleMin: SCALE_MIN, scaleMax: SCALE_MAX };
   /**
@@ -168,6 +231,86 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
   function setNotice(kind, message) {
     notice = message ? { kind, message } : null;
     render();
+  }
+
+  /**
+   * **显示开关**：把宠物关掉 / 打开。
+   *
+   * 用户报障的原始形态是：「目前好像只有卸载或者停用宠物插件才能关闭宠物，
+   * 不太合理」。确实不合理——想安静一会儿却要卸载插件，代价完全不对等。
+   *
+   * 语义边界（面板上也要说清，否则用户会以为「关闭」=「停用」）：
+   * 关掉的是**宠物**，不是插件。面板、坞入口、所有设置都还在；
+   * 想让它回来，再点一下这个开关就行。
+   */
+  function renderVisibility() {
+    const hidden = Boolean(hiddenState);
+    const box = el(
+      'div',
+      `pet-visibility ${hidden ? 'is-hidden' : ''}`.trim(),
+    );
+
+    const copy = el('div', 'pet-visibility-copy');
+    const title = el('div', 'pet-visibility-title');
+    title.appendChild(el('span', null, hidden ? '宠物已关闭' : '宠物显示中'));
+    title.appendChild(el(
+      'span',
+      `pet-badge ${hidden ? 'is-builtin' : ''}`.trim(),
+      hidden ? '已隐藏' : '运行中',
+    ));
+    copy.appendChild(title);
+    copy.appendChild(el(
+      'div',
+      'pet-field-hint',
+      hidden
+        ? '屏幕上不会显示宠物，也不会占用任何动画资源。'
+          + '插件仍然启用——想让它回来，点右边的「显示宠物」即可。'
+        : '不想看到它时可以在右边把它关掉，不必卸载或停用插件。',
+    ));
+    box.appendChild(copy);
+
+    const actions = el('div', 'pet-panel-toolbar');
+    const toggle = button(
+      hidden ? '显示宠物' : '关闭宠物',
+      hidden ? 'is-primary' : '',
+      () => toggleVisibility(!hidden),
+    );
+    toggle.dataset.visibilityToggle = 'true';
+    // 让验收脚本与用户都能一眼看出当前状态（也便于 CSS 分别着色）
+    toggle.dataset.visibilityHidden = hidden ? 'true' : 'false';
+    actions.appendChild(toggle);
+    box.appendChild(actions);
+    return box;
+  }
+
+  /**
+   * 切换显示状态。
+   *
+   * 回调失败时**不吞掉**：`onHiddenChange` 内部已经做了回滚，
+   * 这里只需把错误呈现出来。
+   */
+  async function toggleVisibility(hidden) {
+    if (!onHiddenChange) return;
+    await withBusy(async () => {
+      try {
+        await onHiddenChange(hidden);
+        setNotice('ok', hidden ? '已关闭宠物' : '已显示宠物');
+      } catch (error) {
+        setNotice('error', `切换失败：${(error && error.message) || error}`);
+      }
+    });
+  }
+
+  /**
+   * 由 `plugin.js` 在开关变化后回灌状态。
+   *
+   * 为什么需要它：`plugin.js` 才是显示状态的权威来源（它管着宠物视图的
+   * 生与死），面板只是它的一个视图。后台改状态（诊断句柄 `stmPet.hide()`）
+   * 也要让面板跟上。
+   */
+  function setHiddenState(next) {
+    hiddenState = Boolean(next);
+    if (root) render();
   }
 
   /**
@@ -255,6 +398,8 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
       limits = {
         scaleMin: Number(data.limits.scaleMin) || SCALE_MIN,
         scaleMax: Number(data.limits.scaleMax) || SCALE_MAX,
+        scheduleMinMs: Number(data.limits.scheduleMinMs) || SCHEDULE_FALLBACK_MIN_MS,
+        scheduleMaxMs: Number(data.limits.scheduleMaxMs) || SCHEDULE_FALLBACK_MAX_MS,
       };
     }
     if (!selectedId || !pets.some((item) => item.id === selectedId)) {
@@ -433,10 +578,68 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
   }
 
   /**
+   * 调整某行为的**触发时间**（逐形象保存，内置形象同样可调）。
+   *
+   * 这两项（`idle` 小动作 / 自动漫游）是唯一由时间驱动的行为，
+   * 因此也是唯一能设「多久一次」的。落点是 `data/settings.json` 而不是
+   * `pet.json`——它属于「这台机器上怎么养」的偏好，而且**内置形象必须能调**
+   * （内置形象是只读的，而它恰恰是大多数用户唯一会用的形象）。
+   */
+  async function updateSchedule(behavior, patch) {
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(selectedId)}/schedule`,
+        { method: 'POST', body: { schedule: { [behavior]: patch } } },
+      );
+      if (!data) return;
+      // 让运行中的宠物立刻用上新节奏（不必刷新页面）
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+    });
+  }
+
+  /** 清掉某形象的**全部**节奏覆盖（回落到包内声明 / 默认值）。 */
+  async function resetSchedule() {
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(selectedId)}/schedule`,
+        { method: 'POST', body: { reset: true } },
+      );
+      if (!data) return;
+      setNotice('ok', '已恢复默认触发时间');
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+    });
+  }
+
+  /**
+   * 改写**自建形象**的元信息：名字 / 作者 / 标准图像。
+   *
+   * 与 `/appearance`（大小、渲染方式）的分工：那个改的是「用户怎么看」，
+   * 落在 `data/settings.json`，内置形象也能改；这个改的是**形象本身**
+   * （写进 `pet.json`），因此只对自建形象开放。
+   */
+  async function updateMeta(patch, { message = '已更新' } = {}) {
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(selectedId)}/meta`,
+        { method: 'POST', body: patch },
+      );
+      if (!data) return;
+      setNotice('ok', message);
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+    });
+  }
+
+  /**
    * 提交「新建形象」。
    *
    * 每个动作一个文件字段，字段名就是动作名；帧数/帧率走 `meta` 这个 JSON 字段。
    * 只提交**填了图**的动作——空字段会被后端当成「没提供」。
+   *
+   * 标准图像有两种提交形态（见 `draftStill`）：复用某个动作的某一帧走 JSON，
+   * 单独上传一张走文件字段 `still`。后端两种都认。
    */
   async function submitCreate() {
     const name = draftName.trim();
@@ -451,6 +654,8 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
 
     const form = new FormData();
     form.append('name', name);
+    // 作者署名：**总是提交**（哪怕是空串），让用户看到「署名」这件事存在。
+    form.append('author', draftAuthor.trim());
     form.append('scale', String(draftScale));
     form.append('pixelated', draftPixelated ? '1' : '0');
     const meta = {};
@@ -462,6 +667,28 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     }
     form.append('meta', JSON.stringify(meta));
 
+    // ---- 标准图像
+    //
+    // 两种形态共用 `still` 这个字段名，但**一个是文件、一个是 JSON 文本**：
+    // Flask 会把它们分别放进 `request.files` 与 `request.form`，因此能共存。
+    // 这样后端只需要认一个字段名，不必为两种来源各写一条通路。
+    if (draftStill && draftStill.file) {
+      form.append('still', JSON.stringify({
+        frames: Math.max(1, Number(draftStill.frames) || 1),
+      }));
+      form.append('still', draftStill.file);
+    } else if (draftStill && draftStill.action) {
+      form.append('still', JSON.stringify({
+        action: draftStill.action,
+        frame: Math.max(0, Number(draftStill.frame) || 0),
+      }));
+    }
+
+    // ---- 触发节奏（只在用户真的改过时才写进 pet.json）
+    if (draftSchedule) {
+      form.append('schedule', JSON.stringify(draftSchedule));
+    }
+
     await withBusy(async () => {
       const data = await call('/pets/create', { method: 'POST', body: form });
       if (!data) return;
@@ -470,6 +697,9 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
       creating = false;
       draft = {};
       draftName = '';
+      draftAuthor = '';
+      draftStill = null;
+      draftSchedule = null;
       setNotice('ok', `已创建「${data.pet ? data.pet.name : name}」并设为当前形象`);
       await refresh();
       if (onPetChanged) await onPetChanged(activeId);
@@ -567,6 +797,13 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     const count = el('span', 'pet-card-meta', `${pets.length} 个形象`);
     toolbar.appendChild(count);
     root.appendChild(toolbar);
+
+    // ---- 显示开关（放在最显眼的位置）
+    //
+    // 用户要求「插件应该支持关闭宠物」。这个开关必须**触手可及**：
+    // 藏进「设置 → 插件」两层里就等于没有——想安静一会儿还要翻半天，
+    // 用户会继续用「卸载插件」那个笨办法。
+    root.appendChild(renderVisibility());
 
     if (notice) {
       const box = el(
@@ -673,9 +910,12 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     ));
     header.appendChild(title);
 
-    if (detail.author) {
-      header.appendChild(el('div', 'pet-field-hint', `作者：${detail.author}`));
-    }
+    // ---- 作者署名
+    //
+    // 用户要求「自定义宠物应该支持设置作者名，方便其他人制作宠物发布」。
+    // 因此这里对**自建**形象给一个可编辑的输入框；对内置形象只显示
+    // （内置形象是随插件发布的，作者固定为「官方」）。
+    header.appendChild(renderAuthorRow());
     if (detail.size) {
       header.appendChild(el(
         'div',
@@ -718,6 +958,9 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     wrap.appendChild(header);
 
     wrap.appendChild(renderAppearance());
+
+    // ---- 触发时间（唯一由时间驱动的两个行为：idle 小动作 / 自动漫游）
+    wrap.appendChild(renderSchedule());
 
     // ---- 动画预览（可以直接播具体动作，内置形象同样支持）
     wrap.appendChild(renderPreview());
@@ -853,6 +1096,184 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     ));
     section.appendChild(renderField);
 
+    return section;
+  }
+
+  /**
+   * **作者署名**一行。
+   *
+   * 用户要求「自定义宠物应该支持设置作者名，方便其他人制作宠物发布」——
+   * 有了署名，别人拿到一个宠物包就知道是谁做的，也才可能去找作者确认。
+   * 内置形象的作者固定为「官方」，只读显示。
+   */
+  function renderAuthorRow() {
+    const field = el('div', 'pet-field');
+    const head = el('div', 'pet-slider-head');
+    head.appendChild(el('span', 'pet-field-label', '作者'));
+    field.appendChild(head);
+
+    if (!detail.writable) {
+      // 内置形象：只显示，不给编辑（它的 pet.json 是随包资源）
+      const badge = el('div', 'pet-choice-row');
+      badge.appendChild(el(
+        'span',
+        'pet-badge is-builtin',
+        detail.author || '官方',
+      ));
+      field.appendChild(badge);
+      field.appendChild(el(
+        'div',
+        'pet-field-hint',
+        '插件自带的形象，作者由随包资源固定。',
+      ));
+      return field;
+    }
+
+    const input = el('input', 'pet-input');
+    input.type = 'text';
+    input.value = detail.author || '';
+    input.placeholder = '例如：你的昵称';
+    input.maxLength = 60;
+    input.dataset.authorInput = 'true';
+    input.setAttribute('aria-label', '形象作者');
+    // 失焦或回车才提交：逐字符提交会打出一串请求
+    const commit = () => {
+      const next = input.value.trim();
+      if (next === (detail.author || '')) return;
+      updateMeta({ author: next }, {
+        message: next ? `作者已设为「${next}」` : '已清空作者',
+      });
+    };
+    input.addEventListener('change', commit);
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        input.blur();
+      }
+    });
+    field.appendChild(input);
+    field.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '会写进形象的 pet.json，导出形象包时一起带走——'
+      + '别人拿到这个包就能看到是谁做的。',
+    ));
+    return field;
+  }
+
+  /**
+   * **触发时间**区：调整「多久自己动一次」。
+   *
+   * 只列出真正**由时间驱动**的两个行为（`idle` 小动作 / 自动漫游）。
+   * 其余动作由事件触发——`click` 要有人点、`fall` 要松手、`happy` 要有播报，
+   * 给它们设「多久一次」没有意义，后端也会拒绝，因此这里不渲染它们的滑块。
+   *
+   * 这两项**对内置形象同样开放**：它们落在 `data/settings.json`（用户偏好），
+   * 不是随包资源。内置形象恰恰是大多数用户唯一会用的形象。
+   */
+  function renderSchedule() {
+    const section = el('div', 'pet-section');
+    const title = el('div', 'pet-section-title');
+    title.appendChild(el('span', null, '触发时间'));
+    title.appendChild(el('span', 'pet-badge', '可调节'));
+    section.appendChild(title);
+    section.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '只有「由时间自己发生」的行为能设间隔。点击、下落、播报这些由事件触发，'
+      + '没有「多久一次」可言。这两项是按形象记住的。',
+    ));
+
+    const effective = detail.schedule || {};
+    const declared = detail.declaredSchedule || {};
+
+    for (const behavior of SCHEDULE_BEHAVIORS) {
+      // ⚠️ 必须用 `behavior.key` 取值，不能用 `behavior` 本身：
+      // 后者是 `{key, label, hint}` 对象，`effective[对象]` 恒为 `undefined`，
+      // 于是滑块会渲染成**极值**（下限/上限），而用户看到的是「0.2~3600 秒」。
+      // 实测踩到过：滑块看着在、也能拖，但初值是错的——比报错难查得多。
+      const preset = DEFAULT_SCHEDULE_MS[behavior.key] || { min: 6000, max: 18000 };
+      const current = effective[behavior.key] || preset;
+      const suggested = declared[behavior.key] || preset;
+      const minMs = clampScheduleMs(current.minIntervalMs, preset.min);
+      const maxMs = clampScheduleMs(current.maxIntervalMs, preset.max);
+
+      const field = el('div', 'pet-field');
+      const head = el('div', 'pet-slider-head');
+      head.appendChild(el('span', 'pet-field-label', behavior.label));
+      const readout = el(
+        'span',
+        'pet-slider-value',
+        formatInterval(minMs, maxMs),
+      );
+      head.appendChild(readout);
+      field.appendChild(head);
+
+      // 两个滑块（下界 / 上界）。用两个而不是一个「区间滑块」：
+      // 原生 `<input type="range">` 不支持双柄，而自己造一个双柄滑块
+      // 要处理键盘可达性、指针捕获与边界交叉——为一个次要设置不值得。
+      const row = el('div', 'pet-schedule-row');
+      for (const bound of ['min', 'max']) {
+        const slider = el('input', 'pet-slider');
+        slider.type = 'range';
+        slider.min = String(limits.scheduleMinMs);
+        slider.max = String(limits.scheduleMaxMs);
+        // 用**秒**做步长（100ms）而不是 1ms：设置面板上没人会去调 1 毫秒，
+        // 而 1ms 的步长会让滑块几乎不可用（3.6e6 个位置）。
+        slider.step = '100';
+        slider.value = String(bound === 'min' ? minMs : maxMs);
+        slider.dataset.scheduleBehavior = behavior.key;
+        slider.dataset.scheduleBound = bound;
+        slider.setAttribute(
+          'aria-label', `${behavior.label}的${bound === 'min' ? '最短' : '最长'}间隔`,
+        );
+        const live = () => {
+          // 读数按**这个行为自己的**区间夹，而不是全局的 200~3600000：
+          // 用全局区间的话，拖动时读数会跳到「0.2~3600 秒」这种没意义的值。
+          const low = clampScheduleMs(
+            Number(row.querySelector('[data-schedule-bound="min"]').value),
+            preset.min,
+          );
+          const high = clampScheduleMs(
+            Number(row.querySelector('[data-schedule-bound="max"]').value),
+            preset.max,
+          );
+          readout.textContent = formatInterval(low, high);
+        };
+        slider.addEventListener('input', live);
+        // 松手才提交 —— 否则一次拖动会打出几十个请求
+        slider.addEventListener('change', () => {
+          const low = Number(row.querySelector('[data-schedule-bound="min"]').value);
+          const high = Number(row.querySelector('[data-schedule-bound="max"]').value);
+          updateSchedule(behavior.key, {
+            minIntervalMs: low,
+            maxIntervalMs: high,
+          });
+        });
+        row.appendChild(slider);
+      }
+      field.appendChild(row);
+      field.appendChild(el(
+        'div',
+        'pet-field-hint',
+        `${behavior.hint}`
+        + (suggested.minIntervalMs
+          ? `形象包建议 ${formatInterval(suggested.minIntervalMs, suggested.maxIntervalMs)}。`
+          : ''),
+      ));
+      section.appendChild(field);
+    }
+
+    const row = el('div', 'pet-panel-toolbar');
+    if (detail.scheduleOverridden) {
+      row.appendChild(button('恢复默认触发时间', 'is-icon', () => resetSchedule()));
+    }
+    row.appendChild(el(
+      'span',
+      'pet-card-meta',
+      detail.scheduleOverridden ? '已自定义' : '正在用默认 / 形象包的设置',
+    ));
+    section.appendChild(row);
     return section;
   }
 
@@ -1079,7 +1500,7 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     box.appendChild(el(
       'div',
       'pet-field-hint',
-      '插件自带的形象现在是只读的，这些图**不会再生效**，但它们仍占着数据目录。'
+      '插件自带的形象现在是只读的，这些图不会再生效，但它们仍占着数据目录。'
       + '清理只删除你自己上传的覆盖文件，不会动插件自带的图。',
     ));
     const row = el('div', 'pet-panel-toolbar');
@@ -1092,6 +1513,38 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
   function formatScale(value) {
     const number = Number(value) || 1;
     return `${Math.round(number * 100) / 100}×`;
+  }
+
+  /**
+   * 把一个毫秒间隔夹到合法区间内。
+   *
+   * 与后端的 `clamp_schedule_ms` 同一套语义：夹住而不是抛错——
+   * 这个值会被渲染进滑块的 `value`，而 `NaN` 会让滑块直接失效。
+   */
+  function clampScheduleMs(value, fallbackLow) {
+    const low = Number(limits.scheduleMinMs) || SCHEDULE_FALLBACK_MIN_MS;
+    const high = Number(limits.scheduleMaxMs) || SCHEDULE_FALLBACK_MAX_MS;
+    const number = Number(value);
+    const base = Number.isFinite(number) && number > 0
+      ? number
+      : (Number(fallbackLow) || low);
+    return Math.round(Math.min(Math.max(base, low), high));
+  }
+
+  /**
+   * 把「最小~最大」毫秒区间格式化成**秒**（面板上没人按毫秒思考）。
+   *
+   * 小于 1 秒时保留一位小数：`0.2~0.5 秒` 比 `0~1 秒` 有用得多。
+   */
+  function formatInterval(minMs, maxMs) {
+    const low = Number(minMs) || 0;
+    const high = Number(maxMs) || 0;
+    const format = (value) => {
+      const seconds = value / 1000;
+      if (seconds >= 10) return String(Math.round(seconds));
+      return String(Math.round(seconds * 10) / 10);
+    };
+    return `${format(low)}~${format(high)} 秒`;
   }
 
   /**
@@ -1187,9 +1640,29 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     nameInput.value = draftName;
     nameInput.placeholder = '例如：我的猫娘';
     nameInput.maxLength = 60;
+    nameInput.dataset.createName = 'true';
     nameInput.addEventListener('input', () => { draftName = nameInput.value; });
     nameField.appendChild(nameInput);
     header.appendChild(nameField);
+
+    // ---- 作者署名（用户要求：自定义宠物应能设作者名，便于发布）
+    const authorField = el('div', 'pet-field');
+    authorField.appendChild(el('div', 'pet-field-label', '作者'));
+    const authorInput = el('input', 'pet-input');
+    authorInput.type = 'text';
+    authorInput.value = draftAuthor;
+    authorInput.placeholder = '例如：你的昵称（可留空）';
+    authorInput.maxLength = 60;
+    authorInput.dataset.createAuthor = 'true';
+    authorInput.addEventListener('input', () => { draftAuthor = authorInput.value; });
+    authorField.appendChild(authorInput);
+    authorField.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '会写进形象的 pet.json，导出形象包时一起带走。'
+      + '想让别人知道这个宠物是谁做的，就填上。',
+    ));
+    header.appendChild(authorField);
     wrap.appendChild(header);
 
     // ---- 动作列表
@@ -1206,6 +1679,12 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
       section.appendChild(renderCreateRow(item));
     }
     wrap.appendChild(section);
+
+    // ---- 标准图像（不播动画时显示的那一帧）
+    wrap.appendChild(renderCreateStill());
+
+    // ---- 触发时间（初始值；创建后仍可在形象详情里改）
+    wrap.appendChild(renderCreateSchedule());
 
     // ---- 外观初值
     const look = el('div', 'pet-section');
@@ -1232,7 +1711,7 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     scaleField.appendChild(el(
       'div',
       'pet-field-hint',
-      '创建后仍可在形象详情里随时调整，并且是**按形象**记住的。',
+      '创建后仍可在形象详情里随时调整，并且是按形象记住的。',
     ));
     look.appendChild(scaleField);
 
@@ -1267,6 +1746,9 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
       creating = false;
       draft = {};
       draftName = '';
+      draftAuthor = '';
+      draftStill = null;
+      draftSchedule = null;
       notice = null;
       render();
     }));
@@ -1278,6 +1760,185 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     wrap.appendChild(actions);
 
     return wrap;
+  }
+
+  /**
+   * 新建表单的**标准图像**区。
+   *
+   * 这是本轮修「宠物一直卡在抬头看的那一帧」的入口。不设也能用（回落到
+   * idle 首帧），但作者一旦给 idle 挂了第二套动画（例如「张望」），
+   * 回落值就可能是个怪姿势，所以这里明确地把这件事摆出来让作者决定。
+   *
+   * 三种选择：
+   * - 不设（默认，回落 idle 首帧）；
+   * - 复用某个已上传动作的某一帧（最常见的「idle 第 3 帧就是我要的姿势」）；
+   * - 单独上传一张。
+   */
+  function renderCreateStill() {
+    const section = el('div', 'pet-section');
+    const title = el('div', 'pet-section-title');
+    title.appendChild(el('span', null, '标准图像'));
+    title.appendChild(el('span', 'pet-badge', '可选'));
+    section.appendChild(title);
+    section.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '不播放动画时显示的那一帧（也就是平时静止的姿势）。'
+      + '不设就回落到「待机」的第一帧——若待机挂了两套动画，'
+      + '那个回落值可能是个怪姿势，因此建议显式选一张。',
+    ));
+
+    const row = el('div', 'pet-choice-row');
+    const modes = [
+      { key: 'none', label: '不设（用待机首帧）' },
+      { key: 'action', label: '复用某个动作的一帧' },
+      { key: 'file', label: '单独上传一张' },
+    ];
+    const currentKey = !draftStill ? 'none' : (draftStill.file ? 'file' : 'action');
+    for (const mode of modes) {
+      const node = el(
+        'button',
+        `pet-choice ${currentKey === mode.key ? 'is-active' : ''}`.trim(),
+        mode.label,
+      );
+      node.type = 'button';
+      node.dataset.marqueeIgnore = 'true';
+      node.dataset.stillMode = mode.key;
+      node.addEventListener('click', () => {
+        if (mode.key === 'none') draftStill = null;
+        else if (mode.key === 'action') draftStill = { action: 'idle', frame: 0 };
+        else draftStill = { file: null, frames: 1 };
+        render();
+      });
+      row.appendChild(node);
+    }
+    section.appendChild(row);
+
+    if (currentKey === 'action') {
+      const pick = el('div', 'pet-field');
+      const select = el('select', 'pet-input');
+      select.dataset.stillAction = 'true';
+      for (const [action, entry] of Object.entries(draft)) {
+        if (!entry || !entry.file) continue;
+        const option = el('option', null, ACTION_LABELS[action] || action);
+        option.value = action;
+        select.appendChild(option);
+      }
+      select.value = draftStill.action || 'idle';
+      select.addEventListener('change', () => {
+        draftStill = { action: select.value, frame: 0 };
+        render();
+      });
+      pick.appendChild(el('div', 'pet-field-label', '用哪个动作的图'));
+      pick.appendChild(select);
+
+      const frames = Math.max(1, Number((draft[select.value] || {}).frames) || 1);
+      const frameInput = el('input', 'pet-input is-num');
+      frameInput.type = 'number';
+      frameInput.min = '1';
+      frameInput.max = String(frames);
+      frameInput.value = String(Math.min(Number(draftStill.frame) || 0, frames - 1) + 1);
+      frameInput.dataset.stillFrame = 'true';
+      frameInput.addEventListener('change', () => {
+        const value = Math.max(1, Math.min(frames, Number(frameInput.value) || 1));
+        frameInput.value = String(value);
+        draftStill = { action: select.value, frame: value - 1 };
+      });
+      pick.appendChild(el('div', 'pet-field-label', `用第几帧（这个动作共 ${frames} 帧）`));
+      pick.appendChild(frameInput);
+      section.appendChild(pick);
+    } else if (currentKey === 'file') {
+      const pick = el('div', 'pet-field');
+      const cell = el('div', 'pet-create-file');
+      cell.appendChild(button(
+        draftStill.file ? '重新选择' : '选择图片',
+        'is-icon',
+        () => pickFile({
+          accept: 'image/*',
+          onPicked: (file) => {
+            draftStill = Object.assign({ frames: 1 }, draftStill, { file });
+            render();
+          },
+        }),
+      ));
+      if (draftStill.file) {
+        cell.appendChild(el('span', 'pet-card-meta', truncateName(draftStill.file.name)));
+      }
+      pick.appendChild(cell);
+      pick.appendChild(el(
+        'div',
+        'pet-field-hint',
+        '会按形象的单帧尺寸自动缩放居中，不必自己裁。',
+      ));
+      section.appendChild(pick);
+    }
+
+    return section;
+  }
+
+  /**
+   * 新建表单的**触发时间**区。
+   *
+   * 默认「用默认值」——大多数作者不该被这个困扰。想调的作者可以在这里
+   * 给出形象自己的节奏，它会写进 `pet.json` 成为这个形象的「作者建议值」。
+   */
+  function renderCreateSchedule() {
+    const section = el('div', 'pet-section');
+    const title = el('div', 'pet-section-title');
+    title.appendChild(el('span', null, '触发时间'));
+    title.appendChild(el('span', 'pet-badge', '可选'));
+    section.appendChild(title);
+    section.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '闲着的时候多久自己动一次。不填就用默认值'
+      + '（待机小动作 6~18 秒、自动漫游 3~9 秒），大多数形象不需要改。',
+    ));
+
+    for (const behavior of SCHEDULE_BEHAVIORS) {
+      const preset = DEFAULT_SCHEDULE_MS[behavior.key]
+        || { min: 6000, max: 18000 };
+      const current = (draftSchedule && draftSchedule[behavior.key]) || preset;
+      const minMs = clampScheduleMs(current.min ?? current.minIntervalMs, preset.min);
+      const maxMs = clampScheduleMs(current.max ?? current.maxIntervalMs, preset.max);
+
+      const field = el('div', 'pet-field');
+      const head = el('div', 'pet-slider-head');
+      head.appendChild(el('span', 'pet-field-label', behavior.label));
+      const readout = el('span', 'pet-slider-value', formatInterval(minMs, maxMs));
+      head.appendChild(readout);
+      field.appendChild(head);
+
+      const row = el('div', 'pet-schedule-row');
+      for (const bound of ['min', 'max']) {
+        const slider = el('input', 'pet-slider');
+        slider.type = 'range';
+        slider.min = String(limits.scheduleMinMs);
+        slider.max = String(limits.scheduleMaxMs);
+        slider.step = '100';
+        slider.value = String(bound === 'min' ? minMs : maxMs);
+        slider.dataset.createSchedule = behavior.key;
+        slider.dataset.createScheduleBound = bound;
+        slider.setAttribute(
+          'aria-label', `新形象的${behavior.label}${bound === 'min' ? '最短' : '最长'}间隔`,
+        );
+        slider.addEventListener('input', () => {
+          const low = Number(row.querySelector('[data-create-schedule-bound="min"]').value);
+          const high = Number(row.querySelector('[data-create-schedule-bound="max"]').value);
+          readout.textContent = formatInterval(low, high);
+          draftSchedule = Object.assign({}, draftSchedule, {
+            [behavior.key]: {
+              min: clampScheduleMs(low, preset.min),
+              max: clampScheduleMs(high, preset.max),
+            },
+          });
+        });
+        row.appendChild(slider);
+      }
+      field.appendChild(row);
+      section.appendChild(field);
+    }
+    return section;
   }
 
   /** 新建表单里的单个动作行：选图 + 帧数 + 帧率。 */
@@ -1413,9 +2074,14 @@ export function createSettingsPanel({ api, getConfig, getOwnSettings, onConfigCh
     /** 表面已挂载时再次从入口进入（宿主不会重新 mount）。 */
     onOpen() {
       if (!root) return;
+      // 每次打开都同步一次显示状态：宠物可能被别处（诊断句柄 / 别的入口）关掉了
+      if (typeof getHidden === 'function') hiddenState = Boolean(getHidden());
       // 每次打开都刷新一次：形象可能被别处改过
       withBusy(refresh);
     },
+
+    /** 由 `plugin.js` 回灌显示状态（后台改状态时让面板跟上）。 */
+    setHiddenState,
 
     /**
      * 打开面板时回到形象详情（而不是停在新建表单）。

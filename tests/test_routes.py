@@ -437,12 +437,16 @@ def test_settings_only_expose_structured_keys(env):
     """标量配置归宿主的 `config_schema`，插件设置里不该出现第二份。
 
     两边都存会引出「宿主的设置表单改了、插件却不生效」这类双写不同步的 bug。
-    `petScales` / `petPixelated` 是**结构化**的（每个形象一个值），
-    宿主表单表达不了，因此合法地留在这里。
+    `petScales` / `petPixelated` / `petSchedules` 是**结构化**的
+    （每个形象一个值，宿主表单表达不了），`petHidden` 则是「宠物要不要显示」
+    ——它需要触手可及（面板顶部），放宿主表单里就等于藏起来了。
+    因此这几个合法地留在这里。
     """
     _app, _store, client, _api = env
     settings = json_of(client.get('/api/plugins/stm-pet/settings'))['settings']
-    assert set(settings) == {'activePetId', 'petScales', 'petPixelated'}
+    assert set(settings) == {
+        'activePetId', 'petScales', 'petPixelated', 'petSchedules', 'petHidden',
+    }
     for scalar in ('quietMode', 'quiet_mode', 'scale', 'sleepAfter', 'sleep_after'):
         assert scalar not in settings
 

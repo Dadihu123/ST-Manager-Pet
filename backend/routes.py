@@ -27,7 +27,15 @@ from .core.errors import (
     PetError,
 )
 from .core.imports import MAX_IMAGE_BYTES, MAX_PACK_BYTES, check_payload_size
-from .core.pack import ACTION_FALLBACKS, DEFAULT_PIXELATED, SCALE_RANGE
+from .core.pack import (
+    ACTION_FALLBACKS,
+    MAX_IDLE_PLAYS,
+    MAX_SCHEDULE_MS,
+    MIN_SCHEDULE_MS,
+    SCALE_RANGE,
+    SCHEDULE_BEHAVIORS,
+    STILL_ACTION,
+)
 from .core.paths import is_action_name
 from .core.store import (
     CONFIG_KEYS,
@@ -195,6 +203,12 @@ def register_routes(api, store: PetStore) -> None:
                 'maxPackBytes': MAX_PACK_BYTES,
                 'scaleMin': SCALE_RANGE[0],
                 'scaleMax': SCALE_RANGE[1],
+                # 触发节奏的合法区间与可设置的行为（面板据此渲染滑块，
+                # 不自己写死一份——两边写死必然不一致）。
+                'scheduleMinMs': MIN_SCHEDULE_MS,
+                'scheduleMaxMs': MAX_SCHEDULE_MS,
+                'scheduleBehaviors': list(SCHEDULE_BEHAVIORS),
+                'maxIdlePlays': MAX_IDLE_PLAYS,
             },
         })
 
@@ -354,9 +368,16 @@ def register_routes(api, store: PetStore) -> None:
     def create_pet():
         """**从零新建**一个用户形象（不需要 zip，也不需要手写 pet.json）。
 
-        请求是 multipart：除 `name` 等标量字段外，每个动作一个文件字段，
-        字段名就是动作名（`idle` / `walk` / …），配套的 `frames` / `fps` 走
+        请求是 multipart：除 `name` / `author` 等标量字段外，每个动作一个文件字段，
+        字段名就是动作名（`idle` / `walk-left` / …），配套的 `frames` / `fps` 走
         `meta` 这个 JSON 字段（`{"idle": {"frames": 4, "fps": 6}}`）。
+
+        两个**结构化**字段也走 JSON 字符串：
+
+        - `still`：标准图像。`{"data": <单独上传的文件字段名>}` 或
+          `{"action": "idle", "frame": 2}`（复用某个动作的某一帧）。
+          单独上传的图放在文件字段 `still` 里，这里写 `{"file": true}`。
+        - `schedule`：触发节奏，`{"idle": {"intervalMs": [6000, 18000]}, ...}`。
 
         为什么用 multipart 而不是纯 JSON：图是二进制，base64 会让体积涨 33%
         且要自己处理解码；multipart 是浏览器原生能力（`FormData`），
@@ -372,6 +393,9 @@ def register_routes(api, store: PetStore) -> None:
             if not uploaded or not uploaded.filename:
                 continue
             action = str(field_name or '').strip()
+            if action == STILL_ACTION:
+                # 标准图像走单独字段，不当作动作（见下）
+                continue
             if not is_action_name(action):
                 raise PetError(
                     CODE_IMAGE_INVALID,
@@ -395,6 +419,20 @@ def register_routes(api, store: PetStore) -> None:
                 hint='每个动作对应一个文件字段，字段名是动作名（例如 idle）。',
             )
 
+        # ---- 标准图像
+        #
+        # 两种来源共用 `still` 这个字段名：`request.form` 里是 JSON 文本
+        # （复用某个动作的某一帧），`request.files` 里是单独上传的图。
+        # 前端按情况只填其中一个，这里把它们合并成 store 认的结构。
+        still = _json_field(payload.get('still'))
+        still_file = request.files.get('still')
+        if still_file and still_file.filename:
+            still = dict(still)
+            still['data'] = still_file.read(MAX_IMAGE_BYTES + 1)
+            # 单独上传的图**不能**同时带 `action`：那会让 store 走到
+            # 「复用某个动作」那条路，从而把刚上传的图丢掉。
+            still.pop('action', None)
+
         scale = payload.get('scale')
         pixelated = payload.get('pixelated')
         created = store.create_pet(
@@ -404,6 +442,8 @@ def register_routes(api, store: PetStore) -> None:
             author=payload.get('author') or '',
             scale=clamp_scale(scale) if scale not in (None, '') else None,
             pixelated=_optional_bool(pixelated),
+            still=still or None,
+            schedule=_json_field(payload.get('schedule')) or None,
         )
         store.update_settings({'activePetId': created['id']})
         return jsonify({
@@ -411,6 +451,77 @@ def register_routes(api, store: PetStore) -> None:
             'pet': runtime(created['id']),
             'activePetId': created['id'],
         })
+
+    @api.route('/pets/<pet_id>/meta', ['POST'])
+    @_handle
+    def update_pet_meta(pet_id):
+        """改写**自建形象**的元信息：名字 / 作者 / 标准图像 / 触发节奏。
+
+        与 `/appearance` 的分工：那个改的是「用户怎么看」（落在 `data/settings.json`，
+        内置形象也能改）；这个改的是「形象本身」（写进 `pet.json`，只对自建形象开放）。
+
+        传 `null` 表示**清除**该项：
+        - `still: null` → 删掉标准图像声明，回落到 idle 首帧；
+        - `schedule: null` → 删掉包内节奏声明，回落到默认值。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        store.load_pack(pet_id)  # 不存在会抛 404
+        payload = _json_body()
+
+        kwargs = {}
+        if 'name' in payload:
+            kwargs['name'] = payload.get('name')
+        if 'author' in payload:
+            kwargs['author'] = payload.get('author')
+        if 'still' in payload:
+            still = payload.get('still')
+            kwargs['still'] = {} if still in (None, '') else still
+        if 'schedule' in payload:
+            schedule = payload.get('schedule')
+            kwargs['schedule'] = {} if schedule in (None, '') else schedule
+
+        if not kwargs:
+            return jsonify({'success': True, 'pet': runtime(pet_id)})
+        pack = store.update_pet_meta(pet_id, **kwargs)
+        return jsonify({'success': True, 'pet': runtime(pack['id'])})
+
+    @api.route('/pets/<pet_id>/schedule', ['POST'])
+    @_handle
+    def update_pet_schedule(pet_id):
+        """调整某形象的**触发节奏**（逐形象保存，内置形象同样可调）。
+
+        用户要求「支持调整不同动作的触发时间」。真正由**时间驱动**的只有两个
+        行为，因此这里只认它们：
+
+        - `idle`：闲着时偶尔动一下（默认 6~18 秒一次）；
+        - `roam`：闲着时自己在屏幕底部走一走（默认 3~9 秒一次）。
+
+        其余动作由**事件**触发（`click` 要有人点、`fall` 要松手、`happy` 要有播报），
+        给它们设「多久一次」没有意义——传了会得到明确错误，而不是静默忽略。
+
+        为什么这两项落在**用户设置**而不是 `pet.json`：它们是「这台机器上怎么养」
+        的偏好（有人喜欢活泼、有人嫌吵），而且**内置形象必须能调**——
+        内置形象恰恰是大多数用户唯一会用的形象，而它是只读的。
+        传 `null` 表示清除覆盖、回落到包内声明 / 默认值。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        store.load_pack(pet_id)  # 不存在会抛 404
+        payload = _json_body()
+
+        if payload.get('reset'):
+            store.clear_pet_schedule(pet_id)
+        else:
+            patch = payload.get('schedule')
+            if not isinstance(patch, dict):
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    'schedule 应为对象',
+                    user_msg='请求格式不对。',
+                    hint='形如 {"idle": {"minIntervalMs": 6000, "maxIntervalMs": 18000}}。',
+                )
+            store.set_pet_schedule(pet_id, patch)
+
+        return jsonify({'success': True, 'pet': runtime(pet_id)})
 
     @api.route('/pets/<pet_id>/export', ['GET'])
     @_handle
@@ -522,6 +633,45 @@ def register_routes(api, store: PetStore) -> None:
             'pet': runtime(pet_id),
         })
 
+    # ------------------------------------------------------------ 显示开关
+
+    @api.route('/visibility', ['GET', 'POST'])
+    @_handle
+    def pet_visibility():
+        """宠物是否显示（**关闭宠物**的开关）。
+
+        用户要求：「插件应该支持关闭宠物，目前好像只有卸载或者停用宠物插件
+        才能关闭，不太合理」。确实不合理——想安静一会儿却要卸载插件，
+        代价完全不对等。
+
+        语义边界（很重要）：
+
+        - 关掉的是**宠物本身**，不是插件。插件仍然加载、设置面板仍能打开、
+          坞入口仍然在——否则用户关掉之后就没有任何入口把它开回来了。
+        - 不碰宿主的插件启用状态（那是宿主的东西，插件不该改）。
+
+        `GET` 读当前状态，`POST` 写入：
+        - `{"hidden": true}` 隐藏；`{"hidden": false}` 显示；
+        - 不传 `hidden` 时**取反**（面板上的开关按钮就是这么用的，
+          省掉一次「先读再写」的往返）。
+        """
+        if request.method == 'GET':
+            return jsonify({'success': True, 'hidden': store.is_hidden()})
+
+        payload = _json_body()
+        if 'hidden' in payload:
+            raw = payload.get('hidden')
+            if not isinstance(raw, bool):
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'hidden 应为布尔值，实际 {type(raw).__name__}',
+                    user_msg='开关只能是开或关。',
+                )
+            hidden = store.set_hidden(raw)
+        else:
+            hidden = store.set_hidden(not store.is_hidden())
+        return jsonify({'success': True, 'hidden': hidden})
+
     # ---------------------------------------------------------------- 设置
 
     @api.route('/settings', ['GET'])
@@ -582,7 +732,6 @@ def register_routes(api, store: PetStore) -> None:
                 'note': entry.get('note'),
                 'overridden': action in pack['overrides'],
                 'variants': variants,
-                'idleTrigger': entry.get('idleTrigger'),
             })
         return jsonify({
             'success': True,
@@ -599,5 +748,12 @@ def register_routes(api, store: PetStore) -> None:
             'overrides': pack.get('overrides', []),
             'staleOverrides': pack.get('staleOverrides', []),
             'missingRequired': pack['missingRequired'],
+            # 标准图像（不播动画时显示的那一帧）。面板用它在预览区标出
+            # 「静止时会显示这一张」，并让用户知道当前是作者声明的还是回落的。
+            'still': pack.get('still'),
+            # 触发节奏：生效值 + 包内声明值（供面板显示「已覆盖 / 作者建议」）。
+            'schedule': pack.get('schedule'),
+            'declaredSchedule': pack.get('declaredSchedule'),
+            'scheduleOverridden': pack.get('scheduleOverridden', False),
             'actions': summary,
         })

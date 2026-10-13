@@ -35,9 +35,13 @@ def env(tmp_path):
         'id': 'anim',
         'name': '节奏',
         'size': {'w': 64, 'h': 64},
+        # 触发节奏在**顶层** `schedule`（`roam` 不是动作，挂不到动作下面）
+        'schedule': {
+            'idle': {'intervalMs': [3000, 9000], 'plays': 2},
+            'roam': {'intervalMs': [1000, 2000]},
+        },
         'animations': {
             'idle': {
-                'trigger': 'random', 'intervalMs': [3000, 9000], 'plays': 2,
                 'variants': [
                     {'sheet': 'idle-a.png', 'frames': 4, 'fps': 2.5,
                      'frameMs': [400, 300, 300, 600], 'weight': 5},
@@ -126,9 +130,29 @@ def test_runtime_exposes_frame_ms_and_variants(env):
     assert idle['frameMs'] == [400, 300, 300, 600]
     assert len(idle['variants']) == 2
     assert [v['weight'] for v in idle['variants']] == [5, 3]
-    assert idle['idleTrigger']['mode'] == 'random'
-    assert idle['idleTrigger']['minIntervalMs'] == 3000
-    assert idle['idleTrigger']['plays'] == 2
+    # ★ 触发节奏在**形象级**的 `schedule` 里（`roam` 不是动作）
+    schedule = payload['pet']['schedule']
+    assert schedule['idle']['mode'] == 'random'
+    assert schedule['idle']['minIntervalMs'] == 3000
+    assert schedule['idle']['plays'] == 2
+    assert schedule['roam']['minIntervalMs'] == 1000
+
+
+def test_runtime_exposes_still(env):
+    """★ 标准图像必须下发——前端在 idle 的「静止」阶段画它。
+
+    没有它的话，宠物会卡在「上一次随机抽到的变体」的首帧上
+    （内置形象的「张望」就是个抬头姿势）。
+    """
+    _app, _store, client, _api = env
+    payload = json_of(client.get('/api/plugins/stm-pet/runtime'))
+    still = payload['pet']['still']
+    assert still['url'], '标准图像必须有 URL'
+    assert still['frames'] == 4
+    assert still['frame'] == 0
+    assert still['declared'] is False, '这个包没声明 still，应标明是回落的'
+    # 而且这个 URL 要真的能取到图
+    assert client.get(still['url']).status_code == 200
 
 
 def test_runtime_variant_urls_are_reachable(env):
@@ -163,13 +187,17 @@ def test_preview_exposes_variants_with_geometry(env):
 
 
 def test_preview_exposes_idle_trigger(env):
+    """预览接口也要带上触发节奏与标准图像——面板的「触发时间」区靠它渲染。"""
     _app, _store, client, _api = env
     payload = json_of(client.get('/api/plugins/stm-pet/pets/anim/preview'))
-    idle = next(item for item in payload['actions'] if item['action'] == 'idle')
-    assert idle['idleTrigger']['mode'] == 'random'
-    # 非 idle 动作没有触发配置
-    click = next(item for item in payload['actions'] if item['action'] == 'click')
-    assert click['idleTrigger'] is None
+    assert payload['schedule']['idle']['mode'] == 'random'
+    assert payload['schedule']['idle']['minIntervalMs'] == 3000
+    assert payload['declaredSchedule']['idle']['minIntervalMs'] == 3000
+    assert payload['scheduleOverridden'] is False
+    assert payload['still']['url']
+    # 动作条目里**不该**再有 idleTrigger（节奏已上移到形象级）
+    for item in payload['actions']:
+        assert 'idleTrigger' not in item, f'{item["action"]} 不该有 idleTrigger'
 
 
 def test_preview_lists_actions_without_image(env):
@@ -300,17 +328,70 @@ def test_backend_and_frontend_weight_ranges_agree():
 
 
 def test_backend_and_frontend_idle_intervals_agree():
-    """idle 触发的默认间隔前后端必须一致（否则「没配置」时两边行为不同）。"""
+    """★ 触发节奏的默认值与行为名单前后端必须一致。
+
+    不一致的后果很隐蔽：「没配置」时两边的间隔不同，看起来像随机 bug。
+    而**行为名单**不一致更糟——前端多认一个行为，面板就会渲染出一个
+    后端会拒绝的滑块。
+    """
     import re
     import sys as _sys
 
     _sys.path.insert(0, REPO_ROOT)
-    from backend.core.pack import DEFAULT_IDLE_MAX_MS, DEFAULT_IDLE_MIN_MS
+    from backend.core.pack import (
+        DEFAULT_SCHEDULE_MS,
+        MAX_SCHEDULE_MS,
+        MIN_SCHEDULE_MS,
+        SCHEDULE_BEHAVIORS,
+    )
 
     with open(os.path.join(REPO_ROOT, 'frontend', 'animation.js'), encoding='utf-8') as handle:
         source = handle.read()
-    assert int(re.search(r'DEFAULT_IDLE_MIN_MS\s*=\s*([0-9]+)', source).group(1)) == DEFAULT_IDLE_MIN_MS
-    assert int(re.search(r'DEFAULT_IDLE_MAX_MS\s*=\s*([0-9]+)', source).group(1)) == DEFAULT_IDLE_MAX_MS
+
+    # 行为名单
+    declared = re.search(r'SCHEDULE_BEHAVIORS\s*=\s*\[([^\]]*)\]', source).group(1)
+    front_behaviors = re.findall(r"'([a-z-]+)'", declared)
+    assert front_behaviors == list(SCHEDULE_BEHAVIORS), (
+        f'前端 {front_behaviors} 与后端 {list(SCHEDULE_BEHAVIORS)} 不一致'
+    )
+
+    # 每个行为的默认间隔
+    for behavior, (low, high) in DEFAULT_SCHEDULE_MS.items():
+        block = re.search(
+            rf'{behavior}:\s*\{{\s*min:\s*([0-9]+),\s*max:\s*([0-9]+)\s*\}}', source,
+        )
+        assert block, f'前端缺少 {behavior} 的默认间隔'
+        assert (int(block.group(1)), int(block.group(2))) == (low, high), (
+            f'{behavior} 的默认间隔前后端不一致'
+        )
+
+    # 间隔的合法区间
+    assert int(re.search(r'MIN_SCHEDULE_MS\s*=\s*([0-9]+)', source).group(1)) == MIN_SCHEDULE_MS
+    assert int(
+        re.search(r'MAX_SCHEDULE_MS\s*=\s*([0-9]+)\s*\*\s*1000', source).group(1),
+    ) * 1000 == MAX_SCHEDULE_MS
+
+
+def test_frontend_schedule_behaviors_match_panel():
+    """★ 面板渲染的「触发时间」滑块必须与后端可设置的行为一致。
+
+    面板多渲染一个（例如给 `click` 一个滑块）的后果是：用户拖了、提交了、
+    后端 400——而界面上没有任何东西提示「这个动作根本不能设时间」。
+    """
+    import re as _re
+    import sys as _sys
+
+    _sys.path.insert(0, REPO_ROOT)
+    from backend.core.pack import SCHEDULE_BEHAVIORS
+
+    with open(os.path.join(REPO_ROOT, 'frontend', 'panel.js'), encoding='utf-8') as handle:
+        source = handle.read()
+    block = source[source.index('const SCHEDULE_BEHAVIORS = ['):]
+    block = block[:block.index('\n];')]
+    keys = _re.findall(r"key:\s*'([a-z-]+)'", block)
+    assert keys == list(SCHEDULE_BEHAVIORS), (
+        f'面板 {keys} 与后端 {list(SCHEDULE_BEHAVIORS)} 不一致'
+    )
 
 
 def test_backend_and_frontend_gesture_threshold_agree():

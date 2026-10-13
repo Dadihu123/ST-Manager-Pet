@@ -52,13 +52,14 @@ from .errors import (
     CODE_FILE_TOO_LARGE,
     CODE_IMAGE_INVALID,
     CODE_PACK_ANIMATION_MISSING,
+    CODE_PACK_FIELD_INVALID,
     CODE_PACK_IDLE_MISSING,
     CODE_PACK_NOT_FOUND,
+    CODE_PACK_UNREADABLE,
     CODE_WRITE_FAILED,
     PetError,
 )
 from .imports import (
-    ALLOWED_IMAGE_FORMATS,
     MAX_PACK_BYTES,
     check_size,
     load_image,
@@ -73,10 +74,19 @@ from .pack import (
     DEFAULT_SCALE,
     IMPORT_SOURCE_EXTENSIONS,
     KIND_ANIMATED,
+    MAX_IDLE_PLAYS,
+    MAX_FRAMES,
+    MAX_SCHEDULE_MS,
+    MIN_SCHEDULE_MS,
     ONE_SHOT_ACTIONS,
+    SCHEDULE_BEHAVIORS,
+    STILL_ACTION,
+    DEFAULT_PIXELATED,
     PetPack,
     SCALE_RANGE,
+    Trigger,
     loads as loads_pack,
+    parse_schedule,
 )
 from .paths import is_action_name, is_safe_relative_name, safe_join, to_posix
 
@@ -126,6 +136,34 @@ DEFAULT_SETTINGS = {
     #: 与 `petScales` 同样的道理：像素风与写实插画对放大方式的要求**互斥**
     #: （前者要硬边、后者要平滑），包能声明默认值，用户还能按自己屏幕覆盖。
     'petPixelated': {},
+    #: 逐形象的**时间驱动行为节奏**覆盖：
+    #: `{pet_id: {行为名: {'minIntervalMs': int, 'maxIntervalMs': int, 'plays': int}}}`。
+    #:
+    #: 用户要求「支持调整不同动作的触发时间」。真正由时间驱动的只有 `idle`
+    #: （闲着时偶尔动一下）与 `roam`（闲着时自己走走），其余动作由事件触发。
+    #:
+    #: 为什么放在这里而不是写进 `pet.json`：它与倍率、渲染方式同类——
+    #: 是**用户对自己这台机器**的偏好（有人喜欢宠物活泼、有人嫌吵），
+    #: 而不是形象本身的属性。放在这里还带来一个必要的好处：
+    #: **内置形象也能调**。写进 pet.json 的话，内置形象是只读的，
+    #: 而内置形象恰恰是大多数用户唯一会用的形象。
+    #:
+    #: 优先级：**用户设置 > 包内声明 > 默认值**（与 `effective_scale` 一致）。
+    'petSchedules': {},
+    #: 宠物是否**整个隐藏**（`True` = 不显示）。
+    #:
+    #: 用户要求：「插件应该支持关闭宠物，目前好像只有卸载或者停用宠物插件才能关闭，
+    #: 不太合理」。确实不合理——想安静一会儿却要卸载插件，代价完全不对等。
+    #:
+    #: 为什么是**全局**而不是逐形象：这是「现在要不要看到它」的开关，
+    #: 与「用哪个形象」无关。做成逐形象的话，用户关掉之后换个形象它又冒出来了。
+    #:
+    #: 为什么放在**这里**而不是 manifest 的 `config_schema`：
+    #: 宿主表单里的开关要用户去「设置 → 插件」翻两层才够得着，而这个开关
+    #: 需要触手可及（面板顶部 / 宠物右键）。两个地方都能改的话又会回到
+    #: 「双写不同步」那个坑。宿主表单里那些开关是「功能偏好」（播报、勿扰…），
+    #: 这是「存在与否」，语义不同，因此单独放在这里。
+    'petHidden': False,
 }
 
 #: manifest `config_schema` 里的标量键 → 前端运行期配置的键名。
@@ -171,6 +209,51 @@ def clamp_scale(value) -> float:
     if number != number:  # NaN
         return DEFAULT_SCALE
     return round(min(max(number, SCALE_MIN), SCALE_MAX), 3)
+
+
+def clamp_schedule_ms(value) -> int:
+    """把一个触发间隔（毫秒）夹到合法区间内。
+
+    与 `clamp_scale` 同样的取舍：夹住而不是抛错。这个值来自设置文件，
+    一个脏值不该让「打开设置面板」整件事失败。
+    """
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return MIN_SCHEDULE_MS
+    return int(min(max(number, MIN_SCHEDULE_MS), MAX_SCHEDULE_MS))
+
+
+def _pack_declares_sheet(processed: dict, sheet: str) -> bool:
+    """这张 sheet 是不是包里**某个动作**已经声明的图。
+
+    为什么要查：标准图像指向包内文件时，用户给的是**文件名**。
+    不查的话，一个拼错的文件名会写进 `pet.json`，
+    而后果是「形象能加载、标准图像空白」——比直接报错难查得多。
+    """
+    wanted = to_posix(sheet)
+    for outcome in (processed or {}).values():
+        declared = to_posix(outcome.get('sheet') or '')
+        if declared and declared == wanted:
+            return True
+    return False
+
+
+def _read_still_frames(still: dict, processed: dict, sheet: str) -> int:
+    """推断标准图像那张 sheet 有几帧。
+
+    优先用调用方给的 `frames`（面板知道它），否则从**声明了这张 sheet 的
+    那个动作**上取。两处都没有时退回 1（单帧）——那是安全的降级：
+    帧数只影响前端切帧几何，猜错只会显示错帧，不会崩。
+    """
+    raw = still.get('frames')
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+        return min(raw, MAX_FRAMES)
+    wanted = to_posix(sheet)
+    for outcome in (processed or {}).values():
+        if to_posix(outcome.get('sheet') or '') == wanted:
+            return max(1, int(outcome.get('frames') or 1))
+    return 1
 
 
 def sanitize_pet_id(raw, *, fallback: str = 'pet') -> str:
@@ -289,6 +372,7 @@ class PetStore:
         settings = dict(DEFAULT_SETTINGS)
         settings['petScales'] = {}
         settings['petPixelated'] = {}
+        settings['petSchedules'] = {}
         path = self.settings_path()
         if not os.path.isfile(path):
             return settings
@@ -302,10 +386,14 @@ class PetStore:
             for key, value in stored.items():
                 if key in DEFAULT_SETTINGS:
                     settings[key] = value
-        # 两个结构化项必须逐条清洗：
+        # 三个结构化项必须逐条清洗：
         # 手工编辑过 / 旧版本写坏的值不能让整个设置读不出来。
         settings['petScales'] = self._clean_scale_map(settings.get('petScales'))
         settings['petPixelated'] = self._clean_bool_map(settings.get('petPixelated'))
+        settings['petSchedules'] = self._clean_schedule_map(settings.get('petSchedules'))
+        # 隐藏开关必须是**真布尔**：手工写了 `"false"`（字符串）时
+        # `bool("false")` 是 `True`，宠物会莫名其妙消失。
+        settings['petHidden'] = settings.get('petHidden') is True
         return settings
 
     @staticmethod
@@ -340,6 +428,53 @@ class PetStore:
             cleaned[pet_id] = clamp_scale(number)
         return cleaned
 
+    @staticmethod
+    def _clean_schedule_map(raw) -> dict:
+        """把 `{pet_id: {行为: {minIntervalMs, maxIntervalMs, plays}}}` 清洗成合法结构。
+
+        存储用的键名与**运行期定义完全一致**（`minIntervalMs` /
+        `maxIntervalMs` / `plays`）。为什么要统一：面板、接口与运行期定义
+        已经在用这一套名字，存储层再造一套短名（`min` / `max`）意味着
+        每次读写都要翻译一次，而翻译点越多、越容易漏——漏掉的表现是
+        「设置保存了但读不回来」，非常难查。
+
+        逐条清洗而不是整体丢弃：手工编辑过 / 旧版本写坏的一项
+        不该让**所有**形象的节奏设置一起失效。
+        """
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for key, value in raw.items():
+            pet_id = sanitize_pet_id(key, fallback='')
+            if not pet_id or not isinstance(value, dict):
+                continue
+            per_pet = {}
+            for behavior, spec in value.items():
+                name = str(behavior or '').strip()
+                if name not in SCHEDULE_BEHAVIORS or not isinstance(spec, dict):
+                    continue
+                entry = {}
+                for field_name in ('minIntervalMs', 'maxIntervalMs'):
+                    raw_number = spec.get(field_name)
+                    if isinstance(raw_number, bool) or not isinstance(raw_number, (int, float)):
+                        continue
+                    entry[field_name] = clamp_schedule_ms(raw_number)
+                plays = spec.get('plays')
+                if isinstance(plays, int) and not isinstance(plays, bool) and plays >= 1:
+                    entry['plays'] = min(plays, MAX_IDLE_PLAYS)
+                # 区间写反了就调正（与包解析同一套宽容策略）
+                if (entry.get('minIntervalMs') is not None
+                        and entry.get('maxIntervalMs') is not None
+                        and entry['maxIntervalMs'] < entry['minIntervalMs']):
+                    entry['minIntervalMs'], entry['maxIntervalMs'] = (
+                        entry['maxIntervalMs'], entry['minIntervalMs'],
+                    )
+                if entry:
+                    per_pet[name] = entry
+            if per_pet:
+                cleaned[pet_id] = per_pet
+        return cleaned
+
     def update_settings(self, patch: dict) -> dict:
         """浅合并写入设置（未知键忽略；写入失败抛结构化错误）。"""
         if not isinstance(patch, dict):
@@ -354,6 +489,8 @@ class PetStore:
                     settings[key] = self._clean_scale_map(value)
                 elif key == 'petPixelated':
                     settings[key] = self._clean_bool_map(value)
+                elif key == 'petSchedules':
+                    settings[key] = self._clean_schedule_map(value)
                 else:
                     settings[key] = value
             self._write_json(self.settings_path(), settings)
@@ -455,6 +592,137 @@ class PetStore:
             settings['petPixelated'] = flags
             self._write_json(self.settings_path(), settings)
         return True
+
+    # ------------------------------------------------------------ 触发节奏
+
+    def effective_schedule(self, pet_id: str) -> dict:
+        """算出某形象**实际生效**的时间驱动节奏。
+
+        优先级（与 `effective_scale` 一致）：**用户设置 > 包内声明 > 默认值**。
+
+        返回 `{行为名: {mode, minIntervalMs, maxIntervalMs, plays}}`，
+        覆盖**全部** `SCHEDULE_BEHAVIORS`——前端不自己写默认值，
+        否则两边不一致时表现为「设了却不生效」。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        stored = (self.get_settings().get('petSchedules') or {}).get(pet_id) or {}
+        try:
+            pack = self.load_pack(pet_id)
+        except PetError:
+            pack = None
+
+        result = {}
+        for behavior in SCHEDULE_BEHAVIORS:
+            base = pack.schedule_for(behavior) if pack is not None else None
+            if base is None:
+                base = Trigger()
+            payload = base.to_dict()
+            override = stored.get(behavior) or {}
+            for field_name in ('minIntervalMs', 'maxIntervalMs', 'plays'):
+                if field_name in override:
+                    payload[field_name] = override[field_name]
+            # 调正写反的区间：用户可能把「最小」拖到比「最大」还大
+            if payload['maxIntervalMs'] < payload['minIntervalMs']:
+                payload['minIntervalMs'], payload['maxIntervalMs'] = (
+                    payload['maxIntervalMs'], payload['minIntervalMs'],
+                )
+            result[behavior] = payload
+        return result
+
+    def set_pet_schedule(self, pet_id: str, patch: dict) -> dict:
+        """写入某形象的节奏覆盖（**合并**而不是替换：面板一次只改一个行为）。
+
+        传 `None` 或空串表示**清除该行为**的覆盖，回落到包内声明 / 默认值。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        if not isinstance(patch, dict):
+            raise PetError(CODE_WRITE_FAILED, '节奏补丁应为对象', user_msg='设置格式不对。')
+
+        with self._lock:
+            settings = self.get_settings()
+            stored = dict(settings.get('petSchedules') or {})
+            per_pet = dict(stored.get(pet_id) or {})
+
+            for behavior, spec in patch.items():
+                name = str(behavior or '').strip()
+                if name not in SCHEDULE_BEHAVIORS:
+                    raise PetError(
+                        CODE_WRITE_FAILED,
+                        f'不是可设置触发时间的行为: {name}',
+                        user_msg=f'「{name}」不能设触发时间。',
+                        hint='只有「待机小动作」（idle）与「自动漫游」（roam）'
+                             '能设触发时间——它们由时间驱动。点击、下落、播报'
+                             '这类动作由事件触发，没有「多久一次」可言。',
+                    )
+                if spec is None or spec == '':
+                    per_pet.pop(name, None)
+                    continue
+                if not isinstance(spec, dict):
+                    raise PetError(
+                        CODE_WRITE_FAILED, f'{name} 的节奏应为对象',
+                        user_msg='设置格式不对。',
+                    )
+                entry = dict(per_pet.get(name) or {})
+                for field_name in ('minIntervalMs', 'maxIntervalMs'):
+                    if field_name in spec and spec[field_name] not in (None, ''):
+                        entry[field_name] = clamp_schedule_ms(spec[field_name])
+                if 'plays' in spec and spec['plays'] not in (None, ''):
+                    try:
+                        plays = int(spec['plays'])
+                    except (TypeError, ValueError):
+                        plays = 1
+                    entry['plays'] = int(min(max(plays, 1), MAX_IDLE_PLAYS))
+                if (entry.get('minIntervalMs') is not None
+                        and entry.get('maxIntervalMs') is not None
+                        and entry['maxIntervalMs'] < entry['minIntervalMs']):
+                    entry['minIntervalMs'], entry['maxIntervalMs'] = (
+                        entry['maxIntervalMs'], entry['minIntervalMs'],
+                    )
+                if entry:
+                    per_pet[name] = entry
+                else:
+                    per_pet.pop(name, None)
+
+            if per_pet:
+                stored[pet_id] = per_pet
+            else:
+                stored.pop(pet_id, None)
+            settings['petSchedules'] = stored
+            self._write_json(self.settings_path(), settings)
+        return self.effective_schedule(pet_id)
+
+    def clear_pet_schedule(self, pet_id: str) -> bool:
+        """删掉某形象**全部**节奏覆盖（回落到包内声明 / 默认值）。"""
+        pet_id = sanitize_pet_id(pet_id)
+        with self._lock:
+            settings = self.get_settings()
+            stored = dict(settings.get('petSchedules') or {})
+            if pet_id not in stored:
+                return False
+            del stored[pet_id]
+            settings['petSchedules'] = stored
+            self._write_json(self.settings_path(), settings)
+        return True
+
+    # ------------------------------------------------------------ 显示开关
+
+    def is_hidden(self) -> bool:
+        """宠物是否处于**隐藏**状态（用户主动关掉了）。
+
+        注意语义是「不显示宠物」，**不是**「停用插件」：
+        插件仍然加载、设置面板仍然能打开、坞入口仍然在——
+        否则用户关掉之后就没有任何入口把它开回来了。
+        """
+        return bool(self.get_settings().get('petHidden'))
+
+    def set_hidden(self, value) -> bool:
+        """写入隐藏开关，返回生效后的值。"""
+        hidden = bool(value)
+        with self._lock:
+            settings = self.get_settings()
+            settings['petHidden'] = hidden
+            self._write_json(self.settings_path(), settings)
+        return hidden
 
     def _write_json(self, path: str, payload: dict) -> None:
         """UTF-8（`ensure_ascii=False`）+ 原子落盘。"""
@@ -570,7 +838,7 @@ class PetStore:
             # 一处是 `None`、另一处是 dict 的话，前端要么得写两种判空，
             # 要么会在坏包上抛错——而「一个坏包不该让整个列表打不开」正是
             # 这个方法存在的意义。
-            'thumb': {'url': '', 'frames': 1, 'layout': 'horizontal'},
+            'thumb': {'url': '', 'frames': 1, 'frame': 0, 'layout': 'horizontal'},
         }
         try:
             pack = self.load_pack(pet_id)
@@ -590,6 +858,10 @@ class PetStore:
             'pixelated': self.effective_pixelated(pet_id),
             'declaredScale': clamp_scale(pack.scale),
             'declaredPixelated': bool(pack.pixelated),
+            # 标准图像是否由作者显式声明（`False` = 回落 idle 首帧）。
+            # 面板据此提示「建议显式设一张标准图像」，因为回落值在
+            # idle 挂了两套动画时可能是个怪姿势。
+            'stillDeclared': bool(pack.resolve_still().declared),
             'writable': not builtin_only,
             'staleOverrides': base['overrides'] if builtin_only else [],
             'thumb': self.thumbnail_spec(pet_id, pack),
@@ -597,29 +869,34 @@ class PetStore:
         return base
 
     def thumbnail_spec(self, pet_id: str, pack: PetPack = None) -> dict:
-        """列表缩略图要的几何：`{url, frames, layout}`（取 `idle` 的主变体）。
+        """列表缩略图要的几何：`{url, frames, frame, layout}`（取**标准图像**）。
+
+        为什么用标准图像而不是 `idle` 的主变体：缩略图就是「这个形象长什么样」
+        的第一印象，而标准图像的定义正是「不播动画时显示的那一帧」——
+        两者是同一件事。用 `idle` 主变体在作者挂了两套 idle 动画时会显示
+        「作者未必想当门面」的那一套（内置形象的「张望」就是这种情况）。
 
         `frames <= 1` 时前端用 `contain` 居中显示；多帧时按帧数横向放大、
-        左对齐，只露出第 0 帧（见 `panel.js:applyThumbGeometry`）。
+        按 `frame` 偏移，只露出标准图像那一帧（见 `panel.js:applyThumbGeometry`）。
 
         取不到图时返回 `{'url': ''}`，面板据此显示占位而不是一张破图。
         """
+        empty = {'url': '', 'frames': 1, 'frame': 0, 'layout': 'horizontal'}
         try:
             pack = pack if pack is not None else self.load_pack(pet_id)
         except PetError:
-            return {'url': '', 'frames': 1, 'layout': 'horizontal'}
-        resolved = pack.resolve('idle')
-        variants = resolved.variants or []
-        if resolved.kind != KIND_ANIMATED or not variants:
-            return {'url': '', 'frames': 1, 'layout': 'horizontal'}
-        path, _source = self.resolve_frame_path(pet_id, 'idle', variant=0)
+            return dict(empty)
+        still = pack.resolve_still()
+        if not still.sheet:
+            return dict(empty)
+        path, _source = self.resolve_frame_path(pet_id, STILL_ACTION)
         if not path:
-            return {'url': '', 'frames': 1, 'layout': 'horizontal'}
-        primary = variants[0]
+            return dict(empty)
         return {
-            'url': self.frame_url(pet_id, 'idle', path),
-            'frames': int(primary.frames) or 1,
-            'layout': primary.layout or 'horizontal',
+            'url': self.frame_url(pet_id, STILL_ACTION, path),
+            'frames': max(1, int(still.frames)) or 1,
+            'frame': max(0, int(still.frame)),
+            'layout': still.layout or 'horizontal',
         }
 
     # ------------------------------------------------------------ 读取
@@ -726,6 +1003,36 @@ class PetStore:
             index = 0
 
         user_dir = self.user_pet_dir(pet_id)
+
+        # 0) **标准图像**：先试它自己的覆盖，再按「是不是作者声明的」分流。
+        #
+        # 这一步不能省。用户换掉 `idle` 的图时，如果标准图像是**回落**自 idle
+        # 的，那它也必须跟着换——否则会出现「我明明换了待机图，静止时却还是
+        # 旧图」这种前后不一致（实测踩到过：面板缩略图与桌面宠物显示不同的图）。
+        #
+        # 分流规则与 `resolve_still()` 一致：
+        # - 作者**声明**了 still → 用它的 sheet（并允许 `overrides/still.<ext>`）；
+        # - 没声明（回落） → **委托给来源动作**（通常是 idle）走完整的覆盖链。
+        if action == STILL_ACTION:
+            if index == 0 and not self._is_builtin_only(pet_id):
+                override_dir = os.path.join(user_dir, OVERRIDES_DIRNAME)
+                for extension in _IMAGE_EXTENSIONS:
+                    candidate = os.path.join(override_dir, f'{STILL_ACTION}{extension}')
+                    if os.path.isfile(candidate):
+                        return candidate, 'override'
+            try:
+                pack = self.load_pack(pet_id)
+            except PetError:
+                return '', 'none'
+            still = pack.resolve_still()
+            if not still.sheet:
+                return '', 'none'
+            if not still.declared:
+                # 回落 → 委托给来源动作（`idle`），它自己会处理覆盖优先级
+                return self.resolve_frame_path(pet_id, still.source or 'idle')
+            action = STILL_ACTION  # 继续走下面的通用路径，用 `pack.resolve('still')`
+            index = 0
+
         # 1) 单动作覆盖 —— 只对**用户形象**、且只对**第一套**动画生效。
         #    内置形象不读覆盖目录，否则「不可修改」就只是 UI 层面的假象。
         if index == 0 and not self._is_builtin_only(pet_id):
@@ -824,12 +1131,45 @@ class PetStore:
             'declaredPixelated': bool(pack.pixelated),
             'writable': not self._is_builtin_only(pet_id),
             'actions': actions,
+            # **标准图像**：不播动画时显示的那一帧。前端在 idle 的「静止」阶段
+            # 画它，而不是画「上一次随机抽到的那套动画的第 0 帧」——
+            # 后者在 idle 挂了第二套（例如「张望」）时会卡在一个抬头姿势上。
+            'still': self._runtime_still(pet_id, pack),
+            # **时间驱动行为**的节奏（已按「用户设置 > 包内声明 > 默认」
+            # 算好）。前端直接用，不再自己写一份默认值——两边不一致时
+            # 表现为「设了却不生效」。
+            'schedule': self.effective_schedule(pet_id),
+            # 作者**包内声明**的节奏，供面板显示「作者建议 / 已覆盖」的对比
+            'declaredSchedule': {
+                name: pack.schedule_for(name).to_dict()
+                for name in SCHEDULE_BEHAVIORS
+            },
+            # 用户是否改过节奏（面板据此决定要不要显示「恢复默认」）
+            'scheduleOverridden': bool(
+                (self.get_settings().get('petSchedules') or {}).get(pet_id)
+            ),
             'missingRequired': pack.missing_required(),
             'overrides': self._overridden_actions(pet_id),
             'staleOverrides': stale_overrides,
             'directory': to_posix(os.path.relpath(directory, self.data_dir))
             if source == 'user' else '',
         }
+
+    def _runtime_still(self, pet_id: str, pack: PetPack) -> dict:
+        """标准图像的运行期条目：`{url, frames, frame, layout, declared, source, frameSource}`。
+
+        图 URL 走与动作**同一条**解析通路（`resolve_frame_path` 对 `still`
+        这个伪动作名做同样的「覆盖 > 包内 > 内置」解析），因此：
+        用户对标准图像换图、路径安全复核、内容版本号缓存**全部自动成立**。
+        """
+        still = pack.resolve_still()
+        payload = still.to_dict()
+        path, frame_source = self.resolve_frame_path(pet_id, STILL_ACTION)
+        payload['url'] = (
+            self.frame_url(pet_id, STILL_ACTION, path) if path else ''
+        )
+        payload['frameSource'] = frame_source
+        return payload
 
     def _runtime_action(self, pet_id: str, pack: PetPack, action: str) -> dict:
         """把一个动作解析成前端直接可播的运行期条目。
@@ -843,12 +1183,14 @@ class PetStore:
               "url": "...",                    # 主变体的图（兼容旧前端）
               "frameSource": "builtin",
               "variants": [ {...}, {...} ],    # 每套动画各自的图与帧参数
-              "idleTrigger": {...},            # 只有 idle 有
             }
 
         `url` / `frames` / `fps` 这一组是**主变体**的透传：老前端只认它们，
         新前端优先读 `variants`。两套并存是有意的——运行期定义是前后端之间的
         契约，加字段安全、改字段危险。
+
+        注意这里**没有** `idleTrigger`：时间驱动的节奏上移到形象级的
+        `schedule` 块了（`roam` 不是动作，挂不到动作下面）。
         """
         resolved = pack.resolve(action)
         entry = resolved.to_dict()
@@ -1020,6 +1362,8 @@ class PetStore:
         pixelated=None,
         anchor: dict = None,
         physics: dict = None,
+        still: dict = None,
+        schedule: dict = None,
     ) -> dict:
         """**从零新建**一个用户形象（不需要用户手写 pet.json 或打 zip）。
 
@@ -1032,11 +1376,18 @@ class PetStore:
             frames: `{动作名: {'data': bytes, 'frames': int, 'fps': int,
                 'loop': bool}}`。至少要有 `idle`。
             pet_id: 想要的 id；空串则从 `name` 推导。与现有形象冲突时自动改名。
-            author: 作者署名（可选）。
+            author: 作者署名（可选）。用于**发布自己的宠物**时标明作者。
             scale: 自带倍率（可选）。
             pixelated: 是否像素风（可选）。
             anchor: 锚点（可选）。
             physics: 物理参数（可选）。
+            still: **标准图像**（可选）。两种写法：
+                `{'data': bytes, 'frames': int}` 单独上传一张；
+                `{'action': 'idle', 'frame': 2}` 复用某个已上传动作的某一帧。
+                不传则回落 idle 首帧。
+            schedule: **时间驱动行为的节奏**（可选），形如
+                `{'idle': {'intervalMs': [6000, 18000], 'plays': 1},
+                  'roam': {'intervalMs': [3000, 9000]}}`。
 
         Returns:
             dict: `runtime_pack()` 的结果（新建后可直接切过去）。
@@ -1102,6 +1453,13 @@ class PetStore:
                 frame_size = outcome['frame_size']
             processed[action] = outcome
 
+        # ---- 标准图像 ----
+        # 两种来源（`_prepare_still` 负责分清），产出
+        # `(manifest 里的 still 条目, 需要额外落盘的文件或 None)`。
+        still_entry, still_file = self._prepare_still(
+            still, processed=processed, frame_size=frame_size,
+        )
+
         # ---- 组装 pet.json ----
         manifest = {
             'format': 1,
@@ -1110,8 +1468,9 @@ class PetStore:
             'size': {'w': int(frame_size[0]), 'h': int(frame_size[1])},
             'animations': {},
         }
-        if author:
-            manifest['author'] = str(author).strip()
+        # 作者署名：**总是写出来**（哪怕是空串），这样用户在面板上能看到
+        # 「这个形象有没有署名」这件事，而不是靠字段缺失去猜。
+        manifest['author'] = str(author or '').strip()
         if anchor is not None:
             manifest['anchor'] = anchor
         if physics is not None:
@@ -1120,6 +1479,10 @@ class PetStore:
             manifest['scale'] = clamp_scale(scale)
         if pixelated is not None:
             manifest['pixelated'] = bool(pixelated)
+        if still_entry is not None:
+            manifest['still'] = still_entry
+        if schedule:
+            manifest['schedule'] = schedule
 
         for action, outcome in processed.items():
             spec = cleaned[action]
@@ -1157,6 +1520,12 @@ class PetStore:
                 for action, outcome in processed.items():
                     target = os.path.join(staging, f'{action}{outcome["extension"]}')
                     write_bytes_atomic(target, outcome['data'])
+                # 单独上传的标准图像要跟着落盘（复用动作帧的那条路不用写）
+                if still_file is not None:
+                    write_bytes_atomic(
+                        os.path.join(staging, still_file['sheet']),
+                        still_file['data'],
+                    )
                 self._write_json(os.path.join(staging, MANIFEST_FILENAME), manifest)
                 shutil.rmtree(directory, ignore_errors=True)
                 os.replace(staging, directory)
@@ -1179,7 +1548,243 @@ class PetStore:
         )
         return self.runtime_pack(final_id)
 
+    # ------------------------------------------------------------ 包元信息
+
+    def update_pet_meta(
+        self,
+        pet_id: str,
+        *,
+        name=None,
+        author=None,
+        still=None,
+        schedule=None,
+    ) -> dict:
+        """改写**用户自建形象**的 `pet.json` 元信息（作者 / 名字 / 标准图像 / 节奏）。
+
+        与 `save_action_image`（覆盖图）不同：这里改的是**包本身**。
+        因此只对用户自建形象开放——内置形象是随包发布的资源（`assert_writable`）。
+
+        为什么要这个入口：作者做完一个形象后要**署名**、要指定**标准图像**
+        （否则 idle 挂了两套动画时静止画面会卡在一个怪姿势上）、
+        要设**触发节奏**。这三件事都必须在 `pet.json` 里，
+        而让用户手改 JSON 是不现实的。
+
+        Args:
+            name: 新名字；`None` 表示不改。
+            author: 新作者；`None` 表示不改（空串是合法值，表示清空署名）。
+            still: 标准图像声明；`None` 表示不改，`{}` 或 `False` 表示**清除**
+                （回落到 idle 首帧）。
+            schedule: 包内节奏声明；`None` 表示不改，`{}` 表示**清除**
+                （回落到默认值）。
+
+        Returns:
+            dict: `runtime_pack()` 的结果。
+        """
+        pet_id = self.assert_writable(pet_id)
+        pack = self.load_pack(pet_id)
+        directory = self.user_pet_dir(pet_id)
+        manifest_path = os.path.join(directory, MANIFEST_FILENAME)
+
+        with self._lock:
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as handle:
+                    manifest = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise PetError(
+                    CODE_PACK_UNREADABLE,
+                    f'读取 pet.json 失败: {exc}',
+                    user_msg='这个形象的配置文件读不出来，可能已损坏。',
+                    http_status=500,
+                ) from exc
+            if not isinstance(manifest, dict):
+                raise PetError(
+                    CODE_PACK_UNREADABLE,
+                    'pet.json 根节点不是对象',
+                    user_msg='这个形象的配置文件格式不对。',
+                    http_status=500,
+                )
+
+            if name is not None:
+                text = str(name).strip()
+                if not text:
+                    raise PetError(
+                        CODE_PACK_FIELD_INVALID,
+                        '名字不能为空',
+                        user_msg='形象名字不能为空。',
+                    )
+                manifest['name'] = text
+            if author is not None:
+                manifest['author'] = str(author).strip()
+            if still is not None:
+                # 清除语义：空 dict / False / None 值 → 删掉字段，回落 idle 首帧
+                if still in ({}, False) or not isinstance(still, dict):
+                    manifest.pop('still', None)
+                else:
+                    entry, extra = self._prepare_still(
+                        still,
+                        processed=self._existing_actions(pack),
+                        frame_size=(int(pack.size['w']), int(pack.size['h'])),
+                    )
+                    if entry is None:
+                        manifest.pop('still', None)
+                    else:
+                        manifest['still'] = entry
+                        if extra is not None:
+                            write_bytes_atomic(
+                                os.path.join(directory, extra['sheet']), extra['data'],
+                            )
+            if schedule is not None:
+                if schedule in ({}, False) or not isinstance(schedule, dict):
+                    manifest.pop('schedule', None)
+                else:
+                    # 复用包解析器校验一遍，避免写出一份自己都读不了的包
+                    cleaned = parse_schedule(schedule)
+                    if cleaned:
+                        manifest['schedule'] = {
+                            name: trigger.to_dict() for name, trigger in cleaned.items()
+                        }
+                    else:
+                        manifest.pop('schedule', None)
+
+            # 整体校验一遍：宁可拒绝写入，也不要留下一个读不出来的包
+            loads_pack(
+                json.dumps(manifest, ensure_ascii=False).encode('utf-8'),
+                pack_id=pet_id,
+            )
+            self._write_json(manifest_path, manifest)
+
+        logger.info('已更新形象 %s 的元信息', pet_id)
+        return self.runtime_pack(pet_id)
+
+    @staticmethod
+    def _pack_declares_sheet(processed: dict, sheet: str) -> bool:
+        """这张 sheet 是不是包里**某个动作**已经声明的图。
+
+        为什么要查：标准图像指向包内文件时，用户给的是**文件名**。
+        不查的话，一个拼错的文件名会写进 `pet.json`，
+        而后果是「形象能加载、标准图像空白」——比直接报错难查得多。
+        """
+        return _pack_declares_sheet(processed, sheet)
+
+    @staticmethod
+    def _existing_actions(pack: PetPack) -> dict:
+        """把包里已有的动作整理成 `_prepare_still` 要的形状。
+
+        `_prepare_still` 原本服务「新建」（图在内存里），而更新元信息时图**已经
+        在磁盘上**了。这里用包里声明的 `sheet` / `frames` 造一份等价结构，
+        这样「标准图像复用某个动作的某一帧」这条路径在两个入口共用同一段代码。
+        """
+        processed = {}
+        for action, spec in (pack.animations or {}).items():
+            primary = spec.primary
+            if not primary.sheet:
+                continue
+            processed[action] = {
+                'sheet': to_posix(primary.sheet),
+                'extension': os.path.splitext(primary.sheet)[1],
+                'frames': max(1, int(primary.frames)),
+            }
+        return processed
+
     # ------------------------------------------------------- 遗留覆盖清理
+
+    @staticmethod
+    def _prepare_still(still, *, processed: dict, frame_size: tuple) -> tuple:
+        """把新建表单 / 元信息更新里的标准图像声明变成 `pet.json` 的 `still` 条目。
+
+        支持三种来源：
+
+        1. `{'data': bytes, 'frames': int}`：**单独上传**的图。按 `frame_size`
+           归一化后落成 `still.<ext>`，并在 `pet.json` 里指向它。
+        2. `{'action': '<动作名>', 'frame': <下标>}`：**复用**某个已上传动作的
+           某一帧。这条路径**不额外落盘**——直接指向那个动作的 sheet。
+           为什么支持它：作者常常觉得「idle 的第 3 帧就是我要的标准姿势」，
+           为此再上传一张一模一样的图既费事又费空间。
+        3. `{'sheet': '<包内已声明的文件名>', 'frames': n, 'frame': i}`：
+           **直接指向包内已有的一张 sheet**。这条路径服务「更新元信息」——
+           那时图已经在磁盘上了，用户改的只是「用哪一帧」。
+
+        返回 `(manifest 条目 or None, 额外要写的文件 or None)`。
+        `None` 表示「没声明」→ 解析期回落到 idle 首帧。
+        """
+        if not isinstance(still, dict) or not still:
+            return None, None
+
+        # ---- 写法 2：复用某个动作的某一帧
+        action = str(still.get('action') or '').strip()
+        if action and not still.get('data'):
+            outcome = processed.get(action)
+            if outcome is None:
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'标准图像指向的动作 {action} 没有图',
+                    user_msg='选来当标准图像的那个动作还没有上传图片。',
+                    hint='先给那个动作选一张图，或改成单独上传一张标准图像。',
+                )
+            try:
+                frame = int(still.get('frame') or 0)
+            except (TypeError, ValueError):
+                frame = 0
+            frames = max(1, int(outcome['frames']))
+            if not (0 <= frame < frames):
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'标准图像的帧下标 {frame} 越界（{action} 只有 {frames} 帧）',
+                    user_msg=f'那个动作只有 {frames} 帧，取不到第 {frame + 1} 帧。',
+                    hint='换一个帧号，或改用单独上传的标准图像。',
+                )
+            return {
+                'sheet': f'{action}{outcome["extension"]}',
+                'frames': frames,
+                'frame': frame,
+            }, None
+
+        # ---- 写法 3：直接指向包内已有的一张 sheet（更新元信息时走这条）
+        sheet = to_posix(still.get('sheet') or '').strip()
+        if sheet and not still.get('data'):
+            if not _pack_declares_sheet(processed, sheet):
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'标准图像指向的 sheet 不在包里: {sheet}',
+                    user_msg='选来当标准图像的那张图不在这个形象里。',
+                    hint='选一个形象里已有的动作图，或单独上传一张标准图像。',
+                )
+            frames = _read_still_frames(still, processed, sheet)
+            try:
+                frame = int(still.get('frame') or 0)
+            except (TypeError, ValueError):
+                frame = 0
+            return {
+                'sheet': sheet,
+                'frames': frames,
+                'frame': min(max(0, frame), frames - 1),
+            }, None
+
+        # ---- 写法 1：单独上传一张
+        data = still.get('data')
+        if not data:
+            return None, None
+        try:
+            count = int(still.get('frames') or 1)
+        except (TypeError, ValueError):
+            count = 1
+        outcome = prepare_sheet(
+            data, frames=count, frame_size=frame_size, what='标准图像',
+        )
+        try:
+            frame = int(still.get('frame') or 0)
+        except (TypeError, ValueError):
+            frame = 0
+        frames = max(1, int(outcome['frames']))
+        # 单帧图取第 1 帧以上没有意义：夹回 0，而不是报错——
+        # 面板在用户只传一张单帧图时也会给一个 `frame: 0`。
+        frame = min(max(0, frame), frames - 1)
+        sheet_name = f'still{outcome["extension"]}'
+        return {
+            'sheet': sheet_name,
+            'frames': frames,
+            'frame': frame,
+        }, {'sheet': sheet_name, 'data': outcome['data']}
 
     def list_pet_overrides(self, pet_id: str) -> list:
         """列出某形象磁盘上的覆盖动作（**不看是否生效**）。
@@ -1550,13 +2155,13 @@ class PetStore:
             if sanitize_pet_id(settings.get('activePetId') or '') == pet_id:
                 settings['activePetId'] = ''
                 changed = True
-            # 顺手清掉这个形象的逐形象偏好（倍率 / 渲染方式）。
+            # 顺手清掉这个形象的逐形象偏好（倍率 / 渲染方式 / 触发节奏）。
             #
             # 不清的后果是**设置文件无限增长**，而且更隐蔽：id 会被重新分配
             # （`_allocate_pet_id` 复用 `pet`、`pet-2`…），于是新建的形象会
             # 莫名其妙地继承一个早已删除的形象的大小设置。
             # 实测就是这样：验收脚本删掉 `pet` 后重建同名 id，新形象一出生就是 3×。
-            for key in ('petScales', 'petPixelated'):
+            for key in ('petScales', 'petPixelated', 'petSchedules'):
                 stored = dict(settings.get(key) or {})
                 if pet_id in stored:
                     del stored[pet_id]

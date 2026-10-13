@@ -16,9 +16,10 @@
 
 import {
   animationDuration,
-  createIdleScheduler,
+  createBehaviorScheduler,
   playableVariants,
   pickVariantIndex,
+  stillFrame,
 } from './animation.js';
 import { createFrameClock, createIdleGate, decideThrottle } from './clock.js';
 import {
@@ -185,15 +186,20 @@ export function createPetView(options = {}) {
   const gate = createIdleGate();
 
   /**
-   * idle 的随机触发调度器（见 `animation.js`）。
+   * **时间驱动行为**的随机间隔调度器（见 `animation.js`）。
+   *
+   * 管两件事：idle 的小动作（`idleWakeTimer`）与自动漫游（`walkTimer`）。
+   * 两者都是「平时不发生，隔一段随机时间发生一次」，只是触发后做的事不同。
    *
    * 只在**真的处于 idle 且无其它占用**时推进，因此不会影响 sleep：
    * 睡着之后状态不是 idle，`enabled` 为假，排期被清掉；
    * 醒来时重新排期，于是「醒来立刻抽一次时间」而不是「补上睡梦中的那一次」。
    */
-  const idleScheduler = createIdleScheduler();
-  /** 当前 idle 触发是否要求「一直循环」（`trigger: "loop"` 的旧行为）。 */
+  const scheduler = createBehaviorScheduler();
+  /** 当前 idle 触发是否要求「一直循环」（`schedule.idle.mode === 'loop'`）。 */
   let idleLoops = false;
+  /** 标准图像（不播动画时显示的那一帧）；后端已算好回退结论。 */
+  const still = stillFrame(pack);
 
   const gesture = createGesture({ holdMs: DRAG_HOLD_MS, slop: DRAG_SLOP });
 
@@ -342,9 +348,42 @@ export function createPetView(options = {}) {
       clock.setSpec({ frames: 1, fps: 1, loop: true });
       drawFrame();
     }
+    // `idle` 在 `random` 模式下**平时是标准图像**，不是 idle 首帧：
+    // 两者在作者只给了一套 idle 时长得一样，但在挂了第二套（「张望」）时
+    // 完全不同——标准图像是固定的，而「idle 首帧」会让静止画面跟着
+    // 上一次随机抽到的变体变（用户报的「卡在抬头看」就是这个）。
+    if (next === 'idle' && !idleLoops && !idleBurst) drawStill();
     // 动画速度倍率是**播放期**的事：这里只记录，推进时按它折算 dt。
     root.dataset.petAnimSpeed = String(currentSpeed());
     wake();
+  }
+
+  /**
+   * 把**标准图像**写进 sprite（不播动画时显示的那一帧）。
+   *
+   * 为什么需要它：`idle` 可以挂多套动画（内置形象的「张望」就是第二套），
+   * 而「静止」原本的实现是「保留刚刚播过的那套变体的第 0 帧」——
+   * 于是随机播到「张望」之后，宠物就卡在**抬头看**的姿势上不动了。
+   * 正确语义是「不播动画时显示一个固定的标准姿势」，与刚刚播过什么无关。
+   *
+   * `still` 为 `null`（后端一张图都没给）时保持当前绘制不动，
+   * 而不是清空背景——清空会让宠物凭空消失。
+   */
+  function drawStill() {
+    if (!still) return;
+    currentVariant = null;
+    sprite.style.backgroundImage = `url("${still.url}")`;
+    sprite.style.backgroundRepeat = 'no-repeat';
+    const frameW = still.layout === 'vertical'
+      ? width : width * still.frames;
+    const frameH = still.layout === 'vertical'
+      ? height * still.frames : height;
+    sprite.style.backgroundSize = `${frameW}px ${frameH}px`;
+    if (still.layout === 'vertical') {
+      sprite.style.backgroundPosition = `0 ${-still.frame * height}px`;
+    } else {
+      sprite.style.backgroundPosition = `${-still.frame * width}px 0`;
+    }
   }
 
   /** 把当前帧写进 `background-position`（只改绘制，不触发 layout）。 */
@@ -621,7 +660,7 @@ export function createPetView(options = {}) {
   function scheduleIdleWake() {
     cancelIdleWake();
     if (!idleTriggerEnabled()) return;
-    const seconds = idleScheduler.reschedule();
+    const seconds = scheduler.reschedule('idle');
     idleWakeTimer = setTimeout(() => {
       idleWakeTimer = 0;
       // 到点时再确认一次：等待期间用户可能已经把它拖走了 / 让它睡了
@@ -634,10 +673,13 @@ export function createPetView(options = {}) {
   function startIdleBurst() {
     const spec = actionSpec('idle');
     if (!spec) return;
+    // `idleBurst` 必须在 `setAction` **之前**置位：`setAction` 在 idle 上会
+    // 把 sprite 画成标准图像（那是「平时」的样子），而这次是**要播动画**。
+    // 顺序反了的表现是「触发之后仍然停在标准图像上」，看起来像没触发。
+    idleBurst = true;
     // 换一套变体：`force` 让「同一动作重播」也能生效，
     // 否则抽到另一套时 `setAction` 会因为名字没变而直接返回。
     setAction('idle', { force: true });
-    idleBurst = true;
     // 只播一轮：idle 的变体在包里通常声明 `loop: true`（它是待机循环），
     // 但「随机触发」的语义是「播一遍就停」，因此这里显式改成不循环，
     // 让时钟在末帧 `finished`，由 `finishIdleBurst` 收尾。
@@ -659,19 +701,19 @@ export function createPetView(options = {}) {
     }, duration);
   }
 
-  /** 结束一次 idle 小动作：回到静止画面，并排下一次。 */
+  /** 结束一次 idle 小动作：回到标准图像，并排下一次。 */
   function finishIdleBurst() {
     if (!idleBurst) return;
     idleBurst = false;
     clearTimeout(actionTimer);
     actionTimer = 0;
-    // 回到**静止画面**：保留当前变体的贴图，只把时钟钉成单帧、不推进，
-    // 于是它停在第 0 帧上等下一次触发。
+    // 回到**标准图像**（而不是「当前变体的第 0 帧」）。
     //
-    // 这里刻意**不**重新抽变体：静止画面的姿势若每次都换，看起来像瞬移。
-    // 换姿势的时机是「下一次触发开始播」的时候（见 `startIdleBurst`）。
+    // 这一处是本轮修的核心：旧实现保留刚播过的变体，于是随机播到「张望」
+    // 之后，宠物会一直卡在抬头姿势上——用户报的「一直卡在这帧看起来怪怪的」
+    // 就是这个。标准图像与「这次抽到哪一套」无关，因此不会出现这种事。
     clock.setSpec({ frames: 1, fps: 1, loop: true });
-    drawFrame();
+    drawStill();
     scheduleIdleWake();
     wake();
   }
@@ -700,8 +742,10 @@ export function createPetView(options = {}) {
   }
 
   function scheduleWalk() {
-    // 间隔带随机，看起来才像在"逛"而不是机械往返
-    walkTimer = 3000 + Math.random() * 6000;
+    // 间隔从**后端下发的节奏**里抽（默认 3~9 秒），不再是写死的
+    // `3000 + random * 6000`——用户要求「支持调整触发时间」，
+    // 而漫游正是除 idle 之外唯一由时间驱动的行为。
+    walkTimer = scheduler.reschedule('roam') * 1000;
     const world = physics.bounds;
     walkTargetX = 40 + Math.random() * Math.max(1, world.width - 80);
     const direction = walkTargetX > physics.x ? 1 : -1;
@@ -957,8 +1001,10 @@ export function createPetView(options = {}) {
   lastInteractionAt = performance.now();
   machine.setNow(lastInteractionAt);
   applyFacing();
-  idleLoops = idleTriggerOf('idle').mode === 'loop';
-  idleScheduler.setTrigger(idleTriggerOf('idle'));
+  // 时间驱动的节奏来自后端的 `schedule` 块（用户设置 > 包内声明 > 默认，
+  // 后端已经算好）。前端不自己写一份默认值——两边不一致时表现为「设了却不生效」。
+  scheduler.setSchedule(pack.schedule);
+  idleLoops = scheduler.get('idle').mode === 'loop';
   setAction('idle', { force: true });
   drawPosition();
   // 起始位置：站在地面
@@ -968,18 +1014,6 @@ export function createPetView(options = {}) {
   // 起手就排一次：宠物出现后过一段随机时间自己动一下，而不是永远僵着。
   // 自动漫游（`autoRoam`）与它是两条独立的路子，因此这里不互斥。
   scheduleIdleWake();
-
-  /** 读某动作的 idle 触发配置（非 idle 动作返回默认值）。 */
-  function idleTriggerOf(name) {
-    const spec = actionSpec(name) || {};
-    const trigger = spec.idleTrigger || {};
-    return {
-      mode: trigger.mode === 'loop' ? 'loop' : 'random',
-      minIntervalMs: trigger.minIntervalMs,
-      maxIntervalMs: trigger.maxIntervalMs,
-      plays: trigger.plays,
-    };
-  }
 
   /**
    * 触发一次随机 idle 小动作。
@@ -1016,6 +1050,71 @@ export function createPetView(options = {}) {
     get gesturePhase() { return gesture.phase; },
     /** 当前生效的 idle 触发模式。 */
     get idleMode() { return idleLoops ? 'loop' : 'random'; },
+    /**
+     * 标准图像的元信息（验收脚本与排查用）。
+     *
+     * 暴露它是为了能验证「不播动画时画的是标准图像，而不是上一次抽到的变体」
+     * 这条判定——那是本轮修的核心问题，而它是**渲染结果**，源码里看不出来。
+     */
+    get still() {
+      if (!still) return null;
+      return {
+        url: still.url,
+        frames: still.frames,
+        frame: still.frame,
+        layout: still.layout,
+        declared: still.declared,
+        source: still.source,
+        /** 当前 sprite 上的背景图是否就是标准图像。 */
+        showing: sprite.style.backgroundImage.includes(still.url),
+      };
+    },
+    /** 当前生效的**触发节奏**（idle 小动作 / 自动漫游）。 */
+    get schedule() {
+      return {
+        idle: scheduler.get('idle'),
+        roam: scheduler.get('roam'),
+      };
+    },
+    /**
+     * 就地更新触发节奏（用户在面板上拖完滑块立即生效，不必刷新页面）。
+     *
+     * 与 `scale` 不同，节奏**不需要重建视图**：它只影响两个定时器的下次取值。
+     * 改完之后要**重排**当前等待中的那个定时器——否则用户把间隔从 18 秒
+     * 调到 2 秒，还得先等完那 18 秒才看到效果，看起来像没生效。
+     *
+     * 重排的方式是**按新区间重新抽一次**，而不是把定时器清零：
+     * 清零会让宠物**立刻**开始走动（间隔是「随机区间」，不是「还剩多久」），
+     * 那既不符合用户的预期，也把「闲置一会儿才溜达」这个观感弄没了。
+     */
+    setSchedule(schedule) {
+      scheduler.setSchedule(schedule);
+      idleLoops = scheduler.get('idle').mode === 'loop';
+      if (machine.state === STATES.IDLE && !idleBurst) {
+        cancelIdleWake();
+        if (idleLoops) {
+          // 切到 loop 模式：立刻开始循环播待机动画
+          setAction('idle', { force: true });
+          clock.setSpec({
+            frames: currentVariant ? currentVariant.frames : 1,
+            fps: currentVariant ? currentVariant.fps : 1,
+            loop: true,
+            frameMs: currentVariant ? currentVariant.frameMs : [],
+          });
+          wake();
+        } else {
+          // 切回 random 模式：回到标准图像，并按新间隔重排
+          drawStill();
+          scheduleIdleWake();
+          wake();
+        }
+      }
+      // 漫游的下一次间隔同样按新值重抽（见上面「为什么不是清零」）
+      if (machine.state === STATES.IDLE) {
+        walkTimer = scheduler.reschedule('roam') * 1000;
+      }
+      return this;
+    },
     setConfig(next = {}) {
       Object.assign(config, next);
       // 渲染方式可以**就地**改：只是换一条 CSS 规则，不涉及几何，

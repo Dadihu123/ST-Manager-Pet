@@ -373,12 +373,22 @@ async function main() {
       const action = root.dataset.petAction || 'idle';
       const data = await (await fetch('${API}/runtime')).json();
       const entry = data.pet.actions[action] || data.pet.actions.idle;
+      // ⚠️ 静止时 sprite 画的是**标准图像**（data.pet.still），而不是
+      // actions.idle 的图。两者在作者只给一套 idle 时是同一张，
+      // 但覆盖走的路不同（标准图像回落自 idle 时会跟随 idle 的覆盖）。
+      // 因此这里按「当前实际显示的是哪一份」去比对。
+      const still = data.pet.still || {};
+      const idleOverridden = (data.pet.overrides || []).includes('idle');
+      const expected = (action === 'idle' && still.url && still.declared !== true
+        && idleOverridden) ? still : entry;
       return {
         action,
         overrides: data.pet.overrides,
+        stillUrl: still.url || '',
+        stillSource: still.frameSource || '',
         spriteUrl: getComputedStyle(sprite).backgroundImage,
-        expectedUrl: entry.url,
-        expectedSource: entry.frameSource,
+        expectedUrl: expected.url,
+        expectedSource: expected.frameSource,
       };
     })()`);
     const spriteVersion = versionOf(spriteCheck.spriteUrl);
@@ -405,20 +415,25 @@ async function main() {
       const sprite = root.querySelector('.pet-sprite');
       const action = root.dataset.petAction || 'idle';
       const entry = data.pet.actions[action] || data.pet.actions.idle;
+      // 与 ⑦ 同理：静止时显示的是**标准图像**
+      const still = data.pet.still || {};
+      const expected = (action === 'idle' && still.url && still.declared !== true)
+        ? still : entry;
       return {
         overrides: data.pet.overrides,
         idleSource: data.pet.actions.idle.frameSource,
         walkSource: data.pet.actions['walk-left'].frameSource,
+        stillSource: still.frameSource || '',
         action,
         spriteUrl: getComputedStyle(sprite).backgroundImage,
-        expectedUrl: entry.url,
+        expectedUrl: expected.url,
       };
     })()`);
     record(
       '⑧ 刷新页面后覆盖仍在（idle + walk-left 都持久化，sprite 与后端版本一致）',
       afterReload.idleSource === 'override' && afterReload.walkSource === 'override'
         && versionOf(afterReload.spriteUrl) === versionOf(afterReload.expectedUrl),
-      `overrides=${JSON.stringify(afterReload.overrides)}，idle=${afterReload.idleSource}，walk-left=${afterReload.walkSource}，版本一致=${versionOf(afterReload.spriteUrl) === versionOf(afterReload.expectedUrl)}`,
+      `overrides=${JSON.stringify(afterReload.overrides)}，idle=${afterReload.idleSource}，walk-left=${afterReload.walkSource}，标准图像=${afterReload.stillSource}，版本一致=${versionOf(afterReload.spriteUrl) === versionOf(afterReload.expectedUrl)}`,
     );
 
     // ---- ⑨ 预览接口标出「已自定」

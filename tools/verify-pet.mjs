@@ -141,9 +141,16 @@ async function main() {
     // ⚠️ 2026-10 起 `idle` 默认是「平时静止 + 随机触发」（见 README §3.7），
     // 因此**不能**再靠采样 idle 来断言「帧动画在推进」——那会永远是同一个帧位。
     // 正确做法：主动触发一次 idle 小动作（`pokeIdle`），在它播的那一轮里采样。
+    //
+    // `pokeIdle()` 返回 false 也可能是**正常**的：说明采样时刚好有一次
+    // 随机触发已经在播了（启动后 6~18 秒会自己触发一次，而前面的判定要跑几秒）。
+    // 那种情况下帧位同样在变，因此两种情形都算通过——
+    // 否则这条判定会随「脚本跑得快不快」随机失败。
     const poke = await page.evaluate(`(() => {
       const view = window.__petView;
-      return view ? view.pokeIdle() : false;
+      if (!view) return false;
+      if (view.idleBursting) return true;   // 已经在播，同样能观察到帧推进
+      return view.pokeIdle();
     })()`);
     const frames = [];
     for (let index = 0; index < 8; index += 1) {
@@ -188,10 +195,15 @@ async function main() {
     //
     // 不写死形象 id：默认形象由 `store.DEFAULT_PET_ID` 决定（小满），
     // 写死 id 会让「换掉内置形象」把这条断言变成假失败。
+    //
+    // ⚠️ 2026-10 起「静止」画的是**标准图像**（`/frame/<pet>/still`），
+    // 不再是 `idle` 的首帧——因为 idle 可以挂两套动画（「张望」），
+    // 沿用「上一次抽到的那一套」会卡在一个抬头姿势上（用户报的怪现象）。
+    // 因此这里接受 `still` 或 `idle`（没有标准图像的老包会回落到 idle）。
     const bg = await page.evaluate('window.__pet.bgImage()');
     record(
       '⑤ 用 spritesheet + background-position（不是换 <img src>）',
-      bg.includes('/frame/') && bg.includes('/idle'),
+      bg.includes('/frame/') && (bg.includes('/still') || bg.includes('/idle')),
       bg.slice(0, 120),
     );
 

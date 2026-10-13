@@ -509,6 +509,52 @@
   color: var(--content-on-accent, #fff);
 }
 
+/* ------------------------------------------------------------ 显示开关条 */
+
+/* 「宠物显示中 / 已关闭」那一条。放在面板最上方，因此视觉上要比普通区块
+ * 更醒目一点，但不抢走「形象列表」的主角位置。
+ *
+ * 关闭状态用左边框的强调色区分：用户回到面板时一眼就能看出
+ * 「宠物现在是不显示的」——否则他会以为是宠物坏了。 */
+.plugin-stm-pet .pet-visibility {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-default, rgba(0, 0, 0, 0.12));
+  border-left-width: 3px;
+  border-left-color: var(--accent-color, #7c5cff);
+  background: var(--surface-container, transparent);
+}
+
+/* 已关闭：用中性色 —— 它是「不活动」的状态，不该继续抢注意力 */
+.plugin-stm-pet .pet-visibility.is-hidden {
+  border-left-color: var(--border-strong, rgba(0, 0, 0, 0.28));
+  background: transparent;
+}
+
+.plugin-stm-pet .pet-visibility-copy {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.plugin-stm-pet .pet-visibility-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.plugin-stm-pet .pet-visibility .pet-panel-toolbar {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
 /* ---------------------------------------------------------------- 滑块 */
 
 /* 大小倍率滑块。
@@ -535,6 +581,29 @@
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   color: var(--accent-color, #7c5cff);
+}
+
+/* ------------------------------------------------ 触发时间的双滑块一行 */
+
+/* 每个时间驱动行为一行，行内放两个 range（下界 / 上界）。
+ *
+ * 为什么是两个单柄滑块而不是一个双柄滑块：原生 `<input type="range">`
+ * 不支持双柄，而自己造一个要处理键盘可达性、指针捕获与边界交叉——
+ * 为一个次要设置不值得。
+ *
+ * `min-width: 0` 与 `.pet-slider` 同理：不给的话 range 的默认宽度
+ * 会把窄屏下的单列布局撑破。 */
+.plugin-stm-pet .pet-schedule-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 4px;
+}
+
+.plugin-stm-pet .pet-schedule-row .pet-slider {
+  flex: 1 1 120px;
+  margin: 0;
 }
 
 /* ------------------------------------------------------------ 二选一按钮 */

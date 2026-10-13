@@ -2,7 +2,7 @@
   "format": 1,
   "id": "xiaoman",
   "name": "小满",
-  "author": "ST-Manager",
+  "author": "官方",
   "size": {
     "w": 384,
     "h": 576
@@ -13,6 +13,20 @@
   },
   "scale": 0.45,
   "pixelated": false,
+  "still": {
+    "sheet": "idle.png",
+    "frames": 4,
+    "frame": 0
+  },
+  "schedule": {
+    "idle": {
+      "intervalMs": [6000, 18000],
+      "plays": 1
+    },
+    "roam": {
+      "intervalMs": [3000, 9000]
+    }
+  },
   "physics": {
     "gravity": 1800,
     "walkSpeed": 52,
@@ -22,9 +36,6 @@
   },
   "animations": {
     "idle": {
-      "trigger": "random",
-      "intervalMs": [6000, 18000],
-      "plays": 1,
       "variants": [
         {
           "sheet": "idle.png",

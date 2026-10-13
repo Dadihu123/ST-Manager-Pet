@@ -31,9 +31,13 @@ def store(tmp_path):
         'id': 'anim-pet',
         'name': '节奏测试',
         'size': {'w': 64, 'h': 64},
+        # 触发节奏在**顶层** `schedule`（`roam` 不是动作，挂不到动作下面）
+        'schedule': {
+            'idle': {'intervalMs': [3000, 9000], 'plays': 2},
+            'roam': {'intervalMs': [1000, 2000]},
+        },
         'animations': {
             'idle': {
-                'trigger': 'random', 'intervalMs': [3000, 9000], 'plays': 2,
                 'variants': [
                     {'sheet': 'idle-a.png', 'frames': 4, 'fps': 2.5,
                      'frameMs': [400, 300, 300, 600], 'weight': 5},
@@ -115,15 +119,32 @@ def test_variant_urls_differ_even_for_the_same_sheet(store):
 
 
 def test_runtime_action_exposes_idle_trigger(store):
-    trigger = store.runtime_pack('anim-pet')['actions']['idle']['idleTrigger']
-    assert trigger == {
+    """★ 触发节奏在**形象级**的 `schedule` 里，不在动作里。
+
+    为什么上移：`roam`（自动漫游）不是动作——它没有自己的图，挂不到
+    `animations` 下面。两处都能写同一件事的话，迟早会出现不一致的包。
+    """
+    schedule = store.runtime_pack('anim-pet')['schedule']
+    assert schedule['idle'] == {
         'mode': 'random', 'minIntervalMs': 3000, 'maxIntervalMs': 9000, 'plays': 2,
     }
+    # ★ 漫游的间隔也要下发（用户要求「调整不同动作的触发时间」）
+    assert schedule['roam']['minIntervalMs'] == 1000
+    assert schedule['roam']['maxIntervalMs'] == 2000
 
 
-def test_non_idle_actions_have_no_idle_trigger(store):
+def test_runtime_schedule_covers_every_behavior(store):
+    """两个行为都要有结论——前端不自己写默认值（否则两边会不一致）。"""
+    from backend.core.pack import SCHEDULE_BEHAVIORS
+
+    schedule = store.runtime_pack('anim-pet')['schedule']
+    assert set(schedule) == set(SCHEDULE_BEHAVIORS)
+
+
+def test_actions_have_no_schedule_field(store):
+    """动作条目里**不该**再有 `idleTrigger`（节奏已上移）。"""
     actions = store.runtime_pack('anim-pet')['actions']
-    for name in ('click', 'walk-left', 'fall', 'land', 'sleep'):
+    for name in ('idle', 'click', 'walk-left', 'fall', 'land', 'sleep'):
         assert 'idleTrigger' not in actions[name], f'{name} 不该有 idleTrigger'
 
 
@@ -155,7 +176,6 @@ def test_fallback_action_inherits_all_variants(store):
     # 但**触发配置**不跟着来：它不是「随机待机」，而是「下落」
     assert 'idleTrigger' not in entry
 
-
 def test_mirrored_walk_uses_only_the_primary_variant(store):
     """★ 镜像复用只取主变体（翻转朝向无法用单个 mirror 标记表达多套）。
 
@@ -186,11 +206,16 @@ def test_mirrored_walk_uses_only_the_primary_variant(store):
 
 
 def test_thumbnail_spec_for_every_pet(store):
-    """★ 列表接口必须为每个形象带缩略图几何（「小满没有缩略图」的根因）。"""
+    """★ 列表接口必须为每个形象带缩略图几何（「小满没有缩略图」的根因）。
+
+    缩略图取的是**标准图像**（不播动画时显示的那一帧），而不是 idle 的主变体——
+    后者在作者挂了两套 idle 动画时会显示「作者未必想当门面」的那一套。
+    """
     item = next(i for i in store.list_pets() if i['id'] == 'anim-pet')
     thumb = item['thumb']
-    assert thumb['url'].startswith('/api/plugins/stm-pet/frame/anim-pet/idle')
+    assert thumb['url'].startswith('/api/plugins/stm-pet/frame/anim-pet/still')
     assert thumb['frames'] == 4
+    assert thumb['frame'] == 0
     assert thumb['layout'] == 'horizontal'
 
 
@@ -207,18 +232,45 @@ def test_thumbnail_spec_of_broken_pack_is_empty_not_missing(tmp_path):
     store = PetStore(str(user), str(builtin))
     item = next(i for i in store.list_pets() if i['id'] == 'broken')
     assert item['error'], '损坏的包应带 error'
-    assert item['thumb'] == {'url': '', 'frames': 1, 'layout': 'horizontal'}
+    assert item['thumb'] == {
+        'url': '', 'frames': 1, 'frame': 0, 'layout': 'horizontal',
+    }
 
 
-def test_thumbnail_uses_primary_variant(store):
-    """缩略图用**主变体**的帧数与图（静态展示，不需要随机）。"""
-    from backend.core.pack import KIND_ANIMATED
+def test_thumbnail_uses_declared_still(tmp_path):
+    """★ 作者显式声明标准图像时，缩略图必须用它，而不是 idle 主变体。
 
-    pack = store.load_pack('anim-pet')
-    resolved = pack.resolve('idle')
-    assert resolved.kind == KIND_ANIMATED
-    thumb = store.thumbnail_spec('anim-pet', pack)
-    assert thumb['frames'] == resolved.variants[0].frames
+    这是本轮修的核心：内置形象的 idle 挂了「张望」当第二套动画，
+    而「张望」的首帧是个**抬头看**的姿势——卡在那一帧上很怪。
+    """
+    from pet_test_support import write_pack
+
+    builtin = tmp_path / 'resources' / 'pets'
+    user = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    user.mkdir(parents=True)
+    write_pack(builtin, 'posed', payload={
+        'id': 'posed',
+        'still': {'sheet': 'calm.png', 'frames': 2, 'frame': 1},
+        'animations': {
+            'idle': {'variants': [
+                {'sheet': 'idle.png', 'frames': 4, 'weight': 5},
+                {'sheet': 'look.png', 'frames': 4, 'weight': 2},
+            ]},
+        },
+    }, sheets={'idle.png': 4, 'look.png': 4, 'calm.png': 2})
+
+    store = PetStore(str(user), str(builtin))
+    item = next(i for i in store.list_pets() if i['id'] == 'posed')
+    # URL 是**不透明**的（`/frame/<pet>/<action>`），因此要验的是它背后解析到的文件
+    path, source = store.resolve_frame_path('posed', 'still')
+    assert path.endswith('calm.png'), f'应指向声明的标准图像，实际 {path}'
+    assert source == 'builtin'
+    assert 'still' in item['thumb']['url']
+    assert item['thumb']['frames'] == 2
+    assert item['thumb']['frame'] == 1
+    # 列表也要带上「作者有没有声明」——面板据此提示
+    assert item['stillDeclared'] is True
 
 
 # ------------------------------------------------------------ 单动作覆盖
@@ -262,7 +314,6 @@ def test_override_only_applies_to_first_variant(store):
 def test_resolve_frame_path_out_of_range_variant_returns_none(store):
     assert store.resolve_frame_path('anim-pet', 'idle', variant=99) == ('', 'none')
     assert store.resolve_frame_path('anim-pet', 'idle', variant=-1)[1] != 'none'
-
 
 # ------------------------------------------------------------ 导出完整性
 

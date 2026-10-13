@@ -374,31 +374,45 @@ async function main() {
       JSON.stringify(variantInfo),
     );
 
-    // 权重抽样：连续触发 N 次，统计抽到的变体分布。
+    // 权重抽样：连续触发若干次，统计抽到的变体分布。
     //
     // 关键：每次触发后必须**等这一轮播完**（`finishIdleBurst` 把
     // `idleBurst` 清掉）才能再触发一次，否则 `pokeIdle()` 会被
     // 「正在播」这条守卫直接挡掉——那样统计出来的分布是假的
     // （第一次之后全部无效，看起来像「一套动画占了 99%」）。
-    // 另外要先等它回到 idle：前面的拖拽/点击测试会把它留在空中或播报态。
+    //
+    // ⚠️ **循环条件是「拿到 N 次有效触发」，不是「尝试 N 次」**。
+    // 实测踩到过：`pokeIdle()` 在宠物**漫游中**（state 不是 idle）会返回 false，
+    // 而漫游每 3~9 秒就发生一次。按尝试次数循环时，那些瞬时失败的尝试会白吃掉
+    // 额度（240 次只拿到 71 次有效），于是「有效触发 ≥ 40」这条断言时不时失败
+    // ——看起来像「权重随机坏了」，实际是采样方式不稳。
+    // 改成「等它回到 idle 再触发」，并用**墙钟上限**兜底防止无限等。
     const distribution = await page.evaluate(`(async () => {
       const view = window.__petView;
       const root = window.__p.root();
       const counts = {};
-      // 先等它回到 idle 且不在播（前面的拖拽 / 点击测试把它留在了空中或播报态）。
-      // 不等的话 pokeIdle 会被守卫全部挡掉，统计出 0 次有效触发。
-      const ready = performance.now() + 8000;
-      while (performance.now() < ready) {
-        if (view.state === 'idle' && !view.idleBursting) break;
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      for (let index = 0; index < 240; index += 1) {
-        if (!view.pokeIdle()) continue;
+      const wanted = 60;            // 目标有效触发次数（断言只要求 ≥40）
+      // 墙钟上限：每轮有效触发要等一整轮播完（约 1.6 秒），
+      // 加上等待「回到 idle」的时间，60 次约需 2~4 分钟。
+      // 给到 240 秒是为了在最慢的机器上也稳超 40 次这条断言线。
+      const deadline = performance.now() + 240000;
+      while (performance.now() < deadline) {
+        const done = Object.values(counts).reduce((sum, n) => sum + n, 0);
+        if (done >= wanted) break;
+        // 等它回到「idle 且不在播」——漫游 / 播报 / 落空中都不该触发
+        if (view.state !== 'idle' || view.idleBursting) {
+          await new Promise((r) => setTimeout(r, 60));
+          continue;
+        }
+        if (!view.pokeIdle()) {
+          await new Promise((r) => setTimeout(r, 60));
+          continue;
+        }
         const key = root.dataset.petVariant;
         counts[key] = (counts[key] || 0) + 1;
         // 等这一轮播完（帧数 4、总时长约 1.6 秒 @speed 1）
-        const deadline = performance.now() + 4000;
-        while (view.idleBursting && performance.now() < deadline) {
+        const burstDeadline = performance.now() + 4000;
+        while (view.idleBursting && performance.now() < burstDeadline) {
           await new Promise((r) => setTimeout(r, 40));
         }
       }

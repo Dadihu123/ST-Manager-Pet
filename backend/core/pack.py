@@ -16,6 +16,14 @@
 行走**只有方向化动作**（`walk-left` / `walk-right`），没有「正面 `walk`」：
 正面视角的行走图看起来是「原地踏步 + 平移」，出戏且与水平移动的语义不符。
 2026-10 已把 `walk` 从词表与内置形象里移除（见 README §3、§11）。
+
+两个**顶层**字段不属于任何动作
+------------------------------
+- `still`（标准图像）：不播动画时显示的那一帧。见 `StillImage` 的说明——
+  它是「idle 挂了两套动画之后，静止画面变成张望的抬头帧」这个问题的修法。
+- `schedule`（时间驱动行为的节奏）：`idle` 的小动作间隔、`roam` 的漫游间隔。
+  只有**由时间驱动**的行为能设它；事件驱动的动作（点击、下落、播报…）
+  写它就是错误，因为那件事做不到。
 """
 
 import json
@@ -79,6 +87,16 @@ REQUIRED_ACTIONS = ('idle', 'walk', 'drag', 'fall')
 #: 只播一遍的动作（其余默认循环）。未显式给 `loop` 时按此判定。
 ONE_SHOT_ACTIONS = frozenset({'land', 'click'})
 
+#: 「标准图像」用的伪动作名（**不是动作**）。
+#:
+#: 它不参与状态机，也不在 `ACTION_FALLBACKS` 词表里。之所以复用一个「像动作名」
+#: 的标识，是因为它要复用同一套解析通路（用户覆盖 > 包内声明 > 内置包）与同一条
+#: `/frame/<id>/<action>` 图片路由——否则「路径安全校验」与「覆盖优先级」这两件
+#: 已经有测试钉住的事都要再写一遍，而写两遍的代价是两边迟早不一致。
+#:
+#: 解析器**拒绝**包里出现同名动作（见 `from_dict`），避免两套语义打架。
+STILL_ACTION = 'still'
+
 #: 解析出的实际动作种类。
 KIND_ANIMATED = 'animated'   # 有 sheet，能播帧
 KIND_STATIC = 'static'       # 没 sheet，只位移/不播帧
@@ -132,21 +150,70 @@ DEFAULT_WEIGHT = 1.0
 
 #: idle 的触发方式。
 #:
-#: - `random`（**默认**）：平时停在第一帧（静止画面），每隔一段**随机时间**
+#: - `random`（**默认**）：平时停在标准图像（静止画面），每隔一段**随机时间**
 #:   播一遍，播完回到静止。这是「成熟做法」：常驻循环的待机动画会让人
 #:   觉得宠物在不停抽搐，而静止 + 偶发小动作才像活着。
-#: - `loop`：旧行为，待机动画一直循环。
+#: - `loop`：待机动画一直循环（不做「播一遍就停」）。
 IDLE_TRIGGER_RANDOM = 'random'
 IDLE_TRIGGER_LOOP = 'loop'
 IDLE_TRIGGER_MODES = (IDLE_TRIGGER_RANDOM, IDLE_TRIGGER_LOOP)
 
-#: 随机触发的默认间隔区间（毫秒）。6~18 秒：偶尔动一下，不烦人。
-DEFAULT_IDLE_MIN_MS = 6000
-DEFAULT_IDLE_MAX_MS = 18000
-#: 一次触发连续播几轮。
+#: 一次 idle 触发连续播几轮。
 DEFAULT_IDLE_PLAYS = 1
-#: 间隔与轮数的上限（拦「填错了」的极端值）。
-MAX_IDLE_INTERVAL_MS = 3600 * 1000
+
+#: **时间驱动行为**的默认节奏（毫秒区间）与上限。
+#:
+#: 「时间驱动」指的是**没有外部事件**、靠时间自己发生的动作。只有两个：
+#:
+#: - `idle`：闲着的时候偶尔动一下（默认 6~18 秒一次）；
+#: - `roam`：闲着的时候自己在屏幕底部走一走（默认 3~9 秒一次）。
+#:
+#: 其余动作都是**事件驱动**的（`click` 要有人点、`fall` 要松手、
+#: `happy` 要有播报…），给它们设「多久触发一次」没有意义，
+#: 因此 `schedule` 里**只认这两个键**——多写的键会被明确拒绝，
+#: 而不是静默忽略（作者会以为设了却没生效）。
+SCHEDULE_BEHAVIORS = ('idle', 'roam')
+
+#: 每个时间驱动行为**支持哪些字段**。
+#:
+#: 不支持某个字段时**写它就是错误**，而不是静默忽略——
+#: 「我明明设了却没生效」是最难查的一类问题（与 §2.5 的教训一致）。
+#:
+#: `roam` 没有 `plays` / `mode`：它的持续时长由物理决定（走到目标点就停），
+#: 不是「播几轮动画」。
+#:
+#: 间隔有两种写法，**两种都收**：
+#: - `intervalMs: [最小, 最大]` —— 手写 `pet.json` 时最省事；
+#: - `minIntervalMs` / `maxIntervalMs` —— 运行期定义的形状，
+#:   `to_dict()` 与面板提交的都是这一种。
+#: 只收其中一种的话，`to_dict()` 的输出就不再能被自己读回来
+#: （round-trip 断裂），而面板提交的字段名也得另做一层映射。
+BEHAVIOR_FIELDS = {
+    'idle': ('mode', 'intervalMs', 'minIntervalMs', 'maxIntervalMs', 'plays'),
+    'roam': ('intervalMs', 'minIntervalMs', 'maxIntervalMs'),
+}
+
+#: 行为的**人类可读名**（报错信息与面板共用一份，避免两边叫法不一致）。
+BEHAVIOR_LABELS = {
+    'idle': '待机小动作',
+    'roam': '自动漫游',
+}
+
+#: 每个时间驱动行为的默认间隔区间（毫秒）。
+#:
+#: `roam` 的默认值就是历史行为（`3000 + random * 6000`）——
+#: 把它变成可配置项时**不改动默认观感**，否则用户会莫名其妙地觉得
+#: 「宠物怎么突然走得频繁了」。
+DEFAULT_SCHEDULE_MS = {
+    'idle': (6000, 18000),
+    'roam': (3000, 9000),
+}
+
+#: 间隔的合法区间（毫秒）。下限 200ms 拦住「每帧都在动」，
+#: 上限 1 小时拦住「填错了位数」。
+MIN_SCHEDULE_MS = 200
+MAX_SCHEDULE_MS = 3600 * 1000
+#: 轮数上限（拦「填错了」的极端值）。
 MAX_IDLE_PLAYS = 20
 
 #: 单帧的默认逻辑尺寸。**只是默认值**——`size.w` 与 `size.h` 完全独立，
@@ -268,27 +335,47 @@ class AnimationVariant:
 
 
 @dataclass
-class IdleTrigger:
-    """idle 动作的**触发方式**（只有 idle 用得上，其余动作由状态机驱动）。
+class Trigger:
+    """一个**时间驱动行为**的节奏配置（`idle` 的小动作、`roam` 的漫游）。
 
-    默认 `random`：平时停在第一帧（静止画面），每隔一段**随机时间**播一遍，
-    播完回到静止。这是常驻桌面宠物的成熟做法——一直循环的待机动画会让
-    宠物看起来在不停抽搐，而「静止 + 偶发小动作」才像活着。
+    为什么它不再是「idle 的触发方式」：用户要求「支持调整不同动作的触发时间」，
+    而真正**由时间驱动**的行为只有两个——闲着时偶尔动一下（`idle`）、
+    闲着时自己走一走（`roam`）。其余动作都是**事件驱动**的
+    （`click` 要有人点、`fall` 要松手、`happy` 要有播报…），
+    给它们设「多久触发一次」没有意义，因此解析器对它们明确报错而不是静默忽略。
+
+    `mode` 与 `plays` 只对 `idle` 有意义：
+
+    - `random`（默认）：平时停在标准图像，隔一段随机时间播一遍，播完回静止；
+    - `loop`：一直循环待机动画（不做「播一遍就停」）。
+
+    `roam` 的持续时长由物理决定（走到目标点就停），不是「播几轮」，
+    所以它**没有** `mode` / `plays`（写了会报错，见 `BEHAVIOR_FIELDS`）。
     """
 
     mode: str = IDLE_TRIGGER_RANDOM
-    min_ms: int = DEFAULT_IDLE_MIN_MS
-    max_ms: int = DEFAULT_IDLE_MAX_MS
-    #: 一次触发连续播几轮。
+    min_ms: int = DEFAULT_SCHEDULE_MS['idle'][0]
+    max_ms: int = DEFAULT_SCHEDULE_MS['idle'][1]
+    #: 一次触发连续播几轮（只有 idle 用得上）。
     plays: int = DEFAULT_IDLE_PLAYS
+    #: 这个节奏属于哪个行为（`idle` / `roam`）。
+    #:
+    #: 序列化时按它决定**写哪些字段**：`roam` 没有 `mode` / `plays`，
+    #: 而 `to_dict()` 的输出必须能被 `from_dict()` 原样读回来
+    #: （否则 round-trip 断裂，而「导出再导入」正是靠它）。
+    behavior: str = 'idle'
 
     def to_dict(self) -> dict:
-        return {
-            'mode': self.mode,
+        payload = {
             'minIntervalMs': self.min_ms,
             'maxIntervalMs': self.max_ms,
-            'plays': self.plays,
         }
+        # 只写这个行为**支持**的字段（见 `BEHAVIOR_FIELDS`）。
+        if 'mode' in BEHAVIOR_FIELDS.get(self.behavior, ()):
+            payload['mode'] = self.mode
+        if 'plays' in BEHAVIOR_FIELDS.get(self.behavior, ()):
+            payload['plays'] = self.plays
+        return payload
 
 
 @dataclass
@@ -301,8 +388,6 @@ class AnimationSpec:
     """
 
     variants: list = field(default_factory=list)
-    #: idle 的触发方式；非 idle 动作上是 `None`（不适用）。
-    idle: IdleTrigger = None
 
     # ---- 主变体的透传属性（向后兼容的读法）----
 
@@ -345,13 +430,13 @@ class AnimationSpec:
 
         单套动画仍写成扁平形式：那是绝大多数包的形态，也是
         「最省事的写法」所承诺的样子，不该因为引擎支持多套就变啰嗦。
+
+        注意这里**不写** `trigger` / `intervalMs` / `plays`：那些是
+        **时间驱动行为的节奏**，已经上移到顶层的 `schedule` 块——
+        因为 `roam`（自动漫游）根本不是动作，没法挂在 `animations` 下面。
+        两处都能写同一件事的话，迟早会出现「两处不一致」的包。
         """
         payload = {}
-        if self.idle is not None:
-            trigger = self.idle
-            payload['trigger'] = trigger.mode
-            payload['intervalMs'] = [trigger.min_ms, trigger.max_ms]
-            payload['plays'] = trigger.plays
         if len(self.variants) == 1:
             variant = self.variants[0].to_dict()
             # 单套时不写 weight（它恒为 1，写出来只是噪音）
@@ -412,8 +497,6 @@ class ResolvedAction:
     #: 这个动作的**全部**可播变体（多套动画时按 `weight` 随机选一套播）。
     #: 上面那组字段是**主变体**的透传，方便只关心单套动画的调用方。
     variants: list = field(default_factory=list)
-    #: idle 的触发方式（只有 idle 有；其余动作由状态机驱动）。
-    idle_trigger: IdleTrigger = None
 
     def to_dict(self) -> dict:
         payload = {
@@ -431,9 +514,49 @@ class ResolvedAction:
             'note': self.note,
             'variants': [variant.to_dict() for variant in self.variants],
         }
-        if self.idle_trigger is not None:
-            payload['idleTrigger'] = self.idle_trigger.to_dict()
         return payload
+
+
+@dataclass
+class StillImage:
+    """**标准图像**：不播动画时显示的那一帧。
+
+    为什么需要它
+    ------------
+    `idle` 的默认触发是「平时静止 + 隔一段随机播一遍」，而「静止」原本的实现是
+    **保留刚刚播过的那套变体的第 0 帧**。作者一旦给 idle 挂上第二套动画
+    （内置形象的「张望」就是这样），静止画面就会变成「张望的第 0 帧」——
+    那是一个**抬头看**的姿势，卡在那里很怪。
+
+    正确语义是「不播动画时显示**一个固定的标准姿势**」，与「刚刚播过什么」无关。
+    因此标准图像是独立的一份声明：
+
+    - 包内显式声明了 `still` → 用它；
+    - 没声明 → 回落到 `idle` 主变体的第 0 帧（也就是历史行为里
+      「作者只给了一套 idle」时的正确结果）。
+    """
+
+    #: sheet 相对路径；空表示这个包连 idle 都没有（宠物不显示）。
+    sheet: str = ''
+    #: 这条 sheet 里排了几帧（用于切帧几何）。
+    frames: int = 1
+    #: 用这条 sheet 的第几帧当标准图像。
+    frame: int = 0
+    layout: str = 'horizontal'
+    #: 这一帧是**包内显式声明**的（`False` = 回落自 idle 首帧）。
+    declared: bool = False
+    #: 来源动作名（`'still'` 或 `'idle'`），供 UI 解释与排查。
+    source: str = 'idle'
+
+    def to_dict(self) -> dict:
+        return {
+            'sheet': self.sheet,
+            'frames': self.frames,
+            'frame': self.frame,
+            'layout': self.layout,
+            'declared': self.declared,
+            'source': self.source,
+        }
 
 
 @dataclass
@@ -452,6 +575,11 @@ class PetPack:
     pixelated: bool = DEFAULT_PIXELATED
     physics: dict = field(default_factory=lambda: dict(DEFAULT_PHYSICS))
     animations: dict = field(default_factory=dict)
+    #: **标准图像**的原始声明（`None` = 作者没声明，回落 idle 首帧）。
+    still: StillImage = None
+    #: **时间驱动行为**的节奏：`{行为名: Trigger}`。
+    #: 只包含作者**显式声明过**的项；缺的项由调用方用默认值补齐。
+    schedules: dict = field(default_factory=dict)
     #: 解析时忽略掉的未知字段（向前兼容），仅用于排查。
     ignored_fields: list = field(default_factory=list)
 
@@ -475,6 +603,15 @@ class PetPack:
         action = str(action or '').strip()
         if not action:
             action = 'idle'
+
+        # 标准图像走**同一条**解析通路（用户覆盖 > 包内 > 内置），
+        # 因此这里把它当成一个「只有一帧、不循环」的动作返回。
+        #
+        # 为什么不另写一条：`store.resolve_frame_path()` 已经处理了
+        # 「覆盖优先」「路径安全复核」「文件存在性」这几件事，而那些都有测试钉住。
+        # 复制一份的代价是两边迟早不一致——尤其路径安全那部分。
+        if action == STILL_ACTION:
+            return self._resolve_still_action()
 
         # 未知动作名：直接并入回退链（保证向前兼容：新动作名在旧包上不报错）
         chain = [action]
@@ -529,12 +666,6 @@ class PetPack:
                         )
                         for variant in variants
                     ],
-                    # idle 的触发方式跟着**请求的动作**走，而不是命中回退链的那个：
-                    # 请求 `look` 却回退到 idle 时，它仍然是「被状态机驱动的一次播报」，
-                    # 不该因为落到了 idle 的图上就变成「随机小动作」。
-                    idle_trigger=(
-                        (spec.idle or IdleTrigger()) if action == 'idle' else None
-                    ),
                 )
             # 存在但没 sheet → 只位移不播帧（「必要动作」的降级语义）
             if candidate == 'idle':
@@ -542,9 +673,6 @@ class PetPack:
                     action=action, source=candidate, kind=KIND_STATIC,
                     chain=chain,
                     note='没有可用的帧图，将只移动位置、不播放动画。',
-                    idle_trigger=(
-                        (spec.idle or IdleTrigger()) if action == 'idle' else None
-                    ),
                 )
 
         # 连 idle 都没有：解析阶段已经报错（`from_dict` 会拒绝），
@@ -553,6 +681,65 @@ class PetPack:
             action=action, kind=KIND_NONE, chain=chain,
             note='没有找到任何可用的动作，宠物将不显示。',
         )
+
+    def _resolve_still_action(self) -> ResolvedAction:
+        """把**标准图像**包装成一个「只有一帧、不循环」的动作解析结果。
+
+        这样 `store.resolve_frame_path()` 就能原样处理它（覆盖优先、路径复核、
+        文件存在性检查全都复用），前端也能用同一套切帧几何画它。
+        """
+        still = self.resolve_still()
+        if not still.sheet:
+            return ResolvedAction(
+                action=STILL_ACTION, kind=KIND_NONE, chain=[STILL_ACTION],
+                note='没有可用的标准图像，宠物将不显示。',
+            )
+        return ResolvedAction(
+            action=STILL_ACTION, source=still.source, kind=KIND_ANIMATED,
+            sheet=still.sheet, frames=still.frames, fps=1, loop=False,
+            layout=still.layout, chain=[STILL_ACTION],
+            variants=[ResolvedVariant(
+                sheet=still.sheet, frames=still.frames, fps=1, loop=False,
+                layout=still.layout,
+            )],
+        )
+
+    def resolve_still(self) -> StillImage:
+        """解析**标准图像**（不播动画时显示的那一帧）。
+
+        优先级：
+
+        1. 包内显式声明的 `still`（`declared=True`）；
+        2. 回落：`idle` 主变体的**第 0 帧**。
+
+        为什么要「显式声明优先」而不是「永远用 idle 首帧」：`idle` 可以挂多套
+        动画（内置形象的「张望」就是第二套），而「标准图像」的语义是
+        **一个固定的标准姿势**——与「这次随机抽到了哪一套」无关。
+        回落只保证「作者没声明时不会崩」，不保证它一定好看。
+        """
+        still = self.still
+        if still is not None and still.sheet:
+            return StillImage(
+                sheet=still.sheet,
+                frames=max(1, int(still.frames)),
+                frame=still.frame,
+                layout=still.layout,
+                declared=True,
+                source=STILL_ACTION,
+            )
+
+        # 回落：idle 的主变体首帧
+        resolved = self.resolve('idle')
+        if resolved.kind == KIND_ANIMATED and resolved.sheet:
+            return StillImage(
+                sheet=resolved.sheet,
+                frames=max(1, int(resolved.frames)),
+                frame=0,
+                layout=resolved.layout,
+                declared=False,
+                source=resolved.source or 'idle',
+            )
+        return StillImage()
 
     def missing_required(self) -> list:
         """缺失的「必要动作」列表（**不是错误**，但要告诉用户会怎么降级）。
@@ -573,6 +760,21 @@ class PetPack:
 
         return [name for name in REQUIRED_ACTIONS if not satisfied(name)]
 
+    def schedule_for(self, behavior: str) -> Trigger:
+        """取某行为的节奏配置（作者没声明时给该行为的默认值）。
+
+        `mode` / `plays` 只对 `idle` 有意义：`roam` 没有这两项，
+        因此给它一个 `plays=1` 是无害的占位（前端不读）。
+        """
+        key = str(behavior or '').strip()
+        declared = self.schedules.get(key)
+        if declared is not None:
+            return declared
+        low, high = DEFAULT_SCHEDULE_MS.get(key, DEFAULT_SCHEDULE_MS['idle'])
+        return Trigger(
+            mode=IDLE_TRIGGER_RANDOM, min_ms=low, max_ms=high, behavior=key,
+        )
+
     def to_dict(self) -> dict:
         return {
             'format': self.format,
@@ -585,6 +787,11 @@ class PetPack:
             'pixelated': self.pixelated,
             'physics': dict(self.physics),
             'animations': {key: spec.to_dict() for key, spec in self.animations.items()},
+            'still': self.resolve_still().to_dict(),
+            'schedule': {
+                key: self.schedule_for(key).to_dict()
+                for key in SCHEDULE_BEHAVIORS
+            },
             'missingRequired': self.missing_required(),
             'ignoredFields': list(self.ignored_fields),
         }
@@ -624,7 +831,15 @@ def _read_number(raw: dict, key: str, default: float, *, low: float, high: float
     return number
 
 
-def _read_positive_int(raw: dict, key: str, default: int, *, low: int, high: int) -> int:
+def _read_positive_int(raw: dict, key: str, default: int, *, low: int, high: int,
+                       where: str = '') -> int:
+    """读一个整数并校验范围。
+
+    `where` 只影响**报错信息里的字段名**：默认用 `key`，但顶层字段
+    （例如标准图像的 `still.frame`）需要带上级前缀，否则作者看到的
+    是裸的 `frame`，不知道改哪里。
+    """
+    field = where or key
     value = raw.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int):
         # 容忍 4.0 这种浮点写法，但不接受 4.5
@@ -632,13 +847,13 @@ def _read_positive_int(raw: dict, key: str, default: int, *, low: int, high: int
             value = int(value)
         else:
             raise _field_error(
-                key, '应为整数',
+                field, '应为整数',
                 hint=f'把 {key} 写成整数（例如 {default}）。',
             )
     number = int(value)
     if not (low <= number <= high):
         raise _field_error(
-            key, f'应在 {low} ~ {high} 之间，实际为 {value}',
+            field, f'应在 {low} ~ {high} 之间，实际为 {value}',
             hint=f'把 {key} 调整到 {low} ~ {high} 范围内。',
         )
     return number
@@ -728,51 +943,200 @@ def _read_weight(raw: dict, key: str, default: float = DEFAULT_WEIGHT) -> float:
     return round(number, 4)
 
 
-def _parse_idle_trigger(raw_value: dict, action: str) -> IdleTrigger:
-    """解析 idle 的触发方式（只有 idle 会读它；其它动作忽略这些字段）。"""
-    trigger = IdleTrigger()
-    raw_mode = raw_value.get('trigger', raw_value.get('idleTrigger', IDLE_TRIGGER_RANDOM))
-    if raw_mode is None:
-        raw_mode = IDLE_TRIGGER_RANDOM
-    if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in IDLE_TRIGGER_MODES:
-        allowed = ' / '.join(IDLE_TRIGGER_MODES)
-        raise _field_error(
-            f'animations.{action}.trigger', f'应为 {allowed}',
-            hint=f'trigger 写 "{IDLE_TRIGGER_RANDOM}"（平时静止、偶尔动一下）'
-                 f'或 "{IDLE_TRIGGER_LOOP}"（一直循环）。',
-        )
-    trigger.mode = raw_mode.strip().lower()
+def _parse_schedule(raw_value, *, where: str = 'schedule') -> dict:
+    """解析顶层的 `schedule` 块：`{行为名: {intervalMs, mode, plays}}`。
 
-    raw_interval = raw_value.get('intervalMs')
-    if raw_interval is not None:
-        if (not isinstance(raw_interval, list) or len(raw_interval) != 2):
+    只接受 `SCHEDULE_BEHAVIORS` 里的键（`idle` / `roam`），其余一律报错。
+    为什么不静默忽略未知键：作者写 `"click": {...}` 时的意图是明确的
+    （「我想让点击动作按时间自己触发」），而那是**做不到**的——点击由用户
+    触发。静默忽略会让他以为设好了却没生效，那比直接报错难查得多。
+
+    同理，某个行为不支持的字段（例如 `roam.plays`）也报错，见 `BEHAVIOR_FIELDS`。
+    """
+    if raw_value is None:
+        return {}
+    if not isinstance(raw_value, dict):
+        raise _field_error(
+            where, '应为对象',
+            hint='写成 {"idle": {"intervalMs": [6000, 18000]}} 这种形式。',
+        )
+
+    result = {}
+    for raw_key, raw_spec in raw_value.items():
+        behavior = str(raw_key or '').strip()
+        if behavior not in SCHEDULE_BEHAVIORS:
+            allowed = ' / '.join(SCHEDULE_BEHAVIORS)
             raise _field_error(
-                f'animations.{action}.intervalMs', '应为 [最小毫秒, 最大毫秒]',
-                hint='例如 [6000, 18000]：每隔 6~18 秒随机播一次。',
+                f'{where}.{behavior}',
+                f'不是可设置触发时间的行为（只能是 {allowed}）',
+                hint='只有**由时间驱动**的行为能设间隔：待机小动作（idle）与'
+                     '自动漫游（roam）。点击、下落、播报这类由事件触发的动作'
+                     '没有「多久触发一次」可言。',
+            )
+        if raw_spec is None:
+            continue
+        if not isinstance(raw_spec, dict):
+            raise _field_error(
+                f'{where}.{behavior}', '应为对象',
+                hint=f'写成 {{"intervalMs": [3000, 9000]}} 这种形式。',
+            )
+
+        allowed_fields = BEHAVIOR_FIELDS[behavior]
+        stray = sorted(key for key in raw_spec if key not in allowed_fields)
+        if stray:
+            label = BEHAVIOR_LABELS.get(behavior, behavior)
+            raise _field_error(
+                f'{where}.{behavior}.{stray[0]}',
+                f'「{label}」不支持这个字段',
+                hint=f'「{label}」只能设 {"、".join(allowed_fields)}。',
+            )
+
+        result[behavior] = _parse_trigger(raw_spec, behavior, where=f'{where}.{behavior}')
+    return result
+
+
+def parse_schedule(raw_value) -> dict:
+    """**公开**的节奏解析入口（store 层在写回 `pet.json` 前用它校验）。
+
+    复用同一套校验的意义：面板提交的节奏与手写的 `pet.json` 走**完全一致**的
+    规则。若 store 自己再写一份，两边迟早不一致——那种 bug 表现为
+    「面板上设了能用，手写进包却报错」。
+    """
+    return _parse_schedule(raw_value)
+
+
+def _parse_trigger(raw_spec: dict, behavior: str, *, where: str) -> Trigger:
+    """解析**单个行为**的节奏（间隔区间 + idle 专属的 mode / plays）。"""
+    low_default, high_default = DEFAULT_SCHEDULE_MS.get(
+        behavior, DEFAULT_SCHEDULE_MS['idle'],
+    )
+    trigger = Trigger(
+        mode=IDLE_TRIGGER_RANDOM, min_ms=low_default, max_ms=high_default,
+        behavior=behavior,
+    )
+
+    if 'mode' in raw_spec:
+        raw_mode = raw_spec.get('mode')
+        if raw_mode is None:
+            raw_mode = IDLE_TRIGGER_RANDOM
+        if not isinstance(raw_mode, str) or raw_mode.strip().lower() not in IDLE_TRIGGER_MODES:
+            allowed = ' / '.join(IDLE_TRIGGER_MODES)
+            raise _field_error(
+                f'{where}.mode', f'应为 {allowed}',
+                hint=f'mode 写 "{IDLE_TRIGGER_RANDOM}"（平时静止、偶尔动一下）'
+                     f'或 "{IDLE_TRIGGER_LOOP}"（一直循环）。',
+            )
+        trigger.mode = raw_mode.strip().lower()
+
+    raw_interval = raw_spec.get('intervalMs')
+    if raw_interval is not None:
+        if not isinstance(raw_interval, list) or len(raw_interval) != 2:
+            raise _field_error(
+                f'{where}.intervalMs', '应为 [最小毫秒, 最大毫秒]',
+                hint=f'例如 [{low_default}, {high_default}]：'
+                     f'每隔 {low_default // 1000}~{high_default // 1000} 秒随机触发一次。',
             )
         low = _read_positive_int(
-            {'v': raw_interval[0]}, 'v', DEFAULT_IDLE_MIN_MS, low=1,
-            high=MAX_IDLE_INTERVAL_MS,
+            {'v': raw_interval[0]}, 'v', low_default,
+            low=MIN_SCHEDULE_MS, high=MAX_SCHEDULE_MS, where=f'{where}.intervalMs',
         )
         high = _read_positive_int(
-            {'v': raw_interval[1]}, 'v', DEFAULT_IDLE_MAX_MS, low=1,
-            high=MAX_IDLE_INTERVAL_MS,
+            {'v': raw_interval[1]}, 'v', high_default,
+            low=MIN_SCHEDULE_MS, high=MAX_SCHEDULE_MS, where=f'{where}.intervalMs',
         )
         if high < low:
             # 写反了不算错误——用户意图明确，直接调正比报错友好
             low, high = high, low
         trigger.min_ms, trigger.max_ms = low, high
 
-    raw_plays = raw_value.get('plays')
-    if raw_plays is not None:
-        trigger.plays = _read_positive_int(
-            {'v': raw_plays}, 'v', DEFAULT_IDLE_PLAYS, low=1, high=MAX_IDLE_PLAYS,
-        )
+    # 分开写的形状（`to_dict()` 与面板提交用的都是这个）。
+    # 两个键都可以单独出现：面板一次只改一个滑块时只会传一个。
+    for key, attr in (('minIntervalMs', 'min_ms'), ('maxIntervalMs', 'max_ms')):
+        if key not in raw_spec or raw_spec[key] is None:
+            continue
+        default = low_default if key == 'minIntervalMs' else high_default
+        setattr(trigger, attr, _read_positive_int(
+            {'v': raw_spec[key]}, 'v', default,
+            low=MIN_SCHEDULE_MS, high=MAX_SCHEDULE_MS, where=f'{where}.{key}',
+        ))
+    if trigger.max_ms < trigger.min_ms:
+        trigger.min_ms, trigger.max_ms = trigger.max_ms, trigger.min_ms
+
+    if 'plays' in raw_spec:
+        raw_plays = raw_spec.get('plays')
+        if raw_plays is not None:
+            trigger.plays = _read_positive_int(
+                {'v': raw_plays}, 'v', DEFAULT_IDLE_PLAYS,
+                low=1, high=MAX_IDLE_PLAYS,
+            )
     return trigger
 
 
-def _validate_sheet_path(sheet: str, *, where: str, allow_source_jpeg: bool = False) -> str:
-    """校验 sheet 相对路径：不得绝对、不得 `..`、扩展名在白名单内。"""
+def _parse_still(raw_value, *, allow_source_jpeg: bool = False) -> StillImage:
+    """解析**标准图像**（顶层 `still`）。
+
+    接受两种写法（与动作的 `sheet` 写法对齐，作者不必记两套规则）：
+
+    - 字符串：`"still": "still.png"` —— 单帧；
+    - 对象：`"still": {"sheet": "idle.png", "frame": 1}` —— 指定用第几帧。
+
+    `frame` 是「用这条 sheet 的第几帧」：作者常常想拿 idle 里的某一帧当标准图像，
+    但又不想为它单独切一张图，于是这个字段让「从多帧 sheet 里挑一帧」成立。
+    """
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, str):
+        raw_value = {'sheet': raw_value}
+    if not isinstance(raw_value, dict):
+        raise _field_error(
+            'still', '应为对象或字符串',
+            hint='写成 {"sheet": "still.png"} 或直接写 "still.png"。',
+        )
+
+    raw_sheet = raw_value.get('sheet', '')
+    if raw_sheet is None:
+        raw_sheet = ''
+    if not isinstance(raw_sheet, str):
+        raise _field_error('still.sheet', '应为字符串', hint='sheet 写文件名文本。')
+    if not raw_sheet.strip():
+        # 显式给了 still 却指向空：当作「没声明」，回落到 idle 首帧。
+        # 这里不报错是因为「先占个位、图后面再补」是合理的编辑过程。
+        return None
+
+    sheet = _validate_sheet_path(
+        raw_sheet, where='still', allow_source_jpeg=allow_source_jpeg, prefix='',
+    )
+    frames = _read_positive_int(
+        raw_value, 'frames', 1, low=1, high=MAX_FRAMES, where='still.frames',
+    )
+    frame = _read_positive_int(
+        raw_value, 'frame', 0, low=0, high=max(0, frames - 1), where='still.frame',
+    )
+
+    layout = raw_value.get('layout', 'horizontal')
+    if not isinstance(layout, str) or layout.strip().lower() not in ('horizontal', 'vertical'):
+        raise _field_error(
+            'still.layout', '应为 "horizontal" 或 "vertical"',
+            hint='水平排布用 "horizontal"（默认），垂直排布用 "vertical"。',
+        )
+    return StillImage(
+        sheet=sheet,
+        frames=frames,
+        frame=frame,
+        layout=layout.strip().lower(),
+        declared=True,
+        source=STILL_ACTION,
+    )
+
+
+def _validate_sheet_path(sheet: str, *, where: str, allow_source_jpeg: bool = False,
+                         prefix: str = 'animations') -> str:
+    """校验 sheet 相对路径：不得绝对、不得 `..`、扩展名在白名单内。
+
+    `where` 是**报错信息**里的字段前缀（`idle` / `variants[1]` / `still`），
+    `prefix` 是它的**父级**（动作在 `animations` 下，标准图像在顶层）。
+    分开是因为标准图像是顶层字段（`still`），写成 `animations.still` 会误导作者。
+    """
     text = to_posix(sheet).strip()
     if not text:
         raise PetError(
@@ -781,20 +1145,21 @@ def _validate_sheet_path(sheet: str, *, where: str, allow_source_jpeg: bool = Fa
             user_msg=f'宠物包里「{where}」的图没有指定文件名。',
             hint='给该项写一个相对路径，例如 "idle.png"。',
         )
+    field = f'{prefix}.{where}.sheet' if prefix else f'{where}.sheet'
     if text.startswith('/') or (len(text) >= 2 and text[1] == ':'):
         raise _field_error(
-            f'animations.{where}.sheet', '不允许绝对路径',
+            field, '不允许绝对路径',
             hint='sheet 必须是相对于包目录的路径，例如 "idle.png"。',
         )
     segments = [seg for seg in text.split('/') if seg not in ('', '.')]
     if any(seg == '..' for seg in segments):
         raise _field_error(
-            f'animations.{where}.sheet', '不允许包含 ".."',
+            field, '不允许包含 ".."',
             hint='sheet 只能指向包目录内部的文件。',
         )
     if not segments or not is_safe_relative_name(segments[-1]):
         raise _field_error(
-            f'animations.{where}.sheet', '文件名不合法',
+            field, '文件名不合法',
             hint='文件名不能包含 <>:"|?* 等字符，也不能为空。',
         )
     extension = os.path.splitext(text)[1].lower()
@@ -805,7 +1170,7 @@ def _validate_sheet_path(sheet: str, *, where: str, allow_source_jpeg: bool = Fa
     if extension not in allowed:
         allowed_text = '、'.join(sorted(allowed))
         raise _field_error(
-            f'animations.{where}.sheet',
+            field,
             f'扩展名 {extension or "(无)"} 不受支持',
             hint=f'只支持 {allowed_text}。JPEG 请先转成 PNG 或 WebP 再放进包里。',
         )
@@ -883,6 +1248,21 @@ def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False)
     where = f'animations.{action}'
     spec = AnimationSpec()
 
+    # 节奏字段已上移到顶层 `schedule`：老写法**显式报错**而不是静默忽略。
+    #
+    # 插件未发布，因此不必兼容读取；但「静默忽略」是最坏的选择——
+    # 作者按 `animations.idle.intervalMs` 设了间隔，包能读、宠物也能跑，
+    # 只是那个间隔永远不生效，他会一直以为是引擎的 bug。
+    legacy = sorted(key for key in _LEGACY_SCHEDULE_KEYS if key in raw_value)
+    if legacy:
+        raise _field_error(
+            f'{where}.{legacy[0]}',
+            '节奏字段已移到顶层的 schedule 里',
+            hint='把 "trigger" / "intervalMs" / "plays" 从动作里拿出来，'
+                 '写成 {"schedule": {"idle": {"intervalMs": [6000, 18000]}}}。'
+                 '这样自动漫游（roam）也能一起设。',
+        )
+
     raw_variants = raw_value.get('variants')
     if raw_variants is None:
         # ---- 单套写法（绝大多数包）----
@@ -931,10 +1311,18 @@ def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False)
             ))
         spec.variants = parsed
 
-    # idle 的触发方式（只有 idle 读它）
-    if action == 'idle':
-        spec.idle = _parse_idle_trigger(raw_value, action)
+    # 时间驱动的节奏**不在这里**读：它上移到顶层的 `schedule` 块了
+    # （`roam` 不是动作，挂不到 `animations` 下面）。若包在动作里写了这些字段，
+    # 下面的 `stray` 检查会把它当未知字段忽略——为了不让作者以为生效了，
+    # `from_dict` 对动作里的这几个键**显式报错**（见 `_LEGACY_SCHEDULE_KEYS`）。
     return spec
+
+
+#: 曾经写在 `animations.idle` 里的节奏字段，现在上移到顶层 `schedule`。
+#:
+#: 插件未发布，因此**不做兼容读取**，而是给出可读的迁移提示：
+#: 静默忽略的后果是「作者按老写法设了间隔，却永远不生效」。
+_LEGACY_SCHEDULE_KEYS = ('trigger', 'idleTrigger', 'intervalMs', 'plays')
 
 
 def _parse_mapping(raw, key: str, defaults: dict, *, low_map, high_map) -> dict:
@@ -1032,6 +1420,13 @@ def from_dict(raw: dict, *, pack_id: str = '', allow_source_jpeg: bool = False) 
         name = str(action or '').strip()
         if not name:
             continue
+        if name == STILL_ACTION:
+            raise _field_error(
+                f'animations.{name}',
+                f'「{name}」是保留名（标准图像不是动作）',
+                hint='标准图像写在顶层的 "still" 字段里，'
+                     '不要把它当成一个动作放进 animations。',
+            )
         animations[name] = _parse_animation(
             name, value, allow_source_jpeg=allow_source_jpeg,
         )
@@ -1055,10 +1450,16 @@ def from_dict(raw: dict, *, pack_id: str = '', allow_source_jpeg: bool = False) 
                  '所以没有它就无法显示。请把其中一张图声明为 "idle"。',
         )
 
+    # ---- 标准图像（不播动画时显示的那一帧；可选）----
+    pack.still = _parse_still(raw.get('still'), allow_source_jpeg=allow_source_jpeg)
+
+    # ---- 时间驱动行为的节奏（可选；缺的项由调用方补默认值）----
+    pack.schedules = _parse_schedule(raw.get('schedule'))
+
     # ---- 向前兼容：记录被忽略的未知顶层字段 ----
     known = {
         'format', 'id', 'name', 'author', 'size', 'anchor', 'scale', 'pixelated',
-        'physics', 'animations',
+        'physics', 'animations', 'still', 'schedule',
     }
     pack.ignored_fields = sorted(str(key) for key in raw.keys() if key not in known)
 
