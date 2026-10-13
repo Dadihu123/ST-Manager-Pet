@@ -21,6 +21,7 @@ import {
   createIdleScheduler,
   DEFAULT_IDLE_MAX_MS,
   DEFAULT_IDLE_MIN_MS,
+  frameSizeOf,
   normalizeWeight,
   pickVariantIndex,
   playableVariants,
@@ -251,6 +252,78 @@ test('可播变体：完全没有图时返回空数组', () => {
   assert.deepEqual(playableVariants({ url: '', frames: 1 }), []);
   assert.deepEqual(playableVariants(null), []);
   assert.deepEqual(playableVariants({ variants: [{ url: '' }] }), []);
+});
+
+// ============================================ 每动作单帧尺寸（横 / 竖构图共存）
+
+test('单帧尺寸：变体自带 > 动作条目 > 包级', () => {
+  const base = { w: 384, h: 576 };
+  // 变体自带时用它（最具体的一层）
+  assert.deepEqual(
+    frameSizeOf({ size: { w: 627, h: 353 } }, { size: { w: 100, h: 200 } }, base),
+    { w: 627, h: 353 },
+  );
+  // 变体没有、动作条目有 → 用动作条目的
+  assert.deepEqual(
+    frameSizeOf({}, { size: { w: 100, h: 200 } }, base),
+    { w: 100, h: 200 },
+  );
+  // 两层都没有 → 回落到包级
+  assert.deepEqual(frameSizeOf({}, {}, base), { w: 384, h: 576 });
+  assert.deepEqual(frameSizeOf(null, null, base), { w: 384, h: 576 });
+});
+
+test('单帧尺寸：躺姿与站立可以同时存在，互不干扰', () => {
+  const base = { w: 384, h: 576 };        // 站立：竖构图
+  const lying = { size: { w: 627, h: 353 } };  // 躺姿：横构图
+  const standing = frameSizeOf({}, {}, base);
+  const sleep = frameSizeOf(lying, {}, base);
+  assert.ok(sleep.w > sleep.h, '躺姿应是横构图');
+  assert.ok(standing.h > standing.w, '站立应是竖构图');
+});
+
+test('单帧尺寸：非法值被跳过而不是污染几何', () => {
+  const base = { w: 384, h: 576 };
+  // 0 / 负数 / NaN / 缺一个方向 —— 都不该被采纳
+  assert.deepEqual(frameSizeOf({ size: { w: 0, h: 100 } }, {}, base), base);
+  assert.deepEqual(frameSizeOf({ size: { w: -5, h: 100 } }, {}, base), base);
+  assert.deepEqual(frameSizeOf({ size: { w: NaN, h: 100 } }, {}, base), base);
+  assert.deepEqual(frameSizeOf({ size: { w: 100 } }, {}, base), base);
+  assert.deepEqual(frameSizeOf({ size: 'big' }, {}, base), base);
+});
+
+test('单帧尺寸：全都没有时用默认值（不返回 0，否则会被 Math.max 拉成怪值）', () => {
+  assert.deepEqual(frameSizeOf({}, {}, {}), { w: 64, h: 64 });
+  assert.deepEqual(frameSizeOf(null, null, null), { w: 64, h: 64 });
+});
+
+test('单帧尺寸：非法层会继续往下找，而不是直接放弃', () => {
+  const base = { w: 384, h: 576 };
+  // 变体的尺寸非法 → 应继续用动作条目的，而不是跳到默认值
+  assert.deepEqual(
+    frameSizeOf({ size: { w: 0, h: 0 } }, { size: { w: 627, h: 353 } }, base),
+    { w: 627, h: 353 },
+  );
+});
+
+test('可播变体：尺寸随帧参数一起流出（否则换动作会「帧换了、尺寸没换」）', () => {
+  const list = playableVariants({
+    url: '/main',
+    variants: [
+      { url: '/a', frames: 4, size: { w: 627, h: 353 } },
+      { url: '/b', frames: 2 },
+    ],
+  });
+  assert.deepEqual(list[0].size, { w: 627, h: 353 });
+  assert.equal(list[1].size, undefined, '没声明的不该被补成默认值');
+});
+
+test('可播变体：老后端只给主变体字段时，尺寸也能透出', () => {
+  const legacy = playableVariants({ url: '/main', frames: 3, size: { w: 627, h: 353 } });
+  assert.deepEqual(legacy[0].size, { w: 627, h: 353 });
+  // 完全没给尺寸 → undefined，由 frameSizeOf 回落到包级
+  const older = playableVariants({ url: '/main', frames: 3 });
+  assert.equal(older[0].size, undefined);
 });
 
 test('动作时长：非均匀时长下逐帧求和', () => {

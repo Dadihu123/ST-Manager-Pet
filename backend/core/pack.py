@@ -237,6 +237,16 @@ class AnimationVariant:
     frame_ms: list = field(default_factory=list)
     #: 权重（**相对比例**，不是百分比）。见 `DEFAULT_WEIGHT` 的说明。
     weight: float = DEFAULT_WEIGHT
+    #: **这一套动画自己的单帧尺寸**（逻辑像素）；`None` 表示沿用包级 `size`。
+    #:
+    #: 为什么需要它：一个动作的画布比例可能和别的动作根本不同。典型例子是
+    #: 「躺下睡觉」——人物横躺，画布自然是**横构图**（例如 1672×941），
+    #: 而站立动作是 2:3 竖构图（1024×1536）。若强行共用一个 `size`，
+    #: 前端会按 `size` 去拉伸贴图，躺姿会被压扁变形。
+    #:
+    #: 挂在这一层（而不是动作层）是因为「画布尺寸」是**图本身的属性**：
+    #: 多套动画可以各自是不同尺寸的图，前端换套播时几何要跟着换。
+    size: dict = None
 
     @property
     def total_ms(self) -> float:
@@ -256,7 +266,7 @@ class AnimationVariant:
         return round(self.frames * 1000.0 / total, 2)
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             'sheet': self.sheet,
             'frames': self.frames,
             'fps': self.fps,
@@ -265,6 +275,10 @@ class AnimationVariant:
             'frameMs': list(self.frame_ms),
             'weight': self.weight,
         }
+        # 只在**真的声明了**独立尺寸时才写这个字段：绝大多数包不该多出噪音
+        if self.size:
+            payload['size'] = dict(self.size)
+        return payload
 
 
 @dataclass
@@ -373,9 +387,11 @@ class ResolvedVariant:
     layout: str = 'horizontal'
     frame_ms: list = field(default_factory=list)
     weight: float = DEFAULT_WEIGHT
+    #: 这一套动画自己的单帧尺寸；`None` 表示沿用包级 `size`（见 `AnimationVariant.size`）。
+    size: dict = None
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             'sheet': self.sheet,
             'frames': self.frames,
             'fps': self.fps,
@@ -384,6 +400,9 @@ class ResolvedVariant:
             'frameMs': list(self.frame_ms),
             'weight': self.weight,
         }
+        if self.size:
+            payload['size'] = dict(self.size)
+        return payload
 
 
 @dataclass
@@ -412,6 +431,8 @@ class ResolvedAction:
     #: 这个动作的**全部**可播变体（多套动画时按 `weight` 随机选一套播）。
     #: 上面那组字段是**主变体**的透传，方便只关心单套动画的调用方。
     variants: list = field(default_factory=list)
+    #: 主变体自己的单帧尺寸；`None` 表示沿用包级 `size`。
+    size: dict = None
     #: idle 的触发方式（只有 idle 有；其余动作由状态机驱动）。
     idle_trigger: IdleTrigger = None
 
@@ -431,6 +452,8 @@ class ResolvedAction:
             'note': self.note,
             'variants': [variant.to_dict() for variant in self.variants],
         }
+        if self.size:
+            payload['size'] = dict(self.size)
         if self.idle_trigger is not None:
             payload['idleTrigger'] = self.idle_trigger.to_dict()
         return payload
@@ -517,6 +540,7 @@ class PetPack:
                     sheet=primary.sheet, frames=primary.frames, fps=primary.fps,
                     loop=primary.loop, layout=primary.layout,
                     frame_ms=list(primary.frame_ms),
+                    size=dict(primary.size) if primary.size else None,
                     mirror=mirrored,
                     chain=chain, note=note,
                     variants=[
@@ -526,6 +550,9 @@ class PetPack:
                             layout=variant.layout,
                             frame_ms=list(variant.frame_ms),
                             weight=variant.weight,
+                            # 每套动画可以各自不同尺寸（横构图 / 竖构图共存），
+                            # 前端换套播时几何要跟着换，因此必须逐套透传。
+                            size=dict(variant.size) if variant.size else None,
                         )
                         for variant in variants
                     ],
@@ -852,9 +879,59 @@ def _parse_variant(
         )
     variant.layout = layout.strip().lower()
 
+    # 这一套动画**自己的**单帧尺寸（可选）。不写就沿用包级 `size`。
+    variant.size = _parse_variant_size(raw_value.get('size'), where)
+
     if with_weight:
         variant.weight = _read_weight(raw_value, 'weight')
     return variant
+
+
+def _parse_variant_size(raw, where: str) -> dict:
+    """解析某一套动画自己的单帧尺寸（可选字段）。
+
+    返回值：`None` 表示「没声明，沿用包级 `size`」；否则是 `{'w': int, 'h': int}`。
+
+    为什么要单独写一个解析器而不是复用 `_parse_mapping`：那个函数是给**包级**
+    `size` 用的，它把缺省值当默认，而这里的语义是「没写就是没有」——
+    必须能区分「作者没声明」和「作者声明了和包级一样的值」，否则
+    `to_dict()` 会凭空给每个包都补上一个 `size` 字段。
+
+    ⚠️ 这里的是**逻辑显示尺寸**，不是源图的像素尺寸。既有形象的做法是
+    源图 1024×1536 配逻辑 384×576（密度 8/3）。作者若直接写源图像素尺寸，
+    多数情况会撞上 1024 的上限——因此上限报错里明确点出这个区别。
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise _field_error(
+            f'{where}.size', '应为对象',
+            hint='写成 {"w": 627, "h": 353} 这种形式。',
+        )
+
+    # 自己校验两个方向的取值，而不是复用 `_parse_mapping`：
+    # 那个函数报错时用的是裸键名（`w`），看不出「这是动作级 size」，
+    # 更没法附上「逻辑尺寸 vs 源图像素尺寸」这条最关键的提示。
+    result = {}
+    for key, default in (('w', DEFAULT_SIZE['w']), ('h', DEFAULT_SIZE['h'])):
+        value = raw.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise _field_error(
+                f'{where}.size.{key}', '应为数字',
+                hint=f'把 {key} 写成一个数字，例如 {{"w": 627, "h": 353}}。',
+            )
+        number = float(value)
+        if not (_MIN_FRAME_SIZE <= number <= _MAX_FRAME_SIZE):
+            raise _field_error(
+                f'{where}.size.{key}',
+                f'应在 {_MIN_FRAME_SIZE} ~ {_MAX_FRAME_SIZE} 之间，实际为 {value}',
+                hint=f'这里填的是**逻辑显示尺寸**，不是源图像素尺寸。'
+                     f'既有形象的做法是源图 1024px 配逻辑 384px（密度 8/3），'
+                     f'请照此换算：源 1672px 宽 → 填 {round(1672 * 3 / 8)}。'
+                     f'上限为 {_MAX_FRAME_SIZE}。',
+            )
+        result[key] = int(round(number))
+    return result
 
 
 def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False) -> AnimationSpec:
@@ -906,7 +983,7 @@ def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False)
             )
         # 顶层不该再混写单套字段（见 docstring）
         stray = sorted(
-            key for key in ('sheet', 'frames', 'fps', 'loop', 'layout', 'frameMs')
+            key for key in ('sheet', 'frames', 'fps', 'loop', 'layout', 'frameMs', 'size')
             if key in raw_value
         )
         if stray:

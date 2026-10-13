@@ -17,6 +17,7 @@
 import {
   animationDuration,
   createIdleScheduler,
+  frameSizeOf,
   playableVariants,
   pickVariantIndex,
 } from './animation.js';
@@ -118,8 +119,11 @@ export function createPetView(options = {}) {
   const actions = pack.actions || {};
   const baseSize = pack.size || { w: 64, h: 64 };
   const scale = clamp(Number(config.scale) || 1, SCALE_MIN, SCALE_MAX);
-  const width = Math.max(8, Math.round(baseSize.w * scale));
-  const height = Math.max(8, Math.round(baseSize.h * scale));
+  // 单帧的**显示**尺寸。它是 `let` 而不是 `const`：动作可以自带画布尺寸
+  // （见 `frameSizeOf`），换动作时这三处几何要一起换——根节点尺寸、切帧几何、
+  // 物理包围盒。留成同名变量，所有既有用法不必改。
+  let width = Math.max(8, Math.round(baseSize.w * scale));
+  let height = Math.max(8, Math.round(baseSize.h * scale));
   const anchorX = Number(pack.anchor?.x ?? 0.5);
   const anchorY = Number(pack.anchor?.y ?? 1);
 
@@ -246,6 +250,30 @@ export function createPetView(options = {}) {
     return actions[name] || null;
   }
 
+  /**
+   * 把「当前这一套动画」的几何同步到四处：根节点尺寸、物理包围盒、贴图铺法、切帧偏移。
+   *
+   * 这四处**必须一起改**：只改其中一部分的后果分别是
+   * 「宠物框住一大片空白」「切帧错位露出邻帧」「脚底悬空/陷进地面」。
+   * 返回是否真的变了，没变就不做多余的 DOM 写入。
+   *
+   * 尺寸取自 `animation.js:frameSizeOf`（**变体自带 > 动作条目 > 包级**）。
+   */
+  function applyFrameSize(variant, spec) {
+    const logical = frameSizeOf(variant, spec, baseSize);
+    const nextWidth = Math.max(8, Math.round(logical.w * scale));
+    const nextHeight = Math.max(8, Math.round(logical.h * scale));
+    if (nextWidth === width && nextHeight === height) return false;
+    width = nextWidth;
+    height = nextHeight;
+    root.style.width = `${width}px`;
+    root.style.height = `${height}px`;
+    // 物理包围盒：`setSize` 会把 x 夹回可见区，y（脚底）不动——
+    // 于是换动作时脚仍然踩在同一处地面，不会因为换了尺寸而跳一下。
+    physics.setSize({ width, height });
+    return true;
+  }
+
   /** 当前生效的速度倍率（含宿主忙碌 / 弹层打开时的额外放慢）。 */
   function currentSpeed() {
     let speed = animSpeed;
@@ -315,6 +343,19 @@ export function createPetView(options = {}) {
     const animated = Boolean(variant) && variant.frames > 1;
     root.dataset.petAction = next;
     root.dataset.petVariant = variant ? String(index) : '';
+
+    // 换动作可能同时换**画布尺寸**（例如躺姿的 sleep 是横构图）。
+    // 必须在写 `background-size` 与 `drawPosition()` **之前**完成：
+    // 下面两处都用 `width` / `height` 算铺法与位移，顺序反了会按旧尺寸铺一帧。
+    // 尺寸没变时它是空操作，因此绝大多数动作切换没有额外开销。
+    const sizeChanged = applyFrameSize(variant, spec);
+    if (sizeChanged) {
+      // 尺寸变了就**立刻**重算位移。不能只靠 rAF 里的 `drawPosition()`：
+      // 那个调用受 `moved > 0.01` 门控，而静息状态（宠物站着不动、循环已停）
+      // 正好不满足条件——于是换到不同尺寸的动作后，宠物会一直停在
+      // 按旧尺寸算出的位移上，看起来是「换动作后瞬移了一段」。
+      drawPosition();
+    }
 
     if (variant) {
       // spritesheet + background-position：换帧只改绘制，不走网络与解码（§2.5）
