@@ -427,3 +427,58 @@ def test_export_import_keeps_motion(tmp_path):
     imported = store.import_zip(data)
     assert imported['actions']['idle']['motion']['breathe']['amplitude'] == 0.025
     assert imported['actions']['idle']['motion']['blink']['frames'] == [2, 3]
+
+
+# ==================================================== 内置形象：常驻呼吸
+
+def test_builtin_pets_breathe():
+    """★ 内置形象声明了**常驻呼吸**（这是「平时看起来是活的」的落点）。
+
+    默认 idle 模式是「平时静止 + 隔 6~18 秒随机播一遍」，也就是说宠物
+    **大部分时间显示标准图像**。没有呼吸的话它在那段时间里完全是张死图
+    （实测：4 帧 idle 的顶边只动 1px，几乎看不出在动）。
+
+    ⚠️ 这条测试守的是「别把呼吸删掉」——它是**观感特性**，
+    删掉不会有任何功能测试失败，只会让宠物悄悄变回死的。
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    builtin = os.path.join(repo, 'resources', 'pets')
+    store = PetStore(os.path.join(repo, 'data'), builtin)
+    for pet_id in ('xiaoka', 'xiaoman'):
+        pack = store.load_pack(pet_id)
+        # ★ **两套** idle 变体都要有：否则随机抽到「张望」那一套时呼吸会消失
+        # （`idle` 挂了两套动画，抽到哪套由权重决定）。
+        variants = pack.animations['idle'].variants
+        assert len(variants) >= 2, f'{pet_id} 的 idle 变体数变了'
+        for index, variant in enumerate(variants):
+            assert variant.motion is not None, f'{pet_id} idle 第 {index} 套没有 motion'
+            assert variant.motion.breathes, f'{pet_id} idle 第 {index} 套没有呼吸'
+            # 幅度落在「看得出在动、但不至于像弹跳」的区间里
+            amp = variant.motion.amplitude
+            assert 0.004 <= amp <= 0.016, (
+                f'{pet_id} 呼吸幅度 {amp} 超出推荐区间 0.004~0.016——'
+                f'实测内置形象显示尺度是 0.45，0.02 会让头顶在屏幕上动 10px'
+                f'（占身高 3.9%），而真人静息呼吸只占 0.5%~1%'
+            )
+        # 标准图像必须继承到呼吸（静止时才真的在动）
+        still = pack.resolve_still()
+        assert still.motion is not None and still.motion.breathes, (
+            f'{pet_id} 的标准图像没有继承呼吸——那样宠物静止时仍是死的'
+        )
+
+
+def test_builtin_breathing_origin_follows_each_anchor():
+    """★ 两个内置形象的 anchor.y 不同（0.9913 / 0.9809），原点必须各按各的算。
+
+    写死 `bottom center`（100%）会让它们呼吸时脚各飘一点点——而默认锚点
+    接近 1.0，差异很小、肉眼几乎看不出来，正是那种「看不出但确实错了」的 bug。
+    """
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    store = PetStore(os.path.join(repo, 'data'), os.path.join(repo, 'resources', 'pets'))
+    for pet_id in ('xiaoka', 'xiaoman'):
+        pack = store.load_pack(pet_id)
+        entry = store._runtime_action(pet_id, pack, 'idle')
+        assert entry['motionOrigin'] == f'50% {pack.anchor["y"] * 100:.2f}%', pet_id
+        assert entry['motionOrigin'] != '50% 100.00%', (
+            f'{pet_id} 的原点落到了写死值上——说明没读 anchor.y'
+        )
