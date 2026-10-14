@@ -281,10 +281,11 @@ def test_card_thumbnail_shows_only_first_frame():
         source = handle.read()
 
     assert 'applyThumbGeometry' in source, '缺少缩略图几何计算函数'
-    # 必须按帧数放大
-    assert 'boxWidth * frames' in source, '缩略图宽度没有乘以帧数'
-    # 必须左对齐（居中会露出第 1、2 帧）
-    assert "'left top'" in source, '缩略图应左对齐，否则会露出后续帧'
+    # 必须经 `frameGrid` 归一化：网格排布下「只给帧数」是不够的
+    assert 'frameGrid({' in source, '几何必须经 frameGrid 归一化'
+    # 整条 sheet 的尺寸必须是「单帧显示尺寸 × 行列数」
+    assert '* grid.cols' in source, '缩略图宽度没有按列数放大'
+    assert '* grid.rows' in source, '缩略图高度没有按行数放大'
     # ★ 必须遍历**所有**框：不能只取第一个（`querySelector` 单数）
     geometry = source[source.index('function applyThumbGeometry'):]
     geometry = geometry[:geometry.index('\n  }')]
@@ -323,12 +324,48 @@ def test_thumbnail_geometry_uses_per_card_frame_count():
 
 
 def test_thumbnail_geometry_handles_vertical_layout():
-    """垂直排布的包也要处理（否则第二帧会被露出来）。"""
+    """单列（`vertical`）排布必须能算对——否则第二帧会被露出来。
+
+    这条与下一条一起表达同一件事：**几何必须按网格算**，而不是「挑一个方向
+    钉住」。钉宽或钉高只在单行 / 单列时安全，网格排布下两个方向都有邻格。
+    """
     with open(os.path.join(REPO_ROOT, 'frontend', 'panel.js'), encoding='utf-8') as handle:
         source = handle.read()
     section = source[source.index('function applyThumbGeometry'):]
     section = section[:section.index('\n  }\n')]
-    assert "'vertical'" in section, '未处理 vertical 排布'
+    assert 'grid.cols === 1' in section, '未处理单列（vertical）排布'
+    assert 'grid.rows' in section, '未处理行数'
+
+
+def test_thumbnail_geometry_never_leaks_a_neighbour_cell():
+    """★ 缩略图必须用 `cover`（两个方向都取 max），不能「钉住某一个方向」。
+
+    这是加 `grid` 排布时暴露出来的**潜在漏帧**：旧实现按排布挑一个方向钉住——
+    水平钉宽、垂直钉高。那在单行 / 单列时是安全的（另一个方向没有邻格），
+    但网格排布**两个方向都有邻格**：
+
+    - 竖构图的帧（384×576）若钉高，帧宽只有框宽的 2/3，方框右侧会露出
+      **右边那一列**的一部分；
+    - 横构图的帧（627×353）若钉宽，帧高只有框高的 1/2，方框下方会露出
+      **下面那一行**。
+
+    `cover`（`max(框宽/帧宽, 框高/帧高)`）让单帧在两个方向都 >= 方框，
+    于是无论排布如何都不可能漏。实测它在既有素材上与旧行为**完全一致**
+    （竖构图等于钉宽、横构图等于钉高），因此不是「用一个新问题换旧问题」。
+    """
+    with open(os.path.join(REPO_ROOT, 'frontend', 'panel.js'), encoding='utf-8') as handle:
+        source = handle.read()
+    section = source[source.index('function applyThumbGeometry'):]
+    section = section[:section.index('\n  }\n')]
+    assert 'Math.max(boxWidth / cellW, boxHeight / cellH)' in section, (
+        '缩略图必须用 cover（两个方向都取 max），否则网格排布会露出邻格'
+    )
+    # 单帧尺寸要来自每个框自己的 data-（与 frames / cols / rows 同一套契约）
+    assert 'box.dataset.cellW' in section and 'box.dataset.cellH' in section, (
+        '单帧尺寸要取自该框自己的 data-cell-w / data-cell-h'
+    )
+    # 位移必须恒为左上（居中会露出中间那一列）
+    assert "backgroundPosition = '0 0'" in section, '缩略图必须左上对齐'
 
 
 def test_list_endpoint_provides_thumbnail_geometry():
@@ -354,4 +391,11 @@ def test_list_endpoint_provides_thumbnail_geometry():
         assert isinstance(thumb, dict), f'{item["id"]} 缺少 thumb 字段'
         assert thumb.get('url'), f'{item["id"]} 的 thumb 没有 URL'
         assert int(thumb.get('frames') or 0) >= 1, f'{item["id"]} 的 thumb 缺少帧数'
-        assert thumb.get('layout') in ('horizontal', 'vertical')
+        assert thumb.get('layout') in ('horizontal', 'vertical', 'grid')
+        # 网格几何：缩略图要按它算放大倍率，缺了会退回「钉一个方向」的旧行为
+        assert int(thumb.get('cols') or 0) >= 1, f'{item["id"]} 的 thumb 缺少列数'
+        assert int(thumb.get('rows') or 0) >= 1, f'{item["id"]} 的 thumb 缺少行数'
+        # 单帧尺寸：小方框要按它算 `cover`，缺了在网格排布下会露出邻格
+        size = thumb.get('size')
+        assert isinstance(size, dict), f'{item["id"]} 的 thumb 缺少单帧尺寸'
+        assert int(size.get('w') or 0) >= 1 and int(size.get('h') or 0) >= 1

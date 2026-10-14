@@ -21,6 +21,8 @@
  *    否则会留下一个仍在跑 rAF 的定时器（§2.9 的清理纪律）。
  */
 
+import { frameGrid, gridPosition } from './animation.js';
+
 /** 播放器的帧推进上限（与 `clock.js:MAX_FPS` 一致）。 */
 const MAX_FPS = 60;
 
@@ -131,8 +133,10 @@ function snapToDevicePixels(value, dpr) {
  * 背景被它自己的盒子裁住，邻帧物理上不可能漏出来。
  *
  * @param {HTMLElement} box 外框（固定正方形，负责边框与留白）
- * @param {number} frames 帧数
- * @param {string} layout `horizontal` / `vertical`
+ * @param {object} grid 网格几何 `{cols, rows}`（见 `animation.js:frameGrid`）。
+ *   也接受字符串 `'horizontal'` / `'vertical'`（旧签名），内部折算成网格。
+ * @param {number} frames 帧数。网格里**实际**排了几帧；它小于 `cols*rows` 时
+ *   网格是**装不满**的（末尾几格透明），帧号仍按行优先落在前 `frames` 格里。
  * @param {number} index 要显示的帧号
  * @param {object} [size] 单帧原始尺寸 `{w, h}`；缺省时退回「按框的形状铺满」
  *   （老后端不下发尺寸，此时行为与从前一致，不会更差）
@@ -142,11 +146,21 @@ function snapToDevicePixels(value, dpr) {
  *   由函数自己读 `window.devicePixelRatio`（对齐必须按**真实**设备像素算，
  *   写死一个值在 HiDPI 屏上就白对齐了）。
  */
-export function applyFrameGeometry(box, frames, layout, index, size, layer, dpr) {
+export function applyFrameGeometry(box, grid, frames, index, size, layer, dpr) {
   if (!box) return;
   const target = layer || box;
   const count = Math.max(1, Math.floor(Number(frames) || 1));
-  const at = Math.min(Math.max(0, Math.floor(Number(index) || 0)), count - 1);
+  // 网格：`{cols, rows}` 直接用；字符串（旧签名）按 `layout` 折算。
+  //
+  // 兼容字符串是**有意的**：这个函数有多个调用方，而面板里还有一处
+  // `data-layout` 契约驱动的路径。让函数自己容错比让每处各自容错更安全
+  // ——少一处容错就多一处「某种排布下预览错位」。
+  const shape = typeof grid === 'string' || grid === null || grid === undefined
+    ? frameGrid({ layout: grid, frames: count })
+    : frameGrid(Object.assign({ frames: count }, grid));
+  const cols = shape.cols;
+  const rows = shape.rows;
+  const at = gridPosition(index, shape, count);
   const boxWidth = box.clientWidth || 64;
   const boxHeight = box.clientHeight || 64;
   const ratio = Number(dpr) > 0 ? Number(dpr) : currentDpr();
@@ -166,9 +180,13 @@ export function applyFrameGeometry(box, frames, layout, index, size, layer, dpr)
   const shownWidth = snapToDevicePixels(known ? frameWidth * fit : boxWidth, ratio);
   const shownHeight = snapToDevicePixels(known ? frameHeight * fit : boxHeight, ratio);
 
-  // 一整条 spritesheet 的显示尺寸
-  const sheetWidth = layout === 'vertical' ? shownWidth : shownWidth * count;
-  const sheetHeight = layout === 'vertical' ? shownHeight * count : shownHeight;
+  // 整条 spritesheet 的显示尺寸 = 单帧显示尺寸 × 行列数。
+  //
+  // ⚠️ 这里用 `cols` / `rows`（**网格容量**）而不是 `frames`：装不满的网格
+  // （例如 4×4 只放 13 帧）末行是空的，但背景图仍然是完整的 4×4 张图，
+  // 按 `frames` 算会把它压扁——表现为「帧位置整体错位、越到后面越偏」。
+  const sheetWidth = shownWidth * cols;
+  const sheetHeight = shownHeight * rows;
 
   if (target !== box) {
     // 内层 = **一帧**的大小。背景铺的是整条 sheet，但只在这个盒子里可见，
@@ -188,9 +206,11 @@ export function applyFrameGeometry(box, frames, layout, index, size, layer, dpr)
   // 在内层（一帧的窗口）里把第 `at` 帧挪到窗口位置。
   // 这里**不需要**再加居中/贴底的偏移——那是外框摆内层的事，
   // 混在一起会让两个方向的偏移互相污染。
-  target.style.backgroundPosition = layout === 'vertical'
-    ? `0px ${-at * shownHeight}px`
-    : `${-at * shownWidth}px 0px`;
+  //
+  // ★ 两个方向都写：单行排布下 `row` 恒为 0、单列下 `col` 恒为 0，
+  // 于是 `horizontal` / `vertical` 的结果与从前**完全一致**。
+  target.style.backgroundPosition =
+    `${-at.col * shownWidth}px ${-at.row * shownHeight}px`;
 }
 
 /**
@@ -264,8 +284,10 @@ export function createAnimationPlayer(options = {}) {
   function draw() {
     applyFrameGeometry(
       box,
+      // 网格几何由变体自己带（后端算好的 cols / rows，缺失时按 layout 推）。
+      // 播放器不自己判断排布——那是 `frameGrid` 的唯一职责。
+      variant ? frameGrid(variant) : { cols: frames, rows: 1 },
       frames,
-      variant ? variant.layout : 'horizontal',
       index,
       variant ? variant.size : null,
       layer,

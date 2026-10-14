@@ -17,7 +17,9 @@
 import {
   animationDuration,
   createBehaviorScheduler,
+  frameGrid,
   frameSizeOf,
+  gridPosition,
   playableVariants,
   pickVariantIndex,
   stillFrame,
@@ -372,13 +374,15 @@ export function createPetView(options = {}) {
     }
 
     if (variant) {
-      // spritesheet + background-position：换帧只改绘制，不走网络与解码（§2.5）
-      const frameW = variant.layout === 'vertical'
-        ? width : width * Number(variant.frames || 1);
-      const frameH = variant.layout === 'vertical'
-        ? height * Number(variant.frames || 1) : height;
+      // spritesheet + background-position：换帧只改绘制，不走网络与解码（§2.5）。
+      //
+      // 铺法由**网格几何**决定（`cols × rows`），不再是「水平 or 垂直」两条分支：
+      // 整条 sheet 的显示尺寸 = 单帧显示尺寸 × 行列数。`horizontal` 是
+      // `cols=frames, rows=1`、`vertical` 是 `cols=1, rows=frames`，
+      // 三者共用这一条公式，因此不可能出现「某种排布算错」。
+      const grid = frameGrid(variant);
       sprite.style.backgroundImage = `url("${variant.url}")`;
-      sprite.style.backgroundSize = `${frameW}px ${frameH}px`;
+      sprite.style.backgroundSize = `${width * grid.cols}px ${height * grid.rows}px`;
       sprite.style.backgroundRepeat = 'no-repeat';
     } else {
       sprite.style.backgroundImage = 'none';
@@ -438,16 +442,13 @@ export function createPetView(options = {}) {
     }
     sprite.style.backgroundImage = `url("${still.url}")`;
     sprite.style.backgroundRepeat = 'no-repeat';
-    const frameW = still.layout === 'vertical'
-      ? width : width * still.frames;
-    const frameH = still.layout === 'vertical'
-      ? height * still.frames : height;
-    sprite.style.backgroundSize = `${frameW}px ${frameH}px`;
-    if (still.layout === 'vertical') {
-      sprite.style.backgroundPosition = `0 ${-still.frame * height}px`;
-    } else {
-      sprite.style.backgroundPosition = `${-still.frame * width}px 0`;
-    }
+    // 与 `setAction` 同一条公式（见那里的说明）：网格几何决定铺法。
+    // 标准图像可以是网格排布 sheet 里的**任意一帧**，因此这里也必须按
+    // 行列算偏移——按「单行 + 第 frame 帧」算的话，网格 sheet 会取错帧。
+    const grid = frameGrid(still);
+    sprite.style.backgroundSize = `${width * grid.cols}px ${height * grid.rows}px`;
+    const at = gridPosition(still.frame, grid, still.frames);
+    sprite.style.backgroundPosition = `${-at.col * width}px ${-at.row * height}px`;
   }
 
   /** 把当前帧写进 `background-position`（只改绘制，不触发 layout）。 */
@@ -458,11 +459,8 @@ export function createPetView(options = {}) {
       return;
     }
     const index = clock.frames > 1 ? clock.index : 0;
-    if (variant.layout === 'vertical') {
-      sprite.style.backgroundPosition = `0 ${-index * height}px`;
-    } else {
-      sprite.style.backgroundPosition = `${-index * width}px 0`;
-    }
+    const at = gridPosition(index, frameGrid(variant), variant.frames);
+    sprite.style.backgroundPosition = `${-at.col * width}px ${-at.row * height}px`;
   }
 
   /** 按锚点把「包围盒中心 x / 脚底 y」换算成 CSS 平移量。 */
@@ -1201,6 +1199,10 @@ export function createPetView(options = {}) {
         frames: still.frames,
         frame: still.frame,
         layout: still.layout,
+        // 网格几何也暴露出来：标准图像取错帧（网格 sheet 被当成单行切）时，
+        // 界面「看着有图」，只是显示的是另一帧——没有这两个值就只能靠数像素去猜。
+        cols: frameGrid(still).cols,
+        rows: frameGrid(still).rows,
         declared: still.declared,
         source: still.source,
         // 标准图像自己的单帧尺寸（`undefined` = 沿用包级）。

@@ -121,6 +121,75 @@ MAX_FRAMES = 256
 DEFAULT_MAX_SHEET_PIXELS = 4096
 MAX_FPS = 60
 
+# ---------------------------------------------------------------- 帧排布
+#
+# 三种排布，但**只有一种几何**：帧总是落在一个 `cols × rows` 的网格里。
+# `horizontal` / `vertical` 不是另外两套算法，而是网格的两个特例：
+#
+#     horizontal → cols = frames, rows = 1
+#     vertical   → cols = 1,      rows = frames
+#     grid       → cols / rows 由作者给出（可以装不满）
+#
+# 为什么要把它们统一：旧实现里「水平」与「垂直」是两条独立的计算分支
+# （`frameW = width * frames` / `frameH = height * frames`），加第三种排布
+# 意味着再写第三条分支；而三条分支里只要有两条不一致，就会出现
+# 「桌面上对、面板预览里错」这种最难查的偏差。统一成一个网格之后，
+# 前端只有一组公式，三种排布天然一致。
+#
+# 为什么值得支持 `grid`：单行排布下，一页能装的帧数被**帧宽**卡死——
+# 内置形象单帧 384px 宽，4096 的上限意味着最多 10 帧。改成多行之后
+# 同样的图能装 10×7 = 70 帧。这是「同一张图、同样的解码成本」下
+# 能白拿的最大一块（约 7 倍），而且不动任何管线。
+
+LAYOUT_HORIZONTAL = 'horizontal'
+LAYOUT_VERTICAL = 'vertical'
+LAYOUT_GRID = 'grid'
+LAYOUTS = (LAYOUT_HORIZONTAL, LAYOUT_VERTICAL, LAYOUT_GRID)
+
+
+def frame_grid(layout: str, frames: int, cols: int = 0, rows: int = 0) -> tuple:
+    """把排布声明折算成 `(cols, rows)`——**唯一的**帧几何真相。
+
+    这是整个排布系统的收敛点：解析器、运行期定义、前端三处渲染
+    （桌面宠物 / 面板预览 / 缩略图）全都只认它算出来的这一对数。
+
+    `cols` / `rows` 为 0 表示「没声明，按排布推导」：
+
+    - `horizontal` → `(frames, 1)`
+    - `vertical`   → `(1, frames)`
+    - `grid`       → 必须显式给出（否则无从知道一行放几个）
+
+    Args:
+        layout: 排布名（非法值按 `horizontal` 处理——宽容策略与其它字段一致）。
+        frames: 帧数（至少 1）。
+        cols: 声明的列数；0 = 未声明。
+        rows: 声明的行数；0 = 未声明。
+
+    Returns:
+        tuple: `(cols, rows)`，两个都是 >= 1 的整数。
+    """
+    count = max(1, int(frames or 1))
+    declared_cols = max(0, int(cols or 0))
+    declared_rows = max(0, int(rows or 0))
+    name = str(layout or '').strip().lower()
+
+    if name == LAYOUT_GRID:
+        # 网格模式：两个方向都要有。缺一个时按「装得下」补另一个——
+        # 补出来的是**能放下全部帧的最小网格**，而不是 1（那等于退回单行）。
+        if declared_cols and declared_rows:
+            return declared_cols, declared_rows
+        if declared_cols:
+            return declared_cols, max(1, -(-count // declared_cols))
+        if declared_rows:
+            return max(1, -(-count // declared_rows)), declared_rows
+        # 两个都没给：退回单行（`grid` 没给网格是无意义的声明，
+        # 解析期已经拦掉，这里只是防空转）
+        return count, 1
+
+    if name == LAYOUT_VERTICAL:
+        return 1, count
+    return count, 1
+
 #: 帧率下限。允许**小数**（0.5fps = 每帧 2 秒）。
 #:
 #: 为什么 fps 不再是整数：宠物形象的帧数通常只有 2~6 帧，
@@ -295,7 +364,16 @@ class AnimationVariant:
     #: 帧率。**允许小数**（见 `MIN_FPS`）——帧数少时整数档太粗。
     fps: float = 8
     loop: bool = True
-    layout: str = 'horizontal'
+    layout: str = LAYOUT_HORIZONTAL
+    #: 网格几何。`0` = 未声明，由 `layout` 推导（见 `frame_grid`）。
+    #:
+    #: 这两个字段是**冗余**的：`layout` 已经能推出 `(cols, rows)`。之所以两个都存，
+    #: 是因为推导结果要被前端反复使用（每帧算一次切帧偏移），而让前端自己再推一遍
+    #: 就意味着「后端一套规则、前端一套规则」——两套规则不一致的表现是
+    #: 「桌面上对、面板预览里错」，属于最难查的一类偏差。
+    #: 因此后端**推一次**，把结论随运行期定义一起下发。
+    cols: int = 0
+    rows: int = 0
     #: **非均匀帧时长**（毫秒，每帧一个）。空列表表示「按 `fps` 均匀推进」。
     #:
     #: 为什么需要它：真实动画的帧时长本来就不均匀——起手慢、中间快、
@@ -332,7 +410,31 @@ class AnimationVariant:
             return float(self.fps)
         return round(self.frames * 1000.0 / total, 2)
 
+    @property
+    def grid(self) -> tuple:
+        """生效的 `(cols, rows)`（见 `frame_grid`）。"""
+        return frame_grid(self.layout, self.frames, self.cols, self.rows)
+
+    @property
+    def capacity(self) -> int:
+        """这个网格能装几帧（`cols × rows`）。
+
+        与 `frames` 的差值就是**空着的格子数**——`grid` 排布允许装不满
+        （例如 4×4 的网格只放 13 帧），那 3 个空格子是透明的。
+        """
+        cols, rows = self.grid
+        return cols * rows
+
     def to_dict(self) -> dict:
+        # ⚠️ 这里写的是**作者意图**（`layout`），**不**写推导出来的 `cols` / `rows`。
+        #
+        # 两种形状各司其职，不能混：
+        # - `AnimationVariant.to_dict()` → `pet.json` 的形状（作者写的意图）；
+        # - `ResolvedVariant.to_dict()` → 运行期定义的形状（后端算好的几何）。
+        #
+        # 混起来的后果是**往返断裂**：`to_dict()` 里同时写 `layout: "horizontal"`
+        # 与 `cols: 4, rows: 1`，再读回来时两个字段并存——而它们表达的是同一件事，
+        # 一旦校验规则认为「并存即冲突」，导出再导入就会报错。
         payload = {
             'sheet': self.sheet,
             'frames': self.frames,
@@ -345,6 +447,13 @@ class AnimationVariant:
         # 只在**真的声明了**独立尺寸时才写这个字段：绝大多数包不该多出噪音
         if self.size:
             payload['size'] = dict(self.size)
+        # `grid` 排布下 `cols` / `rows` 是**不可省**的：`layout: "grid"` 本身
+        # 不携带形状信息，丢掉它们就等于丢掉「一行放几个」。
+        # `horizontal` / `vertical` 不需要（形状由 `layout` + 帧数唯一确定）。
+        if self.layout == LAYOUT_GRID:
+            cols, rows = self.grid
+            payload['cols'] = cols
+            payload['rows'] = rows
         return payload
 
 
@@ -469,19 +578,29 @@ class ResolvedVariant:
     frames: int = 1
     fps: float = 8
     loop: bool = True
-    layout: str = 'horizontal'
+    layout: str = LAYOUT_HORIZONTAL
+    #: 网格几何（见 `AnimationVariant.cols` 的说明）。
+    cols: int = 0
+    rows: int = 0
     frame_ms: list = field(default_factory=list)
     weight: float = DEFAULT_WEIGHT
     #: 这一套动画自己的单帧尺寸；`None` 表示沿用包级 `size`（见 `AnimationVariant.size`）。
     size: dict = None
 
+    @property
+    def grid(self) -> tuple:
+        return frame_grid(self.layout, self.frames, self.cols, self.rows)
+
     def to_dict(self) -> dict:
+        cols, rows = self.grid
         payload = {
             'sheet': self.sheet,
             'frames': self.frames,
             'fps': self.fps,
             'loop': self.loop,
             'layout': self.layout,
+            'cols': cols,
+            'rows': rows,
             'frameMs': list(self.frame_ms),
             'weight': self.weight,
         }
@@ -502,7 +621,10 @@ class ResolvedAction:
     frames: int = 0
     fps: float = 0
     loop: bool = True
-    layout: str = 'horizontal'
+    layout: str = LAYOUT_HORIZONTAL
+    #: 主变体的网格几何（见 `AnimationVariant.cols`）。
+    cols: int = 0
+    rows: int = 0
     #: 非均匀帧时长（毫秒）；空表示按 `fps` 均匀推进。
     frame_ms: list = field(default_factory=list)
     #: 是否要把 `sheet` **水平镜像**后再播（方向化行走只提供一侧时为 True）。
@@ -524,6 +646,7 @@ class ResolvedAction:
     size: dict = None
 
     def to_dict(self) -> dict:
+        cols, rows = frame_grid(self.layout, self.frames, self.cols, self.rows)
         payload = {
             'action': self.action,
             'source': self.source,
@@ -533,6 +656,8 @@ class ResolvedAction:
             'fps': self.fps,
             'loop': self.loop,
             'layout': self.layout,
+            'cols': cols,
+            'rows': rows,
             'frameMs': list(self.frame_ms),
             'mirror': self.mirror,
             'chain': list(self.chain),
@@ -569,7 +694,14 @@ class StillImage:
     frames: int = 1
     #: 用这条 sheet 的第几帧当标准图像。
     frame: int = 0
-    layout: str = 'horizontal'
+    layout: str = LAYOUT_HORIZONTAL
+    #: 网格几何（见 `AnimationVariant.cols`）。
+    #:
+    #: 标准图像也要有它：标准图像可以从**任意一条** sheet 里取一帧
+    #: （包括一条网格排布的 sheet）。没有几何就算不出「第 7 帧在哪」——
+    #: 那会让标准图像显示成第 0 帧，而包本身看起来完全正常。
+    cols: int = 0
+    rows: int = 0
     #: 这一帧是**包内显式声明**的（`False` = 回落自 idle 首帧）。
     declared: bool = False
     #: 来源动作名（`'still'` 或 `'idle'`），供 UI 解释与排查。
@@ -585,7 +717,16 @@ class StillImage:
     #: 因此两条分支各自都测不出来，是合并时才发现并补上的。
     size: dict = None
 
+    @property
+    def grid(self) -> tuple:
+        return frame_grid(self.layout, self.frames, self.cols, self.rows)
+
     def to_dict(self) -> dict:
+        # 与 `AnimationVariant.to_dict()` 同样的取舍：这里写**作者意图**
+        # （`layout`），`cols` / `rows` 只在网格排布下才写。
+        # 但标准图像**额外**有一份运行期形状的需求（前端要算「第 frame 帧在哪」），
+        # 那份由 `store._runtime_still()` 在 `to_dict()` 之上补 `cols` / `rows`——
+        # 那条路径的输出不会被再解析回 `StillImage`，因此不会造成往返断裂。
         payload = {
             'sheet': self.sheet,
             'frames': self.frames,
@@ -596,6 +737,10 @@ class StillImage:
         }
         if self.size:
             payload['size'] = dict(self.size)
+        if self.layout == LAYOUT_GRID:
+            cols, rows = self.grid
+            payload['cols'] = cols
+            payload['rows'] = rows
         return payload
 
 
@@ -689,10 +834,12 @@ class PetPack:
                 # 少播几套不影响正确性，播错朝向才是错的）。
                 variants = playable if not mirrored else playable[:1]
                 primary = variants[0]
+                primary_cols, primary_rows = primary.grid
                 return ResolvedAction(
                     action=action, source=candidate, kind=KIND_ANIMATED,
                     sheet=primary.sheet, frames=primary.frames, fps=primary.fps,
                     loop=primary.loop, layout=primary.layout,
+                    cols=primary_cols, rows=primary_rows,
                     frame_ms=list(primary.frame_ms),
                     size=dict(primary.size) if primary.size else None,
                     mirror=mirrored,
@@ -702,6 +849,7 @@ class PetPack:
                             sheet=variant.sheet, frames=variant.frames,
                             fps=variant.fps, loop=variant.loop,
                             layout=variant.layout,
+                            cols=variant.cols, rows=variant.rows,
                             frame_ms=list(variant.frame_ms),
                             weight=variant.weight,
                             # 每套动画可以各自不同尺寸（横构图 / 竖构图共存），
@@ -738,16 +886,18 @@ class PetPack:
                 action=STILL_ACTION, kind=KIND_NONE, chain=[STILL_ACTION],
                 note='没有可用的标准图像，宠物将不显示。',
             )
+        still_cols, still_rows = still.grid
         return ResolvedAction(
             action=STILL_ACTION, source=still.source, kind=KIND_ANIMATED,
             sheet=still.sheet, frames=still.frames, fps=1, loop=False,
-            layout=still.layout, chain=[STILL_ACTION],
+            layout=still.layout, cols=still_cols, rows=still_rows,
+            chain=[STILL_ACTION],
             # 标准图像自己的尺寸（来自它所在的 sheet）要一并透传：
             # `ResolvedAction.size` 是「主变体的尺寸」，而标准图像就是它的主变体。
             size=dict(still.size) if still.size else None,
             variants=[ResolvedVariant(
                 sheet=still.sheet, frames=still.frames, fps=1, loop=False,
-                layout=still.layout,
+                layout=still.layout, cols=still_cols, rows=still_rows,
                 size=dict(still.size) if still.size else None,
             )],
         )
@@ -785,6 +935,8 @@ class PetPack:
                 frames=max(1, int(still.frames)),
                 frame=still.frame,
                 layout=still.layout,
+                cols=still.cols,
+                rows=still.rows,
                 declared=True,
                 source=STILL_ACTION,
                 size=size,
@@ -798,6 +950,12 @@ class PetPack:
                 frames=max(1, int(resolved.frames)),
                 frame=0,
                 layout=resolved.layout,
+                # ★ 回落路径必须**继承 idle 那条 sheet 的网格**：标准图像是它的第 0 帧，
+                # 几何必须与 idle 一致。用默认的「单行」去切一条网格排布的 sheet，
+                # 取到的就不是第 0 帧而是「第 0 行第 0 列」——单行时两者恰好相同，
+                # 网格排布时则完全不同（这正是最容易漏的一处）。
+                cols=resolved.cols,
+                rows=resolved.rows,
                 declared=False,
                 source=resolved.source or 'idle',
                 # ★ 回落路径必须**继承 idle 那条 sheet 的尺寸**：
@@ -1197,17 +1355,17 @@ def _parse_still(raw_value, *, allow_source_jpeg: bool = False) -> StillImage:
         raw_value, 'frame', 0, low=0, high=max(0, frames - 1), where='still.frame',
     )
 
-    layout = raw_value.get('layout', 'horizontal')
-    if not isinstance(layout, str) or layout.strip().lower() not in ('horizontal', 'vertical'):
-        raise _field_error(
-            'still.layout', '应为 "horizontal" 或 "vertical"',
-            hint='水平排布用 "horizontal"（默认），垂直排布用 "vertical"。',
-        )
+    # 标准图像所在 sheet 的排布：与动作共用同一套解析（含 `grid`）。
+    # 不共用的话，作者从一条网格 sheet 里挑一帧当门面时会取错帧——
+    # 而那表现为「标准图像显示成第 0 帧」，包本身看起来完全正常。
+    layout, cols, rows = _parse_layout(raw_value, where='still', frames=frames)
     return StillImage(
         sheet=sheet,
         frames=frames,
         frame=frame,
-        layout=layout.strip().lower(),
+        layout=layout,
+        cols=cols,
+        rows=rows,
         declared=True,
         source=STILL_ACTION,
         # 可选：标准图像所在 sheet 的单帧尺寸。不写就是「沿用包级」。
@@ -1303,13 +1461,11 @@ def _parse_variant(
     variant.loop = _read_bool(raw_value, 'loop', action not in ONE_SHOT_ACTIONS)
     variant.frame_ms = _read_frame_ms(raw_value, 'frameMs', variant.frames)
 
-    layout = raw_value.get('layout', 'horizontal')
-    if not isinstance(layout, str) or layout.strip().lower() not in ('horizontal', 'vertical'):
-        raise _field_error(
-            f'{where}.layout', '应为 "horizontal" 或 "vertical"',
-            hint='水平排布用 "horizontal"（默认），垂直排布用 "vertical"。',
-        )
-    variant.layout = layout.strip().lower()
+    # 排布：`horizontal` / `vertical` / `grid`，统一折算成 `(cols, rows)`
+    # （见 `frame_grid` 与 `_parse_layout`）。
+    variant.layout, variant.cols, variant.rows = _parse_layout(
+        raw_value, where=where, frames=variant.frames,
+    )
 
     # 这一套动画**自己的**单帧尺寸（可选）。不写就沿用包级 `size`。
     variant.size = _parse_variant_size(raw_value.get('size'), where)
@@ -1317,6 +1473,108 @@ def _parse_variant(
     if with_weight:
         variant.weight = _read_weight(raw_value, 'weight')
     return variant
+
+
+def _parse_layout(raw_value: dict, *, where: str, frames: int) -> tuple:
+    """解析帧排布，返回 `(layout, cols, rows)`。
+
+    三种写法，`cols` / `rows` 是**规范形式**：
+
+    - `"layout": "horizontal"`（默认）→ `(horizontal, frames, 1)`
+    - `"layout": "vertical"` → `(vertical, 1, frames)`
+    - `"cols": 4, "rows": 4` → `(grid, 4, 4)`，`layout` 可省略
+
+    为什么 `cols` / `rows` 一出现就**自动**切到网格模式：用户的意图是明确的
+    （「一行放 4 个」），让他再写一遍 `"layout": "grid"` 是纯粹的啰嗦。
+    但**同时**写 `"layout": "horizontal"` 与 `cols` 是**真矛盾**（一个说单行、
+    一个说多列），必须报错而不是挑一个——挑错的那个表现是「我明明设了 4 列，
+    它却排成一行」，属于最难查的一类问题（与 §2.5 的教训一致）。
+
+    `frames > cols*rows` 同样报错：帧放不下，作者一定算错了。
+    反过来 `frames < cols*rows` 是**合法**的（网格装不满，空格透明）——
+    那是用户明确要求的「避免没有填满的情况」。
+    """
+    has_grid_fields = 'cols' in raw_value or 'rows' in raw_value
+    raw_layout = raw_value.get('layout')
+
+    if raw_layout is None or (isinstance(raw_layout, str) and not raw_layout.strip()):
+        name = LAYOUT_GRID if has_grid_fields else LAYOUT_HORIZONTAL
+    elif not isinstance(raw_layout, str):
+        raise _field_error(
+            f'{where}.layout', '应为字符串',
+            hint='排布写 "horizontal"（单行，默认）、"vertical"（单列）或 "grid"（网格）。',
+        )
+    else:
+        name = raw_layout.strip().lower()
+        if name not in LAYOUTS:
+            allowed = ' / '.join(f'"{item}"' for item in LAYOUTS)
+            raise _field_error(
+                f'{where}.layout', f'应为 {allowed}',
+                hint='单行排布用 "horizontal"（默认），单列用 "vertical"，'
+                     '多行网格用 "grid"（或直接写 cols / rows）。',
+            )
+
+    if name in (LAYOUT_HORIZONTAL, LAYOUT_VERTICAL) and has_grid_fields:
+        # `layout` 与 `cols` / `rows` 同时出现时**先看是否一致**：
+        # 一致就是合法的冗余写法（`to_dict()` 的输出、工具生成的包都会长这样），
+        # 不一致才是真矛盾（一个说单行、一个说多列），必须报错。
+        #
+        # 为什么不能一律报错：`layout: "horizontal"` + `cols: 4` 在
+        # 「4 帧单行」这个情形下**完全正确**，把它判成错误会让
+        # 「导出再导入」直接失败——那是自己造出来的 bug。
+        declared_cols = _read_positive_int(
+            raw_value, 'cols', 0, low=0, high=MAX_FRAMES, where=f'{where}.cols',
+        )
+        declared_rows = _read_positive_int(
+            raw_value, 'rows', 0, low=0, high=MAX_FRAMES, where=f'{where}.rows',
+        )
+        expected_cols, expected_rows = frame_grid(name, frames)
+        mismatch = (
+            (declared_cols and declared_cols != expected_cols)
+            or (declared_rows and declared_rows != expected_rows)
+        )
+        if mismatch:
+            actual = f'{declared_cols or expected_cols}×{declared_rows or expected_rows}'
+            raise _field_error(
+                f'{where}.cols',
+                f'与 layout "{name}" 冲突（{name} 是 '
+                f'{expected_cols}×{expected_rows}，声明的是 {actual}）',
+                hint=f'"{name}" 已经决定了网格形状（'
+                     + ('一帧一行' if name == LAYOUT_HORIZONTAL else '一帧一列')
+                     + '），不能再写别的 cols / rows。'
+                     '想自己决定行列，就把 layout 去掉（或写成 "grid"）只留 cols / rows。',
+            )
+        return name, expected_cols, expected_rows
+
+    if name != LAYOUT_GRID:
+        cols, rows = frame_grid(name, frames)
+        return name, cols, rows
+
+    # ---- 网格模式：两个方向都读，缺的按「装得下」补 ----
+    cols = _read_positive_int(
+        raw_value, 'cols', 0, low=0, high=MAX_FRAMES, where=f'{where}.cols',
+    )
+    rows = _read_positive_int(
+        raw_value, 'rows', 0, low=0, high=MAX_FRAMES, where=f'{where}.rows',
+    )
+    if not cols and not rows:
+        raise _field_error(
+            f'{where}.cols', '网格排布至少要给出 cols 或 rows',
+            hint='例如 {"layout": "grid", "cols": 4, "rows": 4}：'
+                 '一行 4 帧、共 4 行。只给一个方向时另一个会按「装得下」自动补。',
+        )
+
+    grid_cols, grid_rows = frame_grid(LAYOUT_GRID, frames, cols, rows)
+    capacity = grid_cols * grid_rows
+    if capacity < frames:
+        raise _field_error(
+            f'{where}.rows',
+            f'{grid_cols}×{grid_rows} 装不下 {frames} 帧（只有 {capacity} 格）',
+            hint=f'{frames} 帧需要至少 {capacity} 个格子。'
+                 f'把 cols / rows 调大（例如 rows: {-(-frames // grid_cols)}），'
+                 f'或把 frames 改成 {capacity} 以内的值。',
+        )
+    return LAYOUT_GRID, grid_cols, grid_rows
 
 
 def _parse_variant_size(raw, where: str) -> dict:
@@ -1430,14 +1688,17 @@ def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False)
             )
         # 顶层不该再混写单套字段（见 docstring）
         stray = sorted(
-            key for key in ('sheet', 'frames', 'fps', 'loop', 'layout', 'frameMs', 'size')
+            key for key in (
+                'sheet', 'frames', 'fps', 'loop', 'layout', 'cols', 'rows',
+                'frameMs', 'size',
+            )
             if key in raw_value
         )
         if stray:
             raise _field_error(
                 f'{where}.variants',
                 f'与顶层字段 {"、".join(stray)} 混用',
-                hint='写了 variants 之后，sheet / frames / fps 等要写进每一套里，'
+                hint='写了 variants 之后，sheet / frames / fps / layout 等要写进每一套里，'
                      '不要在顶层再写一份。',
             )
         parsed = []

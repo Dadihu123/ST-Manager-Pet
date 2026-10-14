@@ -11,6 +11,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { frameGrid, gridPosition } from '../../frontend/animation.js';
 import { frameDurations, totalDuration, applyFrameGeometry } from '../../frontend/preview.js';
 
 /**
@@ -147,15 +148,19 @@ test('预览总时长：与后端的 total_ms 语义一致（同一份数据算�
 function geom(boxSize, frames, layout, at, frameSize, dpr) {
   const box = fakeBox(boxSize, boxSize);
   const layer = fakeLayer();
-  applyFrameGeometry(box, frames, layout, at, frameSize, layer, dpr);
+  // `layout` 参数保留字符串形态（`'horizontal'` / `'vertical'`），
+  // 也接受 `{cols, rows}` 对象——几何函数两者都认（见 `applyFrameGeometry`）。
+  const grid = typeof layout === 'string'
+    ? frameGrid({ layout, frames })
+    : frameGrid(Object.assign({ frames }, layout));
+  applyFrameGeometry(box, grid, frames, at, frameSize, layer, dpr);
   const sheet = layer.size;
   return {
     box,
     layer,
-    // 单帧的显示尺寸 = 整条 / 帧数
-    frame: layout === 'vertical'
-      ? { w: sheet.w, h: sheet.h / frames }
-      : { w: sheet.w / frames, h: sheet.h },
+    grid,
+    // 单帧的显示尺寸 = 整条 / 行列数
+    frame: { w: sheet.w / grid.cols, h: sheet.h / grid.rows },
   };
 }
 
@@ -345,6 +350,210 @@ test('预览几何：垂直 spritesheet 按帧位移', () => {
     '垂直排布每帧应上移一个显示帧高',
   );
   assert.equal(second.layer.offset.x, first.layer.offset.x, '垂直排布不该改变横向位移');
+});
+
+// ============================================================ 网格排布（grid）
+//
+// `grid` 是新增的第三种排布：帧落在一个 `cols × rows` 的网格里，行优先
+// （先从左到右，再从上到下）。`horizontal` / `vertical` 不是另外两套算法，
+// 而是它的两个特例（`cols=N, rows=1` / `cols=1, rows=N`）。
+//
+// 为什么要统一：三条独立分支里只要有两条不一致，就会出现「桌面上对、
+// 面板预览里错」这种最难查的偏差。统一之后只有一组公式。
+
+
+test('★ 预览几何：网格排布按行列定位（行优先）', () => {
+  // 3×3 网格里放 9 帧。逐帧验证「第 n 帧在哪一格」——
+  // 这是网格排布的核心语义，也是唯一能把「行优先 / 列优先」区分开的地方。
+  const size = { w: 100, h: 100 };
+  const grid = { cols: 3, rows: 3 };
+  const cases = [
+    { at: 0, col: 0, row: 0 },
+    { at: 1, col: 1, row: 0 },
+    { at: 2, col: 2, row: 0 },
+    { at: 3, col: 0, row: 1 },   // ★ 第 3 帧换行：列优先实现会给出 col=0,row=... 之外的答案
+    { at: 4, col: 1, row: 1 },
+    { at: 8, col: 2, row: 2 },
+  ];
+  const first = geom(168, 9, grid, 0, size);
+  const stepX = first.frame.w;
+  const stepY = first.frame.h;
+  for (const item of cases) {
+    const { layer } = geom(168, 9, grid, item.at, size);
+    assert.ok(
+      Math.abs(layer.offset.x - (-item.col * stepX)) < 1e-6,
+      `第 ${item.at} 帧的横向位移应是第 ${item.col} 列，实际 ${layer.offset.x}`,
+    );
+    assert.ok(
+      Math.abs(layer.offset.y - (-item.row * stepY)) < 1e-6,
+      `第 ${item.at} 帧的纵向位移应是第 ${item.row} 行，实际 ${layer.offset.y}`,
+    );
+  }
+});
+
+test('★ 预览几何：网格装不满时仍按**网格容量**铺（不是按帧数）', () => {
+  // 4×4 的网格只放 13 帧（用户明确要求「避免没有填满的情况」）。
+  // 背景图仍然是完整的 4×4 张图，因此整条 sheet 必须按 4×4 算。
+  // 按 `frames`（13）算会把它压扁——表现为「帧位置整体错位、越到后面越偏」。
+  const size = { w: 100, h: 100 };
+  const partial = geom(168, 13, { cols: 4, rows: 4 }, 0, size);
+  const full = geom(168, 16, { cols: 4, rows: 4 }, 0, size);
+  assert.ok(
+    Math.abs(partial.layer.size.w - full.layer.size.w) < 1e-9
+    && Math.abs(partial.layer.size.h - full.layer.size.h) < 1e-9,
+    `装不满时整条尺寸应与装满时一致，实际 ${JSON.stringify(partial.layer.size)}`
+    + ` vs ${JSON.stringify(full.layer.size)}`,
+  );
+  assert.ok(
+    Math.abs(partial.frame.w - full.frame.w) < 1e-9
+    && Math.abs(partial.frame.h - full.frame.h) < 1e-9,
+    '单帧尺寸应与装满时一致',
+  );
+});
+
+test('★ 预览几何：网格里最后一帧不会越界到空格子里', () => {
+  // 13 帧放在 4×4 里：第 12 帧是最后一帧，落在第 3 行第 0 列。
+  // 越界会让画面停在透明空格上（宠物凭空消失一帧）。
+  const size = { w: 100, h: 100 };
+  const last = geom(168, 13, { cols: 4, rows: 4 }, 12, size);
+  assert.ok(Math.abs(last.layer.offset.x - 0) < 1e-6, '第 12 帧应在第 0 列');
+  assert.ok(
+    Math.abs(last.layer.offset.y - (-3 * last.frame.h)) < 1e-6,
+    `第 12 帧应在第 3 行，实际 ${last.layer.offset.y}`,
+  );
+  // 越界的帧号被夹到最后一帧（而不是落到空格子上）
+  const over = geom(168, 13, { cols: 4, rows: 4 }, 99, size);
+  assert.equal(over.layer.offset.y, last.layer.offset.y, '超上限应夹到最后一帧');
+});
+
+test('★ 预览几何：内层恒为一帧（网格排布下邻帧同样漏不出来）', () => {
+  // 这是上一轮修的核心保证，网格排布**必须**继续满足它：
+  // 内层尺寸与背景位移必须同源，否则裁切边界与帧边界错开、邻帧漏出来。
+  // 网格排布下漏的就不止上下/左右一帧，而是整行整列——比单行更明显。
+  const size = { w: 120, h: 90 };
+  const grid = { cols: 3, rows: 3 };
+  const { layer, frame } = geom(168, 9, grid, 4, size);
+  const rect = layer.rect;
+  assert.ok(
+    Math.abs(rect.w - frame.w) < 1e-9 && Math.abs(rect.h - frame.h) < 1e-9,
+    `内层应正好是一帧：内层 ${rect.w}×${rect.h} vs 帧 ${frame.w}×${frame.h}`,
+  );
+  assert.ok(rect.w <= 168 + 1e-6 && rect.h <= 168 + 1e-6, '内层不该超出外框');
+  // 位移必须是**整数倍**的帧尺寸（错开就会露邻帧）
+  assert.ok(
+    Math.abs(layer.offset.x % frame.w) < 1e-6 || Math.abs((layer.offset.x % frame.w) + frame.w) < 1e-6,
+    '横向位移应是帧宽的整数倍',
+  );
+  assert.ok(
+    Math.abs(layer.offset.y % frame.h) < 1e-6 || Math.abs((layer.offset.y % frame.h) + frame.h) < 1e-6,
+    '纵向位移应是帧高的整数倍',
+  );
+});
+
+test('预览几何：网格排布也按比例 contain + 底边对齐', () => {
+  // 横构图的帧放进正方框：用满宽度、底边贴框底。这与排布方式无关——
+  // 排布只决定「整条图怎么铺」，单帧的装入方式对所有排布都一样。
+  const { frame, layer } = geom(168, 6, { cols: 3, rows: 2 }, 0, { w: 627, h: 353 });
+  const rel = Math.abs((frame.w / frame.h) - (627 / 353)) / (627 / 353);
+  assert.ok(rel < 0.01, `宽高比应接近 627:353，实际偏差 ${(rel * 100).toFixed(2)}%`);
+  assert.ok(Math.abs(frame.w - 168) < 1e-6, '横构图应该用满框宽');
+  assert.ok(
+    Math.abs((layer.rect.top + layer.rect.h) - 168) <= 1,
+    '底边应贴着框底',
+  );
+});
+
+test('预览几何：网格与等价的单行/单列排布结果一致（三种排布同一套公式）', () => {
+  // `horizontal` 就是 `cols=N, rows=1`、`vertical` 就是 `cols=1, rows=N`。
+  // 这条测试钉住「它们确实是特例」——如果哪天有人把某个排布单独优化坏了，
+  // 这里会立刻暴露。
+  const size = { w: 100, h: 140 };
+  for (const at of [0, 1, 2, 3]) {
+    const byLayout = geom(168, 4, 'horizontal', at, size);
+    const byGrid = geom(168, 4, { cols: 4, rows: 1 }, at, size);
+    assert.equal(byGrid.layer.offset.x, byLayout.layer.offset.x, `水平 第 ${at} 帧横移`);
+    assert.equal(byGrid.layer.offset.y, byLayout.layer.offset.y, `水平 第 ${at} 帧纵移`);
+
+    const vLayout = geom(168, 4, 'vertical', at, size);
+    const vGrid = geom(168, 4, { cols: 1, rows: 4 }, at, size);
+    assert.equal(vGrid.layer.offset.x, vLayout.layer.offset.x, `垂直 第 ${at} 帧横移`);
+    assert.equal(vGrid.layer.offset.y, vLayout.layer.offset.y, `垂直 第 ${at} 帧纵移`);
+  }
+});
+
+test('预览几何：显式 cols/rows 优先于 layout（后端算好的几何不被前端覆盖）', () => {
+  // 运行期定义里 `layout` 与 `cols`/`rows` 同时存在（前者是作者意图，
+  // 后者是后端算好的结论）。前端必须信**算好的**那个，否则两边各推一次，
+  // 不一致时没人知道该信谁。
+  const grid = frameGrid({ frames: 4, layout: 'horizontal', cols: 2, rows: 2 });
+  assert.deepEqual(grid, { cols: 2, rows: 2 }, '显式 cols/rows 应优先');
+});
+
+test('★ 预览几何：网格排布的整数设备像素对齐（每个方向都要对齐）', () => {
+  // 单行/单列只涉及一个方向的位移，网格**两个方向**都要对齐。
+  // 漏掉任何一个方向都会在那一侧的帧边界出现半像素细缝。
+  const DPRS = [1, 1.25, 1.5, 2, 3];
+  const CASES = [
+    { frames: 9, grid: { cols: 3, rows: 3 }, size: { w: 100, h: 140 } },
+    { frames: 13, grid: { cols: 4, rows: 4 }, size: { w: 333, h: 211 } },
+    { frames: 6, grid: { cols: 3, rows: 2 }, size: { w: 627, h: 353 } },
+  ];
+  for (const dpr of DPRS) {
+    for (const item of CASES) {
+      const at = Math.min(5, item.frames - 1);
+      const { layer } = geom(168, item.frames, item.grid, at, item.size, dpr);
+      const isInt = (v) => Math.abs(v - Math.round(v)) < 1e-6;
+      const tag = `dpr=${dpr} ${item.grid.cols}x${item.grid.rows} ${item.frames}帧`;
+      assert.ok(isInt(layer.size.w * dpr), `${tag}: 整条宽应为整数设备像素`);
+      assert.ok(isInt(layer.size.h * dpr), `${tag}: 整条高应为整数设备像素`);
+      assert.ok(isInt(layer.rect.w * dpr) && isInt(layer.rect.h * dpr), `${tag}: 内层应为整数设备像素`);
+      assert.ok(isInt(-layer.offset.x * dpr), `${tag}: 横向位移应为整数设备像素`);
+      assert.ok(isInt(-layer.offset.y * dpr), `${tag}: 纵向位移应为整数设备像素`);
+    }
+  }
+});
+
+// ============================================================ 帧几何辅助函数
+
+
+test('frameGrid：horizontal / vertical 是网格的特例', () => {
+  assert.deepEqual(frameGrid({ frames: 4, layout: 'horizontal' }), { cols: 4, rows: 1 });
+  assert.deepEqual(frameGrid({ frames: 4, layout: 'vertical' }), { cols: 1, rows: 4 });
+  // 缺省（老后端不下发 layout）等价于 horizontal
+  assert.deepEqual(frameGrid({ frames: 3 }), { cols: 3, rows: 1 });
+  assert.deepEqual(frameGrid(null), { cols: 1, rows: 1 });
+});
+
+test('frameGrid：只给一个方向时另一个按「装得下」补', () => {
+  assert.deepEqual(frameGrid({ frames: 10, cols: 4 }), { cols: 4, rows: 3 });
+  assert.deepEqual(frameGrid({ frames: 8, cols: 4 }), { cols: 4, rows: 2 });
+  assert.deepEqual(frameGrid({ frames: 8, rows: 2 }), { cols: 4, rows: 2 });
+  // 帧数少于一行时也不会推出 0 行
+  assert.deepEqual(frameGrid({ frames: 3, cols: 8 }), { cols: 8, rows: 1 });
+});
+
+test('frameGrid：非法输入不产生 0 或 NaN', () => {
+  for (const bad of [
+    { frames: 4, cols: 0, rows: 0 }, { frames: 4, cols: -2 }, { frames: 4, rows: NaN },
+    { frames: 0 }, { frames: -1 }, {},
+  ]) {
+    const grid = frameGrid(bad);
+    assert.ok(grid.cols >= 1 && grid.rows >= 1, `${JSON.stringify(bad)} → ${JSON.stringify(grid)}`);
+    assert.ok(Number.isInteger(grid.cols) && Number.isInteger(grid.rows));
+  }
+});
+
+test('gridPosition：行优先，且帧号被夹在合法范围', () => {
+  const grid = { cols: 4, rows: 4 };
+  assert.deepEqual(gridPosition(0, grid, 13), { col: 0, row: 0 });
+  assert.deepEqual(gridPosition(3, grid, 13), { col: 3, row: 0 });
+  assert.deepEqual(gridPosition(4, grid, 13), { col: 0, row: 1 });
+  assert.deepEqual(gridPosition(12, grid, 13), { col: 0, row: 3 });
+  // 越界夹到最后一帧（不是落到空格子上）
+  assert.deepEqual(gridPosition(99, grid, 13), { col: 0, row: 3 });
+  assert.deepEqual(gridPosition(-5, grid, 13), { col: 0, row: 0 });
+  // 不给帧数时上限是网格容量
+  assert.deepEqual(gridPosition(99, grid), { col: 3, row: 3 });
 });
 
 test('预览几何：帧号越界被夹到合法范围', () => {

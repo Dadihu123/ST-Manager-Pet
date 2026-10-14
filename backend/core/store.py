@@ -838,7 +838,8 @@ class PetStore:
             # 一处是 `None`、另一处是 dict 的话，前端要么得写两种判空，
             # 要么会在坏包上抛错——而「一个坏包不该让整个列表打不开」正是
             # 这个方法存在的意义。
-            'thumb': {'url': '', 'frames': 1, 'frame': 0, 'layout': 'horizontal'},
+            'thumb': {'url': '', 'frames': 1, 'frame': 0, 'layout': 'horizontal',
+                      'cols': 1, 'rows': 1, 'size': None},
         }
         try:
             pack = self.load_pack(pet_id)
@@ -881,7 +882,8 @@ class PetStore:
 
         取不到图时返回 `{'url': ''}`，面板据此显示占位而不是一张破图。
         """
-        empty = {'url': '', 'frames': 1, 'frame': 0, 'layout': 'horizontal'}
+        empty = {'url': '', 'frames': 1, 'frame': 0, 'layout': 'horizontal',
+                 'cols': 1, 'rows': 1}
         try:
             pack = pack if pack is not None else self.load_pack(pet_id)
         except PetError:
@@ -892,11 +894,22 @@ class PetStore:
         path, _source = self.resolve_frame_path(pet_id, STILL_ACTION)
         if not path:
             return dict(empty)
+        cols, rows = still.grid
+        # 单帧尺寸：优先用标准图像自己的，缺失时回落到包级。
+        # 面板的小方框要按它算「单帧放大到盖住方框」的倍率——不知道比例就只能
+        # 钉住某一个方向，而那在**网格**排布下会露出邻格（两个方向都有邻居）。
+        size = still.size or pack.size
         return {
             'url': self.frame_url(pet_id, STILL_ACTION, path),
             'frames': max(1, int(still.frames)) or 1,
             'frame': max(0, int(still.frame)),
             'layout': still.layout or 'horizontal',
+            # 网格几何：缩略图要按它算「第 frame 帧在哪一格」。
+            # 只有帧数是不够的——同样 4 帧，单行是「第 4 列」，2×2 网格是
+            # 「第 2 行第 2 列」，两者算出来的偏移完全不同。
+            'cols': cols,
+            'rows': rows,
+            'size': {'w': int(size['w']), 'h': int(size['h'])} if size else None,
         }
 
     # ------------------------------------------------------------ 读取
@@ -1167,6 +1180,18 @@ class PetStore:
         """
         still = pack.resolve_still()
         payload = still.to_dict()
+        # ★ 补上**算好的**网格几何。`StillImage.to_dict()` 写的是作者意图
+        # （`layout`），而前端要算「第 `frame` 帧在哪一格」——那需要行列数。
+        # 只有帧数是不够的：同样 4 帧，单行是「第 4 列」，2×2 网格是
+        # 「第 2 行第 2 列」，算出来的偏移完全不同。
+        #
+        # 放在这里而不是 `to_dict()` 里：`to_dict()` 的输出会被再解析回
+        # `StillImage`（导出再导入），那时 `layout: "horizontal"` 与
+        # `cols: 4, rows: 1` 并存是**冗余但合法**的；而在这里补没有这个问题
+        # ——运行期定义从不被解析回领域对象。
+        cols, rows = still.grid
+        payload['cols'] = cols
+        payload['rows'] = rows
         path, frame_source = self.resolve_frame_path(pet_id, STILL_ACTION)
         payload['url'] = (
             self.frame_url(pet_id, STILL_ACTION, path) if path else ''

@@ -232,8 +232,11 @@ def test_thumbnail_spec_of_broken_pack_is_empty_not_missing(tmp_path):
     store = PetStore(str(user), str(builtin))
     item = next(i for i in store.list_pets() if i['id'] == 'broken')
     assert item['error'], '损坏的包应带 error'
+    # 几何字段的类型在**成功与失败两条路径上必须一致**（都是 dict，
+    # 且都有 cols / rows / size）——面板照常渲染占位框，不必写两种判空。
     assert item['thumb'] == {
         'url': '', 'frames': 1, 'frame': 0, 'layout': 'horizontal',
+        'cols': 1, 'rows': 1, 'size': None,
     }
 
 

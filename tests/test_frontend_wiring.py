@@ -627,9 +627,11 @@ def test_panel_passes_frame_size_into_the_preview(preview):
     于是人物被压扁。修法是让 `applyFrameGeometry` 按真实比例做 `contain`，
     而它需要尺寸——所以面板必须把尺寸一路传下去。
     """
-    # 几何函数必须接受并使用尺寸参数（末位 `dpr` 是可选的，只给单测用）
-    assert 'export function applyFrameGeometry(box, frames, layout, index, size, layer, dpr)' in preview, (
-        'applyFrameGeometry 必须接收单帧尺寸与内层'
+    # 几何函数必须接受并使用尺寸参数（末位 `dpr` 是可选的，只给单测用）。
+    # 第二个参数是**网格几何** `{cols, rows}`（见 `animation.js:frameGrid`）——
+    # 帧数不再单独传，它与网格形状一起决定「第 n 帧在哪一格」。
+    assert 'export function applyFrameGeometry(box, grid, frames, index, size, layer, dpr)' in preview, (
+        'applyFrameGeometry 必须接收网格几何、帧数、单帧尺寸与内层'
     )
     assert 'boxWidth / frameWidth' in preview, '必须按真实宽高比做 contain 缩放'
     # 底边对齐：用户明确要求「预览动画底部和预览框对齐」
@@ -702,7 +704,7 @@ def test_preview_payload_carries_frame_size(routes_source):
 def test_panel_resolves_preview_frame_size_with_the_shared_priority(panel):
     """面板取单帧尺寸的优先级必须与桌面宠物**同源**（`frameSizeOf`）。"""
     assert 'frameSizeOf' in panel, '必须复用 animation.js 的尺寸解析'
-    assert "import { DEFAULT_SCHEDULE_MS, frameSizeOf } from './animation.js'" in panel
+    assert "import { DEFAULT_SCHEDULE_MS, frameGrid, frameSizeOf } from './animation.js'" in panel
     body = panel[panel.index('function previewSpec()'):]
     body = body[:body.index('\n  /**')]
     assert 'frameSizeOf(base, entry, detail && detail.size)' in body, (

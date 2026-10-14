@@ -125,6 +125,68 @@ export function pickVariantIndex(variants, random = Math.random) {
 export const DEFAULT_FRAME_SIZE = { w: 64, h: 64 };
 
 /**
+ * 把任意排布声明折算成 `{cols, rows}`——**前端唯一的帧几何真相**。
+ *
+ * 与后端 `pack.frame_grid` 是同一套规则的两份实现，**必须保持一致**。
+ * 之所以两边各写一份而不是让前端只读后端算好的值：运行期定义里已经有
+ * `cols` / `rows`（后端算好的），但前端还有几条**自己造** spec 的路径
+ * （老后端不下发网格、单帧兜底、测试夹具），那些地方没有后端结论可用。
+ *
+ * 归一化的价值在于「只有一个几何模型」：`horizontal` 与 `vertical` 不是
+ * 另外两套算法，而是 `cols=N, rows=1` 与 `cols=1, rows=N` 两个特例。
+ * 三条分支各自实现的表现是「桌面上对、面板预览里错」——最难查的一类偏差。
+ *
+ * 优先级：**显式的 `cols` / `rows` > `layout` > 帧数推单行**。
+ * 显式值优先，是因为后端已经推过一次并写进了运行期定义；
+ * 前端再按 `layout` 推一遍等于把同一件事做两次，而两次不一致时
+ * 没人知道该信谁。
+ *
+ * @param {object} source 形如 `{frames, layout, cols, rows}`
+ * @returns {{cols: number, rows: number}} 两个都是 >= 1 的整数
+ */
+export function frameGrid(source) {
+  const spec = source || {};
+  const frames = Math.max(1, Math.floor(Number(spec.frames) || 1));
+  const declaredCols = Math.max(0, Math.floor(Number(spec.cols) || 0));
+  const declaredRows = Math.max(0, Math.floor(Number(spec.rows) || 0));
+
+  if (declaredCols > 0 && declaredRows > 0) {
+    return { cols: declaredCols, rows: declaredRows };
+  }
+  // 只给了一个方向：另一个按「装得下」补（与后端 `frame_grid` 一致）
+  if (declaredCols > 0) {
+    return { cols: declaredCols, rows: Math.max(1, Math.ceil(frames / declaredCols)) };
+  }
+  if (declaredRows > 0) {
+    return { cols: Math.max(1, Math.ceil(frames / declaredRows)), rows: declaredRows };
+  }
+  if (spec.layout === 'vertical') return { cols: 1, rows: frames };
+  return { cols: frames, rows: 1 };
+}
+
+/**
+ * 第 `index` 帧在网格里的**行列位置**（行优先：先从左到右，再从上到下）。
+ *
+ * 行优先是用户明确要求的顺序（「先遍历行，再遍历列」），也是
+ * `horizontal` 的历史行为（`cols=N, rows=1` 时行优先退化成「从左到右」）。
+ *
+ * @param {number} index 帧号（会被夹到合法范围）
+ * @param {object} grid `{cols, rows}`
+ * @param {number} [frames] 帧数；给了就把帧号夹在 `[0, frames-1]`
+ * @returns {{col: number, row: number}} 两个都是非负整数
+ */
+export function gridPosition(index, grid, frames) {
+  const cols = Math.max(1, Math.floor(Number(grid && grid.cols) || 1));
+  const rows = Math.max(1, Math.floor(Number(grid && grid.rows) || 1));
+  const capacity = cols * rows;
+  const limit = frames === undefined
+    ? capacity
+    : Math.min(capacity, Math.max(1, Math.floor(Number(frames) || 1)));
+  const at = Math.min(Math.max(0, Math.floor(Number(index) || 0)), limit - 1);
+  return { col: at % cols, row: Math.floor(at / cols) };
+}
+
+/**
  * 取某套动画的单帧**逻辑**尺寸（未乘倍率）。
  *
  * 优先级：**变体自带 > 动作条目 > 包级**。
@@ -183,6 +245,9 @@ export function playableVariants(entry) {
       fps: Number(item.fps) || 0,
       loop: item.loop !== false,
       layout: item.layout === 'vertical' ? 'vertical' : 'horizontal',
+      // 网格几何：**原样带上**后端算好的值（缺失时 `frameGrid` 会按 layout 推）。
+      cols: Math.max(0, Math.floor(Number(item.cols) || 0)),
+      rows: Math.max(0, Math.floor(Number(item.rows) || 0)),
       frameMs: Array.isArray(item.frameMs) ? item.frameMs.slice() : [],
       weight: normalizeWeight(item.weight),
       size: item.size || undefined,
@@ -195,6 +260,8 @@ export function playableVariants(entry) {
     fps: Number(source.fps) || 0,
     loop: source.loop !== false,
     layout: source.layout === 'vertical' ? 'vertical' : 'horizontal',
+    cols: Math.max(0, Math.floor(Number(source.cols) || 0)),
+    rows: Math.max(0, Math.floor(Number(source.rows) || 0)),
     frameMs: Array.isArray(source.frameMs) ? source.frameMs.slice() : [],
     weight: DEFAULT_WEIGHT,
     size: source.size || undefined,
@@ -222,6 +289,11 @@ export function stillFrame(pack) {
     frames,
     frame,
     layout: still.layout === 'vertical' ? 'vertical' : 'horizontal',
+    // 网格几何（标准图像可以从任意一条 sheet 取一帧，包括网格排布的）。
+    // 没有它就算不出「第 7 帧在哪一格」——那会显示成第 0 帧，
+    // 而包本身看起来完全正常。
+    cols: Math.max(0, Math.floor(Number(still.cols) || 0)),
+    rows: Math.max(0, Math.floor(Number(still.rows) || 0)),
     // 是否由作者显式声明（`false` = 回落自 idle 首帧）。面板据此提示。
     declared: still.declared === true,
     source: String(still.source || 'idle'),

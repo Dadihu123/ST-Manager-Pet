@@ -29,6 +29,8 @@ from .core.errors import (
 from .core.imports import MAX_IMAGE_BYTES, MAX_PACK_BYTES, check_payload_size
 from .core.pack import (
     ACTION_FALLBACKS,
+    LAYOUTS,
+    MAX_FRAMES,
     MAX_IDLE_PLAYS,
     MAX_SCHEDULE_MS,
     MIN_SCHEDULE_MS,
@@ -209,6 +211,10 @@ def register_routes(api, store: PetStore) -> None:
                 'scheduleMaxMs': MAX_SCHEDULE_MS,
                 'scheduleBehaviors': list(SCHEDULE_BEHAVIORS),
                 'maxIdlePlays': MAX_IDLE_PLAYS,
+                # 帧排布与网格上限（面板新建表单据此渲染「排布」选项，
+                # 不自己写死一份——两边写死必然不一致）。
+                'layouts': list(LAYOUTS),
+                'maxFrames': MAX_FRAMES,
             },
         })
 
@@ -714,6 +720,11 @@ def register_routes(api, store: PetStore) -> None:
                     'fps': variant.get('fps'),
                     'loop': variant.get('loop'),
                     'layout': variant.get('layout'),
+                    # 网格几何。预览器**只**用这两个值算切帧偏移——
+                    # `layout` 只是给用户看的名字，真正决定「第 n 帧在哪」的是
+                    # 行列数（`horizontal` / `vertical` 都是它的特例）。
+                    'cols': variant.get('cols'),
+                    'rows': variant.get('rows'),
                     'frameMs': variant.get('frameMs') or [],
                     'weight': variant.get('weight'),
                     'frameSource': variant.get('frameSource'),
@@ -734,6 +745,8 @@ def register_routes(api, store: PetStore) -> None:
                 'fps': entry.get('fps'),
                 'loop': entry.get('loop'),
                 'layout': entry.get('layout'),
+                'cols': entry.get('cols'),
+                'rows': entry.get('rows'),
                 'frameMs': entry.get('frameMs') or [],
                 'url': entry.get('url'),
                 'note': entry.get('note'),

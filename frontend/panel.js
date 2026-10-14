@@ -10,7 +10,7 @@
  * 因此这里拿到的每个动作都已经是「最终结论 + 一句解释」。
  */
 
-import { DEFAULT_SCHEDULE_MS, frameSizeOf } from './animation.js';
+import { DEFAULT_SCHEDULE_MS, frameGrid, frameSizeOf } from './animation.js';
 import { createAnimationPlayer, totalDuration } from './preview.js';
 
 const ACTION_LABELS = {
@@ -540,13 +540,24 @@ export function createSettingsPanel({
    * 因此这里改成**按 `data-` 契约选择**：任何写了 `data-frames` 的小框都会被
    * 覆盖，将来再加一处也不会重蹈覆辙。没有 `data-has-image` 的框
    * （例如「没有可用的图」那张卡）会被跳过，仍走单帧分支。
+   *
+   * ⚠️ **网格排布**（`data-cols` / `data-rows`）也要处理：小框里要露出的
+   * 是「第 0 帧」，而第 0 帧在网格里就是**左上角那一格**——铺法与单行一致
+   * （左对齐 + 顶对齐），但整条 sheet 的尺寸要按**行列数**放大，而不是按帧数。
+   * 按帧数算的话，2×2 的 4 帧网格会被铺成「一行 4 帧」，小框里露出的是
+   * 第 0 帧 + 一部分第 1 帧，看起来像图被切了一半。
    */
   function applyThumbGeometry() {
     if (!root) return;
     const boxes = root.querySelectorAll('.pet-card-thumb, .pet-action-preview');
     for (const box of boxes) {
       const frames = Math.max(1, Number(box.dataset.frames) || 1);
-      const layout = box.dataset.layout === 'vertical' ? 'vertical' : 'horizontal';
+      const grid = frameGrid({
+        frames,
+        layout: box.dataset.layout,
+        cols: box.dataset.cols,
+        rows: box.dataset.rows,
+      });
       const boxWidth = box.clientWidth || 40;
       const boxHeight = box.clientHeight || 40;
 
@@ -557,15 +568,34 @@ export function createSettingsPanel({
         continue;
       }
 
-      // 多帧：单帧按方框尺寸等比放大；整条宽度 = 帧数 × 单帧宽。
-      // `vertical` 排布同理，换成高度方向。
-      if (layout === 'vertical') {
-        box.style.backgroundSize = `auto ${boxHeight * frames}px`;
-        box.style.backgroundPosition = 'center top';
+      // 多帧：把**单帧**放大到至少盖住方框（`cover` 语义），再只露左上角那一格。
+      //
+      // 为什么是 `cover`（两个方向都取 `max`）而不是「钉住某一个方向」：
+      // 钉宽或钉高**只在单行 / 单列时安全**——
+      // - 单行（`rows === 1`）钉宽 → 帧宽正好等于框宽，横向不漏；纵向没有邻行；
+      // - 单列（`cols === 1`）钉高 → 帧高正好等于框高，纵向不漏；横向没有邻列。
+      //
+      // 但**网格**两个方向都有邻格，钉错方向就会漏：竖构图的帧（例如 384×576）
+      // 在网格里若钉高，帧宽只有框宽的 2/3 —— 方框右侧就露出**右边那一列**
+      // 的一部分，看起来像缩略图被切了一半。
+      //
+      // `cover` 让帧在两个方向都 >= 方框，于是无论排布如何都不可能漏。
+      // 而且它在既有素材上与改动前的行为**完全一致**：
+      // 竖构图（384×576）的 `cover` 等于钉宽、横构图（627×353）等于钉高。
+      const cellW = Number(box.dataset.cellW) || 0;
+      const cellH = Number(box.dataset.cellH) || 0;
+      if (cellW > 0 && cellH > 0) {
+        const scale = Math.max(boxWidth / cellW, boxHeight / cellH);
+        box.style.backgroundSize =
+          `${cellW * scale * grid.cols}px ${cellH * scale * grid.rows}px`;
+      } else if (grid.cols === 1) {
+        // 不知道单帧比例：退回「钉高」（旧行为，单列排布下是对的）
+        box.style.backgroundSize = `auto ${boxHeight * grid.rows}px`;
       } else {
-        box.style.backgroundSize = `${boxWidth * frames}px auto`;
-        box.style.backgroundPosition = 'left top';
+        // 退回「钉宽」（旧行为，单行排布下是对的）
+        box.style.backgroundSize = `${boxWidth * grid.cols}px auto`;
       }
+      box.style.backgroundPosition = '0 0';
       // 图片内容变了（URL 带版本），几何不用跟着变——版本变了浏览器自然会换图
     }
   }
@@ -659,10 +689,17 @@ export function createSettingsPanel({
       fps: entry.fps,
       loop: entry.loop,
       layout: entry.layout,
+      cols: entry.cols,
+      rows: entry.rows,
       frameMs: entry.frameMs || [],
     };
     return Object.assign({}, base, {
       size: frameSizeOf(base, entry, detail && detail.size),
+      // 网格几何一并带上（`preview.js` 的播放器只认 `cols` / `rows`）。
+      // 缺失时由 `frameGrid` 按 `layout` + 帧数推——那条路径服务的是
+      // 「老后端不下发网格」，此时行为与从前完全一致。
+      cols: frameGrid(base).cols,
+      rows: frameGrid(base).rows,
     });
   }
 
@@ -1135,6 +1172,18 @@ export function createSettingsPanel({
       thumb.dataset.petId = pet.id;
       thumb.dataset.frames = String(Math.max(1, Number(thumbSpec.frames) || 1));
       thumb.dataset.layout = thumbSpec.layout === 'vertical' ? 'vertical' : 'horizontal';
+      // 网格几何：缩略图要按**行列数**放大整条 sheet，而不是按帧数。
+      // 2×2 的 4 帧网格按帧数算会被铺成「一行 4 帧」，小框里只露出第 0 帧
+      // 加一部分第 1 帧——看起来像图被切了一半。
+      thumb.dataset.cols = String(Math.max(1, Number(thumbSpec.cols) || 1));
+      thumb.dataset.rows = String(Math.max(1, Number(thumbSpec.rows) || 1));
+      // 单帧尺寸：小方框要按它把单帧放大到「盖住方框」，否则网格排布下
+      // 会从方框里露出邻格（网格两个方向都有邻居，钉错方向就漏）。
+      const thumbSize = thumbSpec.size || pet.size || null;
+      if (thumbSize) {
+        thumb.dataset.cellW = String(Math.max(1, Number(thumbSize.w) || 1));
+        thumb.dataset.cellH = String(Math.max(1, Number(thumbSize.h) || 1));
+      }
       thumb.dataset.hasImage = 'true';
     } else {
       // 没有可用的图：留一个空框（面板上仍能看到这个形象存在，而不是破图）
@@ -1631,10 +1680,16 @@ export function createSettingsPanel({
       const pace = uniform
         ? `${formatNumber(spec.fps)} fps`
         : `${Math.round(total)}ms / 轮（逐帧不同）`;
+      // 网格排布时把形状写出来：作者要能一眼看出「帧数 vs 网格容量」是否对得上
+      // （4×4 只放 13 帧是合法的，但那 3 个空格子值得知道）。
+      const shape = frameGrid(spec);
+      const layoutNote = shape.cols > 1 && shape.rows > 1
+        ? ` · ${shape.cols}×${shape.rows} 网格`
+        : (shape.cols === 1 ? ' · 竖排' : '');
       side.appendChild(el(
         'div',
         'pet-preview-meta',
-        `${frames} 帧 · ${pace} · ${spec.loop === false ? '播一遍' : '循环'}`,
+        `${frames} 帧${layoutNote} · ${pace} · ${spec.loop === false ? '播一遍' : '循环'}`,
       ));
       if (entry && entry.kind !== 'animated') {
         side.appendChild(el('div', 'pet-preview-meta', entry.note || '这个动作没有图'));
@@ -1911,9 +1966,22 @@ export function createSettingsPanel({
       preview.style.backgroundRepeat = 'no-repeat';
       // 与卡片缩略图同一个坑：这里拿到的是**整条** spritesheet。
       // 用 `contain` 会把整条压进 56px 的小方框，每帧只剩十几像素。
-      // 因此同样是「按帧数放大 + 左对齐」，只露出第 0 帧。
+      // 因此同样是「按行列数放大 + 左上对齐」，只露出第 0 帧。
+      const tileGrid = frameGrid({
+        frames,
+        layout: entry.layout,
+        cols: entry.cols,
+        rows: entry.rows,
+      });
       preview.dataset.frames = String(frames);
       preview.dataset.layout = entry.layout === 'vertical' ? 'vertical' : 'horizontal';
+      preview.dataset.cols = String(tileGrid.cols);
+      preview.dataset.rows = String(tileGrid.rows);
+      // 单帧尺寸：与卡片缩略图同一个理由（网格排布下要 `cover` 才不漏邻格）。
+      // 优先级与桌面宠物一致：变体自带 > 动作条目 > 包级。
+      const tileSize = frameSizeOf(entry, entry, detail && detail.size);
+      preview.dataset.cellW = String(Math.max(1, Number(tileSize.w) || 1));
+      preview.dataset.cellH = String(Math.max(1, Number(tileSize.h) || 1));
       preview.dataset.hasImage = 'true';
     }
     tile.appendChild(preview);
@@ -2395,7 +2463,13 @@ export function createSettingsPanel({
     const frames = Number(entry.frames) || 1;
     if (frames <= 1) return '单帧（静态显示）';
     const suffix = required ? '' : '（可选）';
-    return `${frames} 帧 @ ${entry.fps}fps${suffix}`;
+    // 网格排布时把形状写出来：`frames` 与网格容量不一致是合法的
+    // （4×4 只放 13 帧），但那正是作者最容易填错的地方，值得显示。
+    const shape = frameGrid({ frames, layout: entry.layout, cols: entry.cols, rows: entry.rows });
+    const where = shape.cols > 1 && shape.rows > 1
+      ? `${shape.cols}×${shape.rows} `
+      : '';
+    return `${where}${frames} 帧 @ ${entry.fps}fps${suffix}`;
   }
 
   // ---------------------------------------------------------------- 生命周期

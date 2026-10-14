@@ -95,6 +95,7 @@
       "frames": 4,
       "fps": 1.43,
       "loop": true,
+      "layout": "vertical",
       "frameMs": [900, 500, 900, 500],
       "size": { "w": 627, "h": 353 }
     },

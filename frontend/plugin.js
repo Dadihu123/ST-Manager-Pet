@@ -277,7 +277,7 @@ export async function activate(api) {
       // 节奏留空 → 前端用与后端一致的默认值（见 `animation.js`）。
       // 写死一份在这里的后果是「两份默认值迟早不一致」。
       schedule: {},
-      still: { url: '', frames: 1, frame: 0, layout: 'horizontal' },
+      still: { url: '', frames: 1, frame: 0, layout: 'horizontal', cols: 1, rows: 1 },
       actions: {
         idle: { action: 'idle', kind: 'static', source: 'idle', url: '', frames: 1, fps: 1, loop: true },
       },
