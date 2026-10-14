@@ -710,13 +710,41 @@ def test_preview_payload_carries_frame_size(routes_source):
 def test_panel_resolves_preview_frame_size_with_the_shared_priority(panel):
     """面板取单帧尺寸的优先级必须与桌面宠物**同源**（`frameSizeOf`）。"""
     assert 'frameSizeOf' in panel, '必须复用 animation.js 的尺寸解析'
-    assert "import { DEFAULT_SCHEDULE_MS, frameGrid, frameSizeOf } from './animation.js'" in panel
+    # 导入行会随新增的导出而变，因此只查「从 animation.js 导入了 frameSizeOf」，
+    # 不钉死整行——钉死整行会让每次加一个导出都要改这条测试
+    # （而它真正要保护的是「尺寸解析同源」这件事）。
+    match = re.search(r"import\s*\{([^}]*)\}\s*from\s*'\./animation\.js'", panel)
+    assert match, '找不到从 animation.js 的导入'
+    names = {name.strip() for name in match.group(1).split(',') if name.strip()}
+    assert 'frameSizeOf' in names, '必须从 animation.js 导入 frameSizeOf'
+    assert 'frameGrid' in names, '必须从 animation.js 导入 frameGrid'
     body = panel[panel.index('function previewSpec()'):]
     body = body[:body.index('\n  /**')]
     assert 'frameSizeOf(base, entry, detail && detail.size)' in body, (
         '优先级必须是 变体 > 动作条目 > 包级'
     )
     assert 'size:' in body, '解析出来的尺寸要挂进预览 spec'
+
+
+def test_panel_normalizes_motion_before_reading_it(panel):
+    """★ 面板读 `motion` 前必须**先规范化**。
+
+    `entry.motion` / `spec.motion` 是后端下发的**原始形状**
+    （`{breathe: {amplitude, periodMs}}`），而 `motionBreathes` /
+    `motionBlinks` 吃的是**规范化后**的形状（`{amplitude, periodMs}`）。
+    直接喂原始形状会恒为假——表现是「面板既不显示『程序化运动』那一条、
+    预览器也不挂呼吸动画」，而桌面宠物一切正常（第一版就错在这里，
+    真实浏览器验收当场抓到）。
+    """
+    assert 'normalizeMotion' in panel, '面板必须导入 normalizeMotion'
+    # 每一处读 motion 的地方都要先规范化
+    for match in re.finditer(r'(motionBreathes|motionBlinks)\((\w+)\)', panel):
+        assert match.group(2) == 'motion', (
+            f'{match.group(1)} 的入参必须是规范化后的 motion，实际是 {match.group(2)}'
+        )
+    assert panel.count('normalizeMotion(') >= 2, (
+        'describeEntry 与预览元信息两处都要规范化'
+    )
 
 
 # ==================================================== 3. 空中不串动作

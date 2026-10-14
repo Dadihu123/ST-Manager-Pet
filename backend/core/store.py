@@ -92,6 +92,7 @@ from .pack import (
     animated_warnings,
     decode_bytes,
     loads as loads_pack,
+    motion_transform_origin,
     parse_schedule,
 )
 from .paths import is_action_name, is_safe_relative_name, safe_join, to_posix
@@ -1284,6 +1285,15 @@ class PetStore:
         cols, rows = still.grid
         payload['cols'] = cols
         payload['rows'] = rows
+        # 标准图像的**程序化运动**同样只在这里补，不写进 `StillImage.to_dict()`。
+        # 理由是它与 `cols` / `rows` 同类：**继承来的**，不是作者写的。
+        # 写进 `to_dict()` 会让「导出再导入」多出一个没人解析的字段。
+        #
+        # 为什么要给标准图像加运动：默认 idle 模式下宠物**大部分时间显示
+        # 的就是它**，不加的话「呼吸」这个特性几乎永远看不见。
+        if still.motion is not None and still.motion.enabled:
+            payload['motion'] = still.motion.to_dict()
+            payload['motionOrigin'] = motion_transform_origin(pack.anchor)
         path, frame_source = self.resolve_frame_path(pet_id, STILL_ACTION)
         payload['url'] = (
             self.frame_url(pet_id, STILL_ACTION, path) if path else ''
@@ -1402,6 +1412,10 @@ class PetStore:
                 item['pages'] = urls
             item['frameSource'] = sources[0] if sources else 'none'
             item['pageSources'] = sources
+            # **程序化运动**（呼吸 / 眨眼）：逐套透传，前端只读运行期定义。
+            # 缺省不写这个键（没声明的包与从前逐字节一致）。
+            if variant.motion is not None and variant.motion.enabled:
+                item['motion'] = variant.motion.to_dict()
             # **解码显存**估算：这才是真正的容量瓶颈（见 `pack.decode_bytes`）。
             # 用户看不到显存，因此后端算出来、面板显示出来——他有权知道
             # 「这个动作要占多少」，然后自己决定要不要用这个形象。
@@ -1472,6 +1486,14 @@ class PetStore:
             entry['animated'] = bool(primary.get('animated'))
             entry['animatedFrames'] = primary.get('animatedFrames', 1)
             entry['warnings'] = list(primary.get('warnings') or [])
+            # 程序化运动：动作层也带一份（前端不必先钻进 `variants`），
+            # 且**只有真的启用时**才写——没声明的包形状与从前一致。
+            if primary.get('motion'):
+                entry['motion'] = dict(primary['motion'])
+                # `transform-origin` 由包级 `anchor` 推出来（**不写死底部居中**），
+                # 见 `pack.motion_transform_origin`：锚点不在底部居中的形象
+                # 写死会让呼吸时脚离地。后端算一次，前端直接用。
+                entry['motionOrigin'] = motion_transform_origin(pack.anchor)
             # **内部**字段：主变体解析到的真实文件路径。仅供 `runtime_pack`
             # 做「同一张图被多个动作共享」的显存去重（见那里的说明），
             # 在返回给前端之前会被 `pop` 掉——服务器文件路径不该出现在响应里。

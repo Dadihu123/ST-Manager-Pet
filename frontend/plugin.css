@@ -87,6 +87,60 @@
   image-rendering: pixelated;
 }
 
+/* ------------------------------------------------------- 程序化运动（呼吸） */
+
+/* **一张图 + 一条曲线 = 无限帧。**
+ *
+ * 为什么走 CSS 动画而不是 JS 的 rAF：这个插件的省电契约是
+ * 「宠物静止时 rAF **真的停掉**」（README §8）。呼吸是**常驻**的连续运动，
+ * 用 rAF 做就意味着循环永不停止。实测（18005 节点的 DOM，交错 3 轮取中位数）：
+ *
+ *   CSS @keyframes   3.2 ms/s   ← 跑在合成器上，完全不碰主线程
+ *   空 rAF 循环     28.0 ms/s   （什么都不画的地板价）
+ *   rAF + 每帧写样式 49.9~62.3 ms/s
+ *
+ * 便宜一个数量级，而且**不需要 rAF** —— 省电模型一行都不用改。
+ *
+ * 幅度 / 相位 / 朝向全部由 CSS 变量给（JS 只写这几个变量，不写关键帧），
+ * 因此**一套关键帧覆盖所有动作**：
+ *   --pet-breathe-amp    幅度（例如 0.02 = ±2%）
+ *   --pet-breathe-period 周期（例如 3200ms）
+ *   --pet-face           朝向（1 或 -1），见下面「为什么合进 transform」的说明
+ *
+ * ⚠️ **镜像必须合进同一套 transform**：朝向翻转（`scaleX(-1)`）原本写在
+ * `.pet-sprite` 的内联 style 上，而 CSS 动画一旦动画同一个属性就会**覆盖**
+ * 内联值（实测：内联 `scaleX(-1)` + 动画 → 变成 `matrix(1,0,0,1.1,0,0)`，
+ * 镜像是**静默失效**的）。因此把朝向做成变量、一起写进关键帧。 */
+@keyframes pet-breathe {
+  0%, 100% {
+    transform: scaleX(var(--pet-face, 1)) scaleY(calc(1 - var(--pet-breathe-amp, 0)));
+  }
+  50% {
+    transform: scaleX(var(--pet-face, 1)) scaleY(calc(1 + var(--pet-breathe-amp, 0)));
+  }
+}
+
+/* 只有**声明了呼吸**的 sprite 才挂动画（JS 加 `has-breathe` 类）。
+ *
+ * 不加这个类判断的话，没声明 motion 的形象也会跑一个 amp=0 的动画：
+ * 视觉上没差别，但会**常驻一个合成层**（§4.1 明确要求避免），
+ * 而且会让「静止时零成本」这条契约对**所有**形象失效。 */
+[data-plugin="stm-pet"].pet-root.has-breathe .pet-sprite,
+.plugin-stm-pet.pet-root.has-breathe .pet-sprite {
+  animation: pet-breathe var(--pet-breathe-period, 3200ms) ease-in-out infinite;
+  /* `transform-origin` 由 JS 按包级 `anchor.y` 写入内联 style——
+   * **不能**在这里写死 `bottom center`：锚点不在底边的形象呼吸时脚会离地。 */
+}
+
+/* 拖动中 / 一次性动作播完的停帧：不呼吸。
+ *
+ * 宠物被拎在手里还在「呼吸」很怪；而 `reducedMotion` 走的是下面那条
+ * `animation: none`（更强的关闭）。 */
+[data-plugin="stm-pet"].pet-root.is-held .pet-sprite,
+.plugin-stm-pet.pet-root.is-held .pet-sprite {
+  animation-play-state: paused;
+}
+
 /* ------------------------------------------------- 宿主遮挡 / 省电兜底 */
 
 /* 宿主在遮罩活跃 / 对话框打开 / 页面不可见时给 ambient 容器加
@@ -408,6 +462,18 @@
   image-rendering: auto;
 }
 
+/* 面板预览里的呼吸：与桌面宠物共用同一套 `@keyframes pet-breathe`
+ * （关键帧只写一次，两处行为不可能不一致）。
+ *
+ * 定位走的是 `left` / `top`（不是 `transform`），因此这里的 `transform`
+ * 动画不会和定位打架。
+ *
+ * 面板**不做眨眼**：预览器的本分是让用户看清每一帧，
+ * 隔一会儿自己跳一帧会让人以为「帧序错了」（见 `preview.js:applyMotion`）。 */
+.plugin-stm-pet .pet-preview-frame-layer.has-breathe {
+  animation: pet-breathe var(--pet-breathe-period, 3200ms) ease-in-out infinite;
+}
+
 .plugin-stm-pet .pet-preview-side {
   display: flex;
   flex-direction: column;
@@ -425,6 +491,15 @@
   font-size: 11px;
   opacity: 0.7;
   line-height: 1.4;
+}
+
+/* 「程序化运动」那一条：用中性强调色标出来。
+ *
+ * 它不是警告（不是错误），但也不该和普通说明混在一起——
+ * 「1 帧却在动」正是最容易让人以为包坏了的地方，值得一眼看见。 */
+.plugin-stm-pet .pet-preview-meta.is-motion {
+  color: var(--color-info, #4a90d9);
+  opacity: 0.95;
 }
 
 /* 帧读数：用等宽数字，否则数字变化时宽度会跳（看起来像在抖） */

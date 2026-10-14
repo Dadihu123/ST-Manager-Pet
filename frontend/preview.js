@@ -21,7 +21,9 @@
  *    否则会留下一个仍在跑 rAF 的定时器（§2.9 的清理纪律）。
  */
 
-import { frameGrid, framePage, framePageCount } from './animation.js';
+import {
+  frameGrid, framePage, framePageCount, motionBreathes, normalizeMotion,
+} from './animation.js';
 
 /** 播放器的帧推进上限（与 `clock.js:MAX_FPS` 一致）。 */
 const MAX_FPS = 60;
@@ -229,6 +231,32 @@ export function applyFrameGeometry(box, grid, frames, index, size, layer, dpr) {
  * @param {function} [options.onFrame] `(index, frames)` 每帧回调（显示「第 n / N 帧」）
  * @param {function} [options.onEnd] 非循环动画播完时回调
  */
+/**
+ * 算出预览层要用的**呼吸样式**（纯函数，便于单测）。
+ *
+ * 与 `petview` 共用同一套 `@keyframes pet-breathe` 与同样的 CSS 变量，
+ * 因此两处的行为不可能不一致（关键帧只写一次）。
+ *
+ * @param {object} spec 变体或动作条目（读 `motion` / `motionOrigin`）
+ * @param {number} speed 动画速度倍率（呼吸周期跟着折算，否则调慢速时不协调）
+ * @returns {{amplitude: string, period: string, origin: string}|null} 不动时返回 `null`
+ */
+export function motionStyle(spec, speed = 1) {
+  // ⚠️ 必须**先规范化**再判断：`spec.motion` 是后端下发的原始形状
+  // （`{breathe: {amplitude, periodMs}}`），而 `motionBreathes` 吃的是
+  // 规范化后的形状（`{amplitude, periodMs}`）。直接喂原始形状会恒为假——
+  // 表现是「面板里永远不呼吸」，而桌面宠物正常。
+  const motion = normalizeMotion(spec);
+  if (!motionBreathes(motion)) return null;
+  const rate = Number(speed) > 0 ? Number(speed) : 1;
+  return {
+    amplitude: String(motion.amplitude),
+    period: `${Math.round(motion.periodMs / rate)}ms`,
+    // 原点由**后端**按包级 `anchor.y` 算好下发（不写死底边居中，见 `plugin.css`）。
+    origin: (spec && spec.motionOrigin) || '',
+  };
+}
+
 export function createAnimationPlayer(options = {}) {
   const box = options.box;
   // 内层：真正承载背景图的那一层（见 `applyFrameGeometry` 里对邻帧泄漏的说明）。
@@ -318,6 +346,33 @@ export function createAnimationPlayer(options = {}) {
     return variant && variant.url ? [variant.url] : [];
   }
 
+  /**
+   * 应用**程序化运动**（呼吸 / 眨眼）到预览层。
+   *
+   * 为什么面板预览也要做：面板正是用户**判断效果**的地方。桌面在呼吸、
+   * 面板里却是一张死图，用户会以为功能没生效（而这与「桌面上对、面板里错」
+   * 是同一类偏差——那个坑在网格排布时已经踩过一次）。
+   *
+   * 与 `petview` 的差别：这里**不做眨眼**。面板是逐帧预览器，它的本分是
+   * 让用户看清每一帧；隔一会儿自己跳一帧会让人以为「帧序错了」。
+   * 呼吸则照做——它不影响看清帧内容，而且正是它最需要被看到。
+   */
+  function applyMotion() {
+    const node = layer || box;
+    if (!node) return;
+    const style = motionStyle(variant, speed);
+    if (style) {
+      node.style.setProperty('--pet-breathe-amp', style.amplitude);
+      node.style.setProperty('--pet-breathe-period', style.period);
+      if (style.origin) node.style.transformOrigin = style.origin;
+      node.classList.add('has-breathe');
+    } else {
+      node.classList.remove('has-breathe');
+      node.style.removeProperty('--pet-breathe-amp');
+      node.style.removeProperty('--pet-breathe-period');
+    }
+  }
+
   function draw() {
     const at = applyFrameGeometry(
       box,
@@ -329,6 +384,7 @@ export function createAnimationPlayer(options = {}) {
       variant ? variant.size : null,
       layer,
     );
+    applyMotion();
     const urls = pageUrls();
     if (!urls.length) return;
     const page = Math.min(Math.max(0, (at && at.page) || 0), urls.length - 1);

@@ -21,6 +21,9 @@ import {
   framePage,
   framePageCount,
   frameSizeOf,
+  motionBlinks,
+  motionBreathes,
+  pickBlinkDelay,
   playableVariants,
   pickVariantIndex,
   stillFrame,
@@ -247,6 +250,17 @@ export function createPetView(options = {}) {
   let lastFrameAt = 0;
   let lastSleepCheck = 0;
   let lastInteractionAt = 0;
+  // **程序化运动**（呼吸 / 眨眼）的状态。
+  //
+  // `blinkTimer` 用 `setTimeout` 而不是 rAF：宠物静止时 rAF 是停着的，
+  // 眨眼必须能在那时发生（否则「宠物站着不动时眨眼」永远不会出现）。
+  let blinkTimer = 0;
+  //: 上一次眨到了 `blinkFrames` 的第几项（轮流用，避免每次都是同一帧）。
+  let blinkFrameIndex = -1;
+  //: 当前生效的眨眼声明（`null` = 不眨）。
+  let currentMotion = null;
+  //: 眨眼的落点几何（`{grid, frames, onStill}`）；见 `applyMotion` 的说明。
+  let blinkTarget = null;
   let hostState = {};
   let throttle = { paused: false, rate: 1, reason: '' };
   let reducedMotion = Boolean(config.reducedMotion);
@@ -433,6 +447,9 @@ export function createPetView(options = {}) {
       clock.setSpec({ frames: 1, fps: 1, loop: true });
       drawFrame();
     }
+    // **程序化运动**：与帧推进正交，因此在两条分支**之后**统一应用
+    // （单帧形象也能呼吸——那正是它最大的用处）。
+    applyMotion(variant);
     // `idle` 在 `random` 模式下**平时是标准图像**，不是 idle 首帧：
     // 两者在作者只给了一套 idle 时长得一样，但在挂了第二套（「张望」）时
     // 完全不同——标准图像是固定的，而「idle 首帧」会让静止画面跟着
@@ -487,6 +504,117 @@ export function createPetView(options = {}) {
     // 标准图像画的不是「当前变体」，页号要跟着清掉——否则下一次 `showPage`
     // 会因为 `currentPage` 还停在旧值而跳过写背景图，宠物会一直显示标准图像。
     currentPage = -1;
+    // ★ 标准图像也要**程序化运动**：默认 idle 模式下宠物大部分时间显示的
+    // 就是它，不动的话「呼吸」这个特性几乎永远看不见。
+    // （后端已经把 idle 的运动继承到 still 上了，这里只是应用它。）
+    applyMotion(still);
+  }
+
+  /**
+   * 应用**程序化运动**（呼吸 / 眨眼）。`spec` 是变体或标准图像，都可以。
+   *
+   * 为什么把两者放在一起：它们**共用同一份声明**，而且必须同步开关——
+   * 只开一个的表现是「换动作后呼吸没了」或「眨眼还在跳但图换了」。
+   *
+   * 呼吸走 CSS 动画（合成器上跑，**不需要 rAF**，见 `plugin.css` 的说明）；
+   * 眨眼走 `background-position` 跳帧，由 `setTimeout` 安排——因为宠物静止时
+   * rAF 是**停着**的（省电契约），用 rAF 计时的话倒计时永远不前进。
+   */
+  function applyMotion(spec) {
+    const motion = spec ? spec.motion : null;
+    // ---- 呼吸
+    if (motionBreathes(motion)) {
+      // 三个变量：幅度 / 周期 / 朝向。
+      //
+      // ⚠️ 朝向（`--pet-face`）必须走变量而不是内联 `transform`：
+      // CSS 动画一旦动画 `transform` 就会**覆盖**内联值，于是镜像会静默失效
+      // （实测：内联 `scaleX(-1)` + 动画 → 变成 `matrix(1,0,0,1.1,0,0)`）。
+      sprite.style.setProperty('--pet-breathe-amp', String(motion.amplitude));
+      // 周期要按**动画速度倍率**折算：用户把倍率调慢时呼吸还按原速跑会不协调。
+      sprite.style.setProperty('--pet-breathe-period', `${Math.round(motion.periodMs / currentSpeed())}ms`);
+      // `transform-origin` 由**后端**按包级 `anchor.y` 算好下发。
+      // 前端不自己推：推错的表现是「锚点不在底边的形象呼吸时脚离地」。
+      if (spec.motionOrigin) sprite.style.transformOrigin = spec.motionOrigin;
+      root.classList.add('has-breathe');
+    } else {
+      root.classList.remove('has-breathe');
+      sprite.style.removeProperty('--pet-breathe-amp');
+      sprite.style.removeProperty('--pet-breathe-period');
+    }
+    // 朝向变量要**无条件**设置：没有呼吸时它仍然承担镜像的职责
+    // （见 `applyFacing`）。有呼吸时它与关键帧里的 `scaleX()` 配合。
+    applyFacing();
+
+    // ---- 眨眼
+    clearTimeout(blinkTimer);
+    blinkTimer = 0;
+    blinkFrameIndex = -1;
+    currentMotion = motionBlinks(motion) ? motion : null;
+    // 眨眼的**落点几何**跟着「当前显示的东西」走：可能是变体，也可能是
+    // 标准图像（默认 idle 模式下大部分时间显示的就是后者，而那正是
+    // 「宠物站着不动时眨眼」应该发生的时候）。
+    //
+    // ⚠️ 必须带上**它自己的** `frames` 做边界检查：标准图像可能取自
+    // 另一条 sheet（例如睡姿），而眨眼帧号是从 idle 继承来的——
+    // 那条 sheet 上未必有那么多帧。越界会让宠物眨眼时**凭空消失**一瞬。
+    blinkTarget = currentMotion
+      ? {
+        grid: frameGrid(spec),
+        frames: Math.max(1, Math.floor(Number(spec.frames) || 1)),
+        onStill: spec === still,
+      }
+      : null;
+    if (currentMotion) scheduleBlink();
+  }
+
+  /**
+   * 安排下一次眨眼。
+   *
+   * 用 `setTimeout` 而不是在 rAF 里累加——宠物静止时 rAF 是停着的，
+   * 放在 rAF 里推进的话倒计时永远不会前进（这个坑在 idle 调度那里
+   * 已经踩过一次，见 `animation.js` 顶部说明）。
+   */
+  function scheduleBlink() {
+    if (!currentMotion || disposed) return;
+    clearTimeout(blinkTimer);
+    blinkTimer = setTimeout(() => {
+      blinkTimer = 0;
+      runBlink();
+    }, pickBlinkDelay(currentMotion));
+  }
+
+  /** 眨一次眼：跳到 `blinkFrames` 的下一帧，停一会儿，再跳回来。 */
+  function runBlink() {
+    if (!currentMotion || disposed || !blinkTarget) return;
+    const frames = currentMotion.blinkFrames;
+    blinkFrameIndex = (blinkFrameIndex + 1) % frames.length;
+    const frame = frames[blinkFrameIndex];
+    // 只改 `background-position`（不换图、不重解码）。
+    //
+    // ⚠️ 用**当前显示的那条 sheet 的网格几何**算这一帧的位置——不能用
+    // 「单行 + 第 frame 帧」硬算：网格排布时「第 2 帧」在第二行第一列，
+    // 硬算会取到错的格子（而单行时两者恰好相同，因此这种错只在网格包上出现）。
+    //
+    // ⚠️ 也要用**它自己的**帧数做边界检查（见 `blinkTarget` 的说明）：
+    // 越界会让宠物眨眼时消失一瞬。
+    if (frame < blinkTarget.frames) {
+      const at = framePage(frame, blinkTarget.grid, blinkTarget.frames);
+      // 标准图像只有一页；变体可能多页，只有当前就在那一页时才跳
+      // （跨页要换图、要解码，那正是我们不想在眨眼这种小事上做的事）。
+      if (blinkTarget.onStill || at.page === currentPage) {
+        sprite.style.backgroundPosition = `${-at.col * width}px ${-at.row * height}px`;
+      }
+    }
+    blinkTimer = setTimeout(() => {
+      blinkTimer = 0;
+      // 眨完回到**当前时钟所在的帧**（而不是硬回到第 0 帧——
+      // 那样循环动画会突然跳回开头）。标准图像则重画那一帧。
+      if (!disposed) {
+        if (blinkTarget && blinkTarget.onStill) drawStill();
+        else drawFrame();
+      }
+      scheduleBlink();
+    }, currentMotion.blinkDurationMs);
   }
 
   /**
@@ -577,7 +705,19 @@ export function createPetView(options = {}) {
     const mirror = machine.state === STATES.WALK
       ? resolveWalkVisual(walkDirection, actions).mirror
       : mirrorForNonWalkAction(facing, actions);
-    sprite.style.transform = mirror ? 'scaleX(-1)' : '';
+    // ⚠️ 有呼吸时**不能**写内联 `transform`：CSS 动画会覆盖它（实测），
+    // 于是镜像静默失效。改用 CSS 变量 `--pet-face`，由关键帧里的
+    // `scaleX(var(--pet-face))` 消费——两者合成在同一个 transform 里。
+    //
+    // 没有呼吸时仍走内联 `transform`：那条路径已经被大量测试钉住，
+    // 没必要为了统一而改动它。
+    if (root.classList.contains('has-breathe')) {
+      sprite.style.setProperty('--pet-face', mirror ? '-1' : '1');
+      sprite.style.removeProperty('transform');
+    } else {
+      sprite.style.removeProperty('--pet-face');
+      sprite.style.transform = mirror ? 'scaleX(-1)' : '';
+    }
   }
 
   // ---------------------------------------------------------------- rAF
@@ -1020,6 +1160,9 @@ export function createPetView(options = {}) {
     physics.beginDrag(point.x, point.y);
     // 运动期间才加 will-change，停下就摘（常驻会占显存，§4.1）
     root.classList.add('is-moving');
+    // 拎在手里时**不呼吸**：宠物被举着还在「喘气」很怪
+    // （CSS 侧按这个类把 `animation-play-state` 设为 paused）。
+    root.classList.add('is-held');
     wake();
   }
 
@@ -1058,6 +1201,7 @@ export function createPetView(options = {}) {
     const outcome = gesture.end(point.x, point.y, now);
     lastPointer = null;
     root.classList.remove('is-moving');
+    root.classList.remove('is-held');
 
     if (outcome.kind === 'click') {
       handleClick();
@@ -1404,6 +1548,11 @@ export function createPetView(options = {}) {
       disposed = true;
       stopLoop();
       clearTimeout(actionTimer);
+      // 眨眼定时器必须回收：它**独立于 rAF**（静止时 rAF 是停着的，
+      // 而眨眼照跑），漏掉的话视图销毁后定时器还在触发——每眨一次
+      // 都会去写一个已经摘掉的 DOM 节点，并且不断自我重排。
+      clearTimeout(blinkTimer);
+      blinkTimer = 0;
       cancelIdleWake();
       if (resizeRaf) window.cancelAnimationFrame(resizeRaf);
       window.removeEventListener('resize', onResize);

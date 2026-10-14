@@ -13,7 +13,12 @@ import { test } from 'node:test';
 
 import { frameGrid, framePage, framePageCount } from '../../frontend/animation.js';
 import { animationDuration } from '../../frontend/animation.js';
-import { frameDurations, totalDuration, applyFrameGeometry } from '../../frontend/preview.js';
+import {
+  normalizeMotion, motionBreathes, motionBlinks, pickBlinkDelay, playableVariants, stillFrame,
+} from '../../frontend/animation.js';
+import {
+  frameDurations, totalDuration, applyFrameGeometry, motionStyle,
+} from '../../frontend/preview.js';
 
 /**
  * 造一个最小的假预览框 + 内层。
@@ -523,6 +528,176 @@ test('frameGrid：horizontal / vertical 是网格的特例', () => {
   // 缺省（老后端不下发 layout）等价于 horizontal
   assert.deepEqual(frameGrid({ frames: 3 }), { cols: 3, rows: 1 });
   assert.deepEqual(frameGrid(null), { cols: 1, rows: 1 });
+});
+
+// ============================================================ 程序化运动（T6）
+//
+// `motion`：不增加帧数的连续运动。呼吸走 CSS `@keyframes`（合成器上跑，
+// **不需要 rAF**），眨眼走 `background-position` 跳帧 + `setTimeout`
+// （因为宠物静止时 rAF 是停着的，用 rAF 计时倒计时永远不前进）。
+//
+// 实测收益：现状 4 帧 idle 循环的顶边只动 1px（4 张图几乎一样），
+// 而 1 帧 + 呼吸能顶边动 22px 且脚底不动 —— **1 帧比 4 帧更像活的**。
+
+
+test('★ normalizeMotion：没声明时返回 null（前端据此完全不动样式）', () => {
+  assert.equal(normalizeMotion({}), null);
+  assert.equal(normalizeMotion({ motion: null }), null);
+  assert.equal(normalizeMotion({ motion: {} }), null);
+  assert.equal(normalizeMotion(null), null);
+  // 有键但值非法 → 当作没声明（宁可不动，也不要写一个坏值进 CSS）
+  assert.equal(normalizeMotion({ motion: { breathe: { amplitude: 0, periodMs: 3200 } } }), null);
+  assert.equal(normalizeMotion({ motion: { breathe: { amplitude: 0.02 } } }), null);
+  assert.equal(normalizeMotion({ motion: { breathe: { amplitude: 'x', periodMs: 'y' } } }), null);
+});
+
+test('normalizeMotion：呼吸', () => {
+  const m = normalizeMotion({ motion: { breathe: { amplitude: 0.02, periodMs: 3200 } } });
+  assert.equal(m.amplitude, 0.02);
+  assert.equal(m.periodMs, 3200);
+  assert.equal(m.blinkFrames.length, 0);
+  assert.equal(motionBreathes(m), true);
+  assert.equal(motionBlinks(m), false);
+});
+
+test('normalizeMotion：眨眼', () => {
+  const m = normalizeMotion({
+    motion: { blink: { frames: [2, 3], everyMs: [3000, 7000], durationMs: 160 } },
+  });
+  assert.deepEqual(m.blinkFrames, [2, 3]);
+  assert.deepEqual(m.blinkEveryMs, [3000, 7000]);
+  assert.equal(m.blinkDurationMs, 160);
+  assert.equal(motionBreathes(m), false);
+  assert.equal(motionBlinks(m), true);
+});
+
+test('normalizeMotion：两者可同时开启', () => {
+  const m = normalizeMotion({
+    motion: {
+      breathe: { amplitude: 0.025, periodMs: 3000 },
+      blink: { frames: [1], everyMs: [2500, 6000], durationMs: 140 },
+    },
+  });
+  assert.equal(motionBreathes(m), true);
+  assert.equal(motionBlinks(m), true);
+});
+
+test('★ normalizeMotion：眨眼的 everyMs 顺序被规范化（后端也做，前端再兜一层）', () => {
+  const m = normalizeMotion({
+    motion: { blink: { frames: [1], everyMs: [7000, 3000], durationMs: 160 } },
+  });
+  assert.deepEqual(m.blinkEveryMs, [3000, 7000]);
+});
+
+test('normalizeMotion：眨眼参数不全就整条丢掉（不要半残的配置）', () => {
+  // 缺 durationMs
+  assert.equal(normalizeMotion({ motion: { blink: { frames: [1], everyMs: [3000, 7000] } } }), null);
+  // everyMs 不是两项
+  assert.equal(normalizeMotion({
+    motion: { blink: { frames: [1], everyMs: [3000], durationMs: 160 } },
+  }), null);
+  // frames 为空
+  assert.equal(normalizeMotion({
+    motion: { blink: { frames: [], everyMs: [3000, 7000], durationMs: 160 } },
+  }), null);
+});
+
+test('★ pickBlinkDelay：只抽数、不管计时', () => {
+  // 抽数（不推进倒计时）——计时必须由调用方做：宠物静止时 rAF 是停着的，
+  // 把倒计时放在这里推进就永远不会前进（idle 调度那里踩过一次）。
+  const m = normalizeMotion({
+    motion: { blink: { frames: [1], everyMs: [3000, 7000], durationMs: 160 } },
+  });
+  assert.equal(pickBlinkDelay(m, () => 0), 3000);
+  assert.equal(pickBlinkDelay(m, () => 1), 7000);
+  assert.equal(pickBlinkDelay(m, () => 0.5), 5000);
+  // 区间退化成一个值时也安全
+  const flat = normalizeMotion({
+    motion: { blink: { frames: [1], everyMs: [4000, 4000], durationMs: 160 } },
+  });
+  assert.equal(pickBlinkDelay(flat, () => 0.7), 4000);
+  // 不眨眼时返回 0（调用方据此不排定时器）
+  assert.equal(pickBlinkDelay(null), 0);
+  assert.equal(pickBlinkDelay({ blinkFrames: [], blinkDurationMs: 0 }), 0);
+});
+
+test('★ playableVariants 带上 motion 与 motionOrigin', () => {
+  const [v] = playableVariants({
+    url: '/f', frames: 4, fps: 6,
+    motion: { breathe: { amplitude: 0.02, periodMs: 3200 } },
+    motionOrigin: '50% 88%',
+  });
+  assert.equal(v.motion.amplitude, 0.02);
+  assert.equal(v.motionOrigin, '50% 88%');
+  // 没声明时是 null / ''（前端据此完全不动样式）
+  const [plain] = playableVariants({ url: '/f', frames: 4 });
+  assert.equal(plain.motion, null);
+  assert.equal(plain.motionOrigin, '');
+});
+
+test('★ stillFrame 带上 motion（标准图像要跟着 idle 一起呼吸）', () => {
+  // 默认 idle 模式下宠物**大部分时间显示的就是标准图像**；
+  // 它不动的话，呼吸在绝大多数时间里根本看不见。
+  //
+  // ⚠️ motion 挂在**运行期的 `still` 载荷上**（后端把 idle 的运动继承过来），
+  // 不是挂在包顶层——写错位置的表现就是「标准图像不呼吸」。
+  const still = stillFrame({
+    still: {
+      url: '/frame/mine/still', sheet: 'idle.png', frames: 4, frame: 0, source: 'idle',
+      motion: { breathe: { amplitude: 0.03, periodMs: 3000 } },
+      motionOrigin: '50% 100%',
+    },
+    animations: { idle: { sheet: 'idle.png', frames: 4, fps: 6 } },
+  });
+  assert.equal(still.motion.amplitude, 0.03);
+  assert.equal(still.motionOrigin, '50% 100%');
+});
+
+test('★ motionStyle：算出预览层要用的呼吸样式（纯函数）', () => {
+  // 与 petview 共用同一套 @keyframes 与同样的 CSS 变量，
+  // 因此两处的行为不可能不一致（关键帧只写一次）。
+  const style = motionStyle({
+    motion: { breathe: { amplitude: 0.03, periodMs: 2500 } },
+    motionOrigin: '50% 90%',
+  });
+  assert.equal(style.amplitude, '0.03');
+  assert.equal(style.period, '2500ms');
+  assert.equal(style.origin, '50% 90%');
+});
+
+test('★ motionStyle：周期按动画速度倍率折算', () => {
+  // 用户把倍率调慢时呼吸还按原速跑会不协调。
+  const spec = { motion: { breathe: { amplitude: 0.02, periodMs: 3000 } } };
+  assert.equal(motionStyle(spec, 1).period, '3000ms');
+  assert.equal(motionStyle(spec, 2).period, '1500ms');
+  assert.equal(motionStyle(spec, 0.5).period, '6000ms');
+  // 倍率非法时退回 1（不要算出 NaN 或 Infinity 写进 CSS）
+  assert.equal(motionStyle(spec, 0).period, '3000ms');
+  assert.equal(motionStyle(spec, -1).period, '3000ms');
+  assert.equal(motionStyle(spec, NaN).period, '3000ms');
+});
+
+test('★ motionStyle：只眨眼 / 没声明时返回 null（不挂呼吸动画）', () => {
+  // 只眨眼不该挂呼吸：会常驻一个合成层，而且「静止时零成本」的契约
+  // 会为这个形象白白失效。
+  assert.equal(motionStyle({ motion: { blink: { frames: [1], everyMs: [3000, 7000], durationMs: 100 } } }), null);
+  assert.equal(motionStyle({}), null);
+  assert.equal(motionStyle(null), null);
+});
+
+test('★ motionStyle：没下发 motionOrigin 时 origin 是空串（而不是编一个）', () => {
+  // 编一个「底部居中」会在锚点不在底边的形象上让脚离地。
+  const style = motionStyle({ motion: { breathe: { amplitude: 0.02, periodMs: 3000 } } });
+  assert.equal(style.origin, '');
+});
+
+test('★ 预览播放器不眨眼（它的本分是让用户看清每一帧）', () => {
+  // 隔一会儿自己跳一帧会让人以为「帧序错了」。
+  // 这里用纯函数验证：只眨眼的声明**不会**产生呼吸样式。
+  const style = motionStyle({
+    motion: { blink: { frames: [2], everyMs: [100, 100], durationMs: 60 } },
+  });
+  assert.equal(style, null);
 });
 
 // ============================================================ 动图容器

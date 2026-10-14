@@ -252,6 +252,76 @@ export function frameSizeOf(variant, spec, base) {
 }
 
 /**
+ * 把运行期下发的 `motion` 规范化成前端好用的形状；没声明时返回 `null`。
+ *
+ * **程序化运动**（T6）：不增加帧数的连续运动，与帧序列正交、可叠加。
+ *
+ * - 呼吸走 CSS `@keyframes`（合成器上跑，**不需要 rAF**，见 `plugin.css`）；
+ * - 眨眼走 `background-position` 跳到另一帧再跳回（复用同一张 sheet）。
+ *
+ * ⚠️ 它**做不了**肢体运动：整身仿射变换无法 articulate 四肢，
+ * 实测把走路两个关键姿势交叉淡入得到的是**双重曝光**（两条腿叠一起）。
+ * 因此这里只处理「整体运动」。
+ */
+export function normalizeMotion(source) {
+  const raw = source && source.motion;
+  if (!raw || typeof raw !== 'object') return null;
+  const out = { amplitude: 0, periodMs: 0, blinkFrames: [], blinkEveryMs: [], blinkDurationMs: 0 };
+
+  const breathe = raw.breathe;
+  if (breathe && typeof breathe === 'object') {
+    const amplitude = Number(breathe.amplitude);
+    const periodMs = Number(breathe.periodMs);
+    if (Number.isFinite(amplitude) && amplitude > 0 && Number.isFinite(periodMs) && periodMs > 0) {
+      out.amplitude = amplitude;
+      out.periodMs = periodMs;
+    }
+  }
+
+  const blink = raw.blink;
+  if (blink && typeof blink === 'object') {
+    const frames = Array.isArray(blink.frames)
+      ? blink.frames.map((v) => Math.floor(Number(v))).filter((v) => Number.isFinite(v) && v >= 0)
+      : [];
+    const every = Array.isArray(blink.everyMs) ? blink.everyMs.map(Number) : [];
+    const duration = Number(blink.durationMs);
+    if (frames.length && every.length === 2 && every.every(Number.isFinite)
+        && Number.isFinite(duration) && duration > 0) {
+      out.blinkFrames = frames;
+      out.blinkEveryMs = [Math.min(every[0], every[1]), Math.max(every[0], every[1])];
+      out.blinkDurationMs = duration;
+    }
+  }
+
+  if (out.amplitude <= 0 && !out.blinkFrames.length) return null;
+  return out;
+}
+
+/** 这条 motion 会呼吸吗？（决定要不要挂 CSS 动画类） */
+export function motionBreathes(motion) {
+  return Boolean(motion && motion.amplitude > 0 && motion.periodMs > 0);
+}
+
+/** 这条 motion 会眨眼吗？（决定要不要起定时器） */
+export function motionBlinks(motion) {
+  return Boolean(motion && motion.blinkFrames.length && motion.blinkDurationMs > 0);
+}
+
+/**
+ * 从 `[最短, 最长]` 里抽一个间隔（毫秒）。
+ *
+ * 与 `pickIdleDelay` 同一套约定：**只抽数、不管计时**——计时必须由
+ * 调用方做，因为宠物静止时 rAF 是停着的，把倒计时放在这里推进就永远不前进
+ * （这个坑在 idle 调度那里已经踩过一次，见 `animation.js` 顶部说明）。
+ */
+export function pickBlinkDelay(motion, random = Math.random) {
+  if (!motionBlinks(motion)) return 0;
+  const [low, high] = motion.blinkEveryMs;
+  if (!(high > low)) return Math.max(0, low || 0);
+  return low + (high - low) * random();
+}
+
+/**
  * 把「运行期动作条目」规范化成一组可播的变体。
  *
  * 优先读 `variants`（后端多套动画的输出），缺失时回退到条目本身的
@@ -309,6 +379,12 @@ function normalizeVariant(item) {
     animated: source.layout === 'animated' || source.animated === true,
     // 动图的**真实帧数**（后端从文件元数据读出来的）；静态图是 1。
     animatedFrames: Math.max(1, Math.floor(Number(source.animatedFrames) || 1)),
+    // **程序化运动**（呼吸 / 眨眼）：与帧序列正交，可叠加。
+    // 没声明时是 `null`——调用方据此完全不动样式（不挂动画类、不起定时器）。
+    motion: normalizeMotion(source),
+    // 呼吸的 `transform-origin`：由后端按包级 `anchor.y` 算好。
+    // 前端**不自己推**——推错的表现是「锚点不在底边的形象呼吸时脚离地」。
+    motionOrigin: typeof source.motionOrigin === 'string' ? source.motionOrigin : '',
     // 网格几何：**原样带上**后端算好的值（缺失时 `frameGrid` 会按 layout 推）。
     cols: Math.max(0, Math.floor(Number(source.cols) || 0)),
     rows: Math.max(0, Math.floor(Number(source.rows) || 0)),
@@ -363,6 +439,14 @@ export function stillFrame(pack) {
     // 这个问题只有「标准图像」与「逐动作尺寸」同时存在时才出现，
     // 因此是两条分支合并时才补上的。
     size: still.size || undefined,
+    // **程序化运动**：标准图像要跟着 idle 一起呼吸。
+    //
+    // 为什么：默认 idle 模式是「平时静止 + 隔一段随机播一遍」，也就是说
+    // 宠物**大部分时间显示的就是标准图像**。标准图像不动的话，呼吸在
+    // 绝大多数时间里根本看不见——宠物看起来仍然是死的。
+    // （后端已经把 idle 的运动继承过来了，这里只是原样带上。）
+    motion: normalizeMotion(still),
+    motionOrigin: typeof still.motionOrigin === 'string' ? still.motionOrigin : '',
   };
 }
 

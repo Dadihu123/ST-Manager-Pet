@@ -748,6 +748,11 @@ def register_routes(api, store: PetStore) -> None:
                     'animated': bool(variant.get('animated')),
                     'animatedFrames': variant.get('animatedFrames') or 1,
                     'warnings': list(variant.get('warnings') or []),
+                    # 程序化运动：面板预览器要一起应用它，否则会出现
+                    # 「桌面上在呼吸、面板里不动」——而面板正是用户判断
+                    # 效果的地方。
+                    'motion': variant.get('motion') or None,
+                    'motionOrigin': variant.get('motionOrigin') or '',
                     # 单帧尺寸（可能缺省 = 沿用包级）。
                     #
                     # 必须透传：面板的预览框要按**真实宽高比**把这一帧装进去，
@@ -775,6 +780,8 @@ def register_routes(api, store: PetStore) -> None:
                 'animated': bool(entry.get('animated')),
                 'animatedFrames': entry.get('animatedFrames') or 1,
                 'warnings': list(entry.get('warnings') or []),
+                'motion': entry.get('motion') or None,
+                'motionOrigin': entry.get('motionOrigin') or '',
                 'frameMs': entry.get('frameMs') or [],
                 'url': entry.get('url'),
                 'note': entry.get('note'),

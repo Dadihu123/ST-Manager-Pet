@@ -218,12 +218,98 @@ def test_respects_prefers_reduced_motion(css):
     )
 
 
-def test_no_animations_outside_reduced_motion_escape(css_body):
-    """本插件不用 CSS 动画驱动宠物（帧推进走 JS 的 rAF），
-    因此 `animation:` 只应出现在 reduced-motion 的关闭声明里。"""
-    for match in re.finditer(r'(?<!-)\banimation\s*:\s*([^;]+);', css_body):
-        value = match.group(1).strip().lower()
-        assert value == 'none', f'不应依赖 CSS 动画（改用 rAF 帧推进）: animation: {value}'
+def test_no_keyframes_animate_frame_stepping(css_body):
+    """★ 没有任何 `@keyframes` 可以动画 `background-position`（= 换帧）。
+
+    这条规则原来写的是「`animation:` 只应出现在 reduced-motion 的关闭声明里」，
+    理由是「本插件不用 CSS 动画驱动宠物（帧推进走 JS 的 rAF）」。
+    加了「程序化运动」（呼吸）之后，这个理由需要**说得更准**：
+
+    - 它真正要禁的是「**用 CSS 动画换帧**」——那会绕过时钟、`frameMs`、
+      动画速度倍率，而且「帧推进走 rAF」这条设计会被撕成两半；
+    - 而呼吸是**装饰性整体运动**，跑在合成器上、不需要 rAF，
+      实测比 JS 循环便宜一个数量级（3.2 vs 62.3 ms/s），
+      正是它让「宠物静止时 rAF 真的停掉」这条省电契约得以保持。
+
+    因此规则改成**更精确、可检查**的形式：禁止的是关键帧里出现
+    `background-position`，而不是禁止 `animation:` 本身。
+
+    ⚠️ 检查必须落在**关键帧块内部**：`animation:` 简写只写动画名，
+    不写被动画的属性——所以查简写是查不出东西的（这里最初就写错了）。
+    """
+    blocks = re.findall(r'@keyframes\s+([A-Za-z0-9_-]+)\s*\{', css_body)
+    assert blocks, '插件里应当有 @keyframes（至少 pet-breathe）'
+    for name in blocks:
+        block = _keyframe_block(css_body, name)
+        assert 'background-position' not in block, (
+            f'@keyframes {name} 动画了 background-position —— 那是换帧的机制，'
+            f'会绕过时钟与帧时长。换帧只能走 JS 的 rAF。'
+        )
+
+
+def _keyframe_block(source: str, name: str) -> str:
+    """取出某个 `@keyframes` 的完整块（按花括号配对）。"""
+    match = re.search(rf'@keyframes\s+{re.escape(name)}\s*\{{', source)
+    assert match, f'找不到 @keyframes {name}'
+    start = match.end() - 1
+    depth = 0
+    for index in range(start, len(source)):
+        if source[index] == '{':
+            depth += 1
+        elif source[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError(f'@keyframes {name} 的块没有闭合')
+
+
+def test_motion_css_animates_transform_only(css_body):
+    """反向钉死：`pet-breathe` 关键帧里只许出现 `transform`。"""
+    block = _keyframe_block(css_body, 'pet-breathe')
+    assert 'transform' in block, '呼吸关键帧必须用 transform'
+    assert 'background' not in block, '呼吸关键帧不得碰 background'
+
+
+def test_breathe_animation_is_opt_in_by_class(css_body):
+    """★ 呼吸动画必须**挂在 `.has-breathe` 类下**，不能无条件挂在 `.pet-sprite` 上。
+
+    无条件挂的后果：没声明 motion 的形象也会跑一个 amp=0 的动画——
+    视觉上看不出来，但会**常驻一个合成层**，而且让「静止时零成本」
+    这条契约对所有形象失效（§4.1 明确要求避免常驻 will-change/层）。
+    """
+    found = re.findall(r'([^{}]+)\{([^}]*animation\s*:\s*pet-breathe[^}]*)\}', css_body)
+    assert found, '找不到应用 pet-breathe 的规则'
+    for selector, _body in found:
+        assert 'has-breathe' in selector, (
+            f'呼吸动画必须由 .has-breathe 类开关，否则未声明的形象也会常驻合成层: {selector.strip()}'
+        )
+
+
+def test_breathe_origin_is_not_hardcoded(css_body):
+    """★ 呼吸的 `transform-origin` 不能写死在 CSS 里。
+
+    呼吸是「以脚底为原点做纵向缩放」，而脚底的位置是**每个形象各自的**
+    `anchor.y`。写死 `bottom center` 时，锚点不在底边的形象会脚离地
+    （实测锚点 y=0.85 时脚飘 3.5px）。因此原点必须由 JS 按 anchor 写入内联 style。
+    """
+    for match in re.finditer(r'([^{}]*has-breathe[^{}]*)\{([^}]*)\}', css_body):
+        assert 'transform-origin' not in match.group(2), (
+            '呼吸规则的 transform-origin 不能写死——必须由 JS 按包级 anchor.y 写入'
+        )
+
+
+def test_js_sets_the_breathe_origin_from_anchor():
+    """★ JS 必须真的把 anchor 换算成 transform-origin 写下去。
+
+    只写 CSS 不写 JS 的话，那条规则形同虚设——而这正是「CSS 里有一条
+    永不生效的规则」这个曾经真实踩过的坑（见 `data-pet-pixelated` 那条）。
+    """
+    source = read(os.path.join(REPO_ROOT, 'frontend', 'petview.js'))
+    assert 'motionOrigin' in source, (
+        'petview.js 必须读取运行期下发的 motionOrigin 并写入 sprite.style.transformOrigin'
+    )
+    assert 'transformOrigin' in source
+    assert 'has-breathe' in source, 'petview.js 必须按声明开关 has-breathe 类'
 
 
 def test_pointer_events_auto_is_taken_back(css_body):

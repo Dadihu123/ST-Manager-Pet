@@ -194,6 +194,39 @@ LAYOUTS = (LAYOUT_HORIZONTAL, LAYOUT_VERTICAL, LAYOUT_GRID, LAYOUT_ANIMATED)
 #: 于是反复调整数字却看不出任何变化（与 §2.5 的教训一致）。
 ANIMATED_FORBIDDEN_FIELDS = ('fps', 'frameMs', 'cols', 'rows', 'loop')
 
+#: **程序化运动**（T6）：不增加帧数的连续运动。
+#:
+#: 为什么要有它：帧序列把「动起来」的成本算成「帧数 × 单帧像素」，
+#: 而呼吸、眨眼这类**装饰性整体运动**根本不需要那么多帧——
+#: 一张图加一条曲线就能无限平滑，比手画 30 帧更自然，还不占额外显存。
+#:
+#: 它与帧序列**正交**，可以叠加：
+#: - 呼吸 = sprite 元素上的 CSS `transform`（走合成器，不需要 rAF）；
+#: - 眨眼 = `background-position` 跳到另一帧再跳回来（复用同一张 sheet）。
+#:
+#: ⚠️ **它做不了什么**（这一点必须说清，否则作者会以为「写了就能自动补间」）：
+#: 整身仿射变换**无法 articulate 四肢**。实测把走路的两个关键姿势交叉淡入，
+#: 得到的中间帧是**双重曝光**（两条腿叠在一起），不是新姿势。
+#: 真正的肢体运动需要骨骼绑定或真实的中间帧。因此 `motion` 的合理范围是
+#: **整体运动**（呼吸 / 摇摆 / 挤压拉伸 / 眨眼），不是「自动生成行走循环」。
+MOTION_BREATHE = 'breathe'
+MOTION_BLINK = 'blink'
+MOTION_KINDS = (MOTION_BREATHE, MOTION_BLINK)
+
+#: 呼吸幅度（纵向缩放 ±amplitude）的合法区间。
+#:
+#: 上限 8%：4% 已经很显眼，再大就是「拉伸」而不是「呼吸」，
+#: 写实素材的边缘还会被拉糊。下限 0.2%：比这更小等于没动，
+#: 而作者会以为功能坏了（「我明明写了」）。
+BREATHE_AMPLITUDE_RANGE = (0.002, 0.08)
+#: 呼吸周期（毫秒）。人类静息呼吸约 3–5 秒一次；800ms 已经偏快，
+#: 20s 是一声很慢的深呼吸。超出这个区间就是填错了。
+BREATHE_PERIOD_RANGE = (800, 20000)
+#: 眨眼间隔（毫秒，`[最短, 最长]`）。默认 3–7 秒一次。
+BLINK_INTERVAL_RANGE = (300, 60000)
+#: 一次眨眼的持续时长（毫秒）。人眼一眨约 100–400ms。
+BLINK_DURATION_RANGE = (40, 2000)
+
 
 def frame_grid(layout: str, frames: int, cols: int = 0, rows: int = 0) -> tuple:
     """把排布声明折算成 `(cols, rows)`——**唯一的**帧几何真相。
@@ -316,6 +349,37 @@ def page_capacity(frames: int, pages: int, cols: int = 0, rows: int = 0) -> int:
     page_count = max(1, int(pages or 1))
     count = max(1, int(frames or 1))
     return max(1, -(-count // page_count))
+
+
+def motion_transform_origin(anchor: dict) -> str:
+    """把包级 `anchor` 换算成呼吸要用的 `transform-origin`。
+
+    ⚠️ **这是「新增形象会不会踩坑」的关键一处。** 呼吸是「以某个点为原点做
+    纵向缩放」，而那个点必须是**宠物的脚底**：
+
+    - 写死 `bottom center` → 锚点不在底部的形象会在呼吸时**脚离地**
+      （实测锚点 y=0.85 时脚飘 3.5px、y=0.5 时上下各飘 11.5px）；
+    - 而 `anchor.y` 本来就已经定义了脚在哪——`drawPosition` 用的就是
+      `top = physics.y - height * anchorY`，也就是说**脚就在 anchorY 处**。
+
+    因此纵向原点直接取 `anchor.y`，两者天然一致：默认 `1.0` 得到 `100%`
+    （底边），自定义锚点自动跟着走。**「新增形象」不需要额外配置。**
+
+    ⚠️ **横向原点固定 `50%`，不取 `anchor.x`**——这一点容易搞错：
+
+    - `scaleX(-1)`（朝向翻转）也走 `transform`，而它的原点**必须是水平中心**，
+      否则翻转会把贴图整体平移（实测原点取 30% 时左移 0.4×宽度）；
+    - 而且横向定位本来就不看 `anchor.x`：`drawPosition` 用的是
+      `left = physics.x - width / 2`，即**恒为居中**。
+
+    两者都指向同一个结论：横向原点只能是 50%。若哪天横向锚点真的接进定位，
+    这里要跟着一起改。
+    """
+    try:
+        y = float(anchor.get('y', DEFAULT_ANCHOR['y']))
+    except (AttributeError, TypeError, ValueError):
+        y = DEFAULT_ANCHOR['y']
+    return f'50% {round(y * 100, 2)}%'
 
 
 def decode_bytes(frames: int, width: int, height: int) -> int:
@@ -580,6 +644,63 @@ _MAX_FRAME_SIZE = 1024
 
 
 @dataclass
+class MotionSpec:
+    """一个变体的**程序化运动**（见 `MOTION_BREATHE` 的说明）。
+
+    两个字段组各自独立、可同时开启：
+
+    - **呼吸**：以 `(anchor.x, anchor.y)` 为原点做纵向缩放（`transform-origin`
+      由包级 `anchor` 推出来，**不是**写死「底部居中」——见 `motion_css` 的说明）。
+    - **眨眼**：每隔一段随机时间，把 `background-position` 跳到
+      `blink_frames` 里的帧、停 `blink_duration_ms`、再跳回原帧。
+      帧号指向**同一张 sheet**，因此不需要第二张图、不需要定位。
+
+    `enabled` 为假时前端完全不碰样式（不写 CSS 变量、不起定时器），
+    因此「没写 motion」的包与从前逐字节等价。
+    """
+
+    #: 呼吸幅度（纵向缩放 ±amplitude）。`0` = 不呼吸。
+    amplitude: float = 0.0
+    #: 呼吸周期（毫秒）。`amplitude > 0` 时必定有值。
+    period_ms: int = 0
+    #: 眨眼用 sheet 里的哪几帧（按顺序播）。空 = 不眨眼。
+    blink_frames: list = field(default_factory=list)
+    #: 眨眼间隔 `[最短, 最长]`（毫秒），每次在这个区间里随机取。
+    blink_every_ms: list = field(default_factory=list)
+    #: 一次眨眼停多久（毫秒）。
+    blink_duration_ms: int = 0
+
+    @property
+    def breathes(self) -> bool:
+        return self.amplitude > 0 and self.period_ms > 0
+
+    @property
+    def blinks(self) -> bool:
+        return bool(self.blink_frames) and self.blink_duration_ms > 0
+
+    @property
+    def enabled(self) -> bool:
+        """有任何一项要动吗？——没有就让前端完全不动样式。"""
+        return self.breathes or self.blinks
+
+    def to_dict(self) -> dict:
+        """只写出**启用**的部分（没写的东西不该出现在往返里）。"""
+        payload = {}
+        if self.breathes:
+            payload[MOTION_BREATHE] = {
+                'amplitude': self.amplitude,
+                'periodMs': self.period_ms,
+            }
+        if self.blinks:
+            payload[MOTION_BLINK] = {
+                'frames': list(self.blink_frames),
+                'everyMs': list(self.blink_every_ms),
+                'durationMs': self.blink_duration_ms,
+            }
+        return payload
+
+
+@dataclass
 class AnimationVariant:
     """**一套**动画（一个动作可以有多套，按 `weight` 随机选一套播）。
 
@@ -630,6 +751,8 @@ class AnimationVariant:
     #: 挂在这一层（而不是动作层）是因为「画布尺寸」是**图本身的属性**：
     #: 多套动画可以各自是不同尺寸的图，前端换套播时几何要跟着换。
     size: dict = None
+    #: **程序化运动**（呼吸 / 眨眼）。`None` 或 `enabled=False` 表示不动（见 `MotionSpec`）。
+    motion: 'MotionSpec' = None
 
     @property
     def sheet(self) -> str:
@@ -733,6 +856,10 @@ class AnimationVariant:
         # `fps: 0`，于是**导出再导入直接报错**。
         if self.animated:
             payload = {'layout': self.layout, 'weight': self.weight}
+        # 程序化运动：只在启用时写，且只写启用的那一部分
+        # （`MotionSpec.to_dict` 保证「写出去 → 读回来」语义不变）。
+        if self.motion is not None and self.motion.enabled:
+            payload['motion'] = self.motion.to_dict()
         # 单页写 `sheet`（字符串）、多页写 `sheets`（数组）：
         # 单页是绝大多数包的形态，不该因为引擎支持多页就变啰嗦。
         if len(self.sheets) > 1:
@@ -885,6 +1012,8 @@ class ResolvedVariant:
     weight: float = DEFAULT_WEIGHT
     #: 这一套动画自己的单帧尺寸；`None` 表示沿用包级 `size`（见 `AnimationVariant.size`）。
     size: dict = None
+    #: 程序化运动（见 `MotionSpec`）。`None` = 不动。
+    motion: 'MotionSpec' = None
 
     @property
     def sheet(self) -> str:
@@ -961,6 +1090,10 @@ class ResolvedVariant:
             payload['sheet'] = self.sheet
         if self.size:
             payload['size'] = dict(self.size)
+        # 程序化运动：运行期定义必须带上它——前端**只读运行期定义**，
+        # 读不到就不会动。而「桌面上不动、面板里动」正是最难查的一类偏差。
+        if self.motion is not None and self.motion.enabled:
+            payload['motion'] = self.motion.to_dict()
         return payload
 
 
@@ -1071,6 +1204,13 @@ class StillImage:
     #: 这个问题只有「标准图像」与「逐动作尺寸」两个功能**同时存在**时才出现，
     #: 因此两条分支各自都测不出来，是合并时才发现并补上的。
     size: dict = None
+    #: **程序化运动**：标准图像要**继承 idle 的运动**（见下面 `resolve_still` 的说明）。
+    #:
+    #: 为什么标准图像也要动：默认的 idle 模式是「平时静止 + 隔一段随机播一遍」，
+    #: 也就是说宠物**大部分时间显示的就是标准图像**。如果标准图像不动，
+    #: 那么「呼吸」这个特性在绝大多数时间里根本看不见——宠物看起来仍是死的。
+    #: 标准图像按定义就是「idle 那个姿势的定格」，因此它理应和 idle 一起呼吸。
+    motion: 'MotionSpec' = None
 
     @property
     def grid(self) -> tuple:
@@ -1210,6 +1350,9 @@ class PetPack:
                             # 每套动画可以各自不同尺寸（横构图 / 竖构图共存），
                             # 前端换套播时几何要跟着换，因此必须逐套透传。
                             size=dict(variant.size) if variant.size else None,
+                            # 程序化运动也逐套透传：多套动画可以一套呼吸、
+                            # 另一套不动（例如「清醒的 idle」与「睡着的 idle」）。
+                            motion=variant.motion,
                         )
                         for variant in variants
                     ],
@@ -1254,6 +1397,9 @@ class PetPack:
                 sheets=[still.sheet], frames=still.frames, fps=1, loop=False,
                 layout=still.layout, cols=still_cols, rows=still_rows,
                 size=dict(still.size) if still.size else None,
+                # 静止画面也要动（见 `StillImage.motion`）：默认 idle 模式下
+                # 宠物大部分时间显示的就是它。
+                motion=still.motion,
             )],
         )
 
@@ -1283,6 +1429,23 @@ class PetPack:
         「逐动作尺寸」这个特性要解决的同一个问题。
         """
         still = self.still
+        # 标准图像的**程序化运动**统一继承 `idle` 主变体——**两条分支都一样**。
+        #
+        # 为什么不看「这条 still 是从哪张图来的」：呼吸是「这个形象在待机时
+        # 怎么动」的属性，而不是「这张图从哪来」的属性。作者声明
+        # `still: {sheet: "sleep.png"}` 时，他要的是「静止时显示睡姿」，
+        # 而不是「静止时不要呼吸」——而睡姿呼吸恰恰是自然的。
+        #
+        # 更要紧的是：默认 idle 模式下宠物**大部分时间显示标准图像**，
+        # 标准图像不继承运动的话，这个特性几乎永远看不见。
+        idle_motion = None
+        try:
+            idle_resolved = self.resolve('idle')
+            if idle_resolved.kind == KIND_ANIMATED and idle_resolved.variants:
+                idle_motion = idle_resolved.variants[0].motion
+        except Exception:  # noqa: BLE001 - 取不到就不动，不该让标准图像解析失败
+            idle_motion = None
+
         if still is not None and still.sheet:
             size = dict(still.size) if still.size else self._size_for_sheet(still.sheet)
             return StillImage(
@@ -1295,6 +1458,7 @@ class PetPack:
                 declared=True,
                 source=STILL_ACTION,
                 size=size,
+                motion=idle_motion,
             )
 
         # 回落：idle 的主变体首帧
@@ -1317,6 +1481,7 @@ class PetPack:
                 # idle 自己声明了 `size` 时（少见但合法），标准图像与它同源，
                 # 几何必须一致，否则静止画面与待机动画会互相错位。
                 size=dict(resolved.size) if resolved.size else None,
+                motion=idle_motion,
             )
         return StillImage()
 
@@ -1841,6 +2006,11 @@ def _parse_variant(
         variant.loop = True
         variant.frame_ms = []
         variant.size = _parse_variant_size(raw_value.get('size'), where)
+        # 动图容器**可以**呼吸（那是 sprite 上的 CSS 变换，与「谁在播」无关），
+        # 但不能眨眼（没有可跳的帧）。
+        variant.motion = _parse_motion(
+            raw_value.get('motion'), where, frames=variant.frames, animated=True,
+        )
         if with_weight:
             variant.weight = _read_weight(raw_value, 'weight')
         return variant
@@ -1848,6 +2018,9 @@ def _parse_variant(
     variant.fps = _read_fps(raw_value, 'fps', 8)
     variant.loop = _read_bool(raw_value, 'loop', action not in ONE_SHOT_ACTIONS)
     variant.frame_ms = _read_frame_ms(raw_value, 'frameMs', variant.frames)
+    variant.motion = _parse_motion(
+        raw_value.get('motion'), where, frames=variant.frames, animated=False,
+    )
 
     # 容量校验：网格必须真的装得下**全部**帧，否则末尾那些帧无处可放。
     #
@@ -2070,6 +2243,167 @@ def _parse_layout(raw_value: dict, *, where: str, frames: int) -> tuple:
                  f'或把 frames 改成 {capacity} 以内的值。',
         )
     return LAYOUT_GRID, grid_cols, grid_rows
+
+
+def _read_motion_number(raw_value, key: str, low: float, high: float, *,
+                        where: str, field: str, unit: str = '') -> float:
+    """读一个带区间的运动参数，越界**报错**并说明合法范围。
+
+    为什么不让它静默取默认值：作者写了 `amplitude: 0.5`（想「明显一点」）
+    而插件悄悄按 0.08 处理，他只会看到「我调了没反应」——
+    而这类问题最难查。报错并给出区间，他一眼就知道该怎么改。
+    """
+    if key not in raw_value:
+        raise _field_error(
+            f'{where}.{field}.{key}', '缺少这个参数',
+            hint=f'{field} 需要 {key}（{unit or "数值"}，合法范围 {low} ~ {high}）。',
+        )
+    raw = raw_value.get(key)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise _field_error(
+            f'{where}.{field}.{key}', f'需要数字，实际是 {type(raw).__name__}',
+            hint=f'例如 {key}: {(low + high) / 2:g}。',
+        )
+    value = float(raw)
+    if not (low <= value <= high):
+        raise _field_error(
+            f'{where}.{field}.{key}', f'{value:g} 超出合法范围 {low:g} ~ {high:g}',
+            hint=(
+                '幅度过大会变成「拉伸」而不是「呼吸」，写实素材的边缘还会被拉糊。'
+                if key == 'amplitude' else
+                '超出这个区间的数值几乎一定是填错了（单位是毫秒）。'
+            ),
+        )
+    return value
+
+
+def _read_motion_frames(raw_value, *, where: str, field: str, frames: int) -> list:
+    """读眨眼的帧号列表，并校验**每一帧都真的存在**。
+
+    不校验的后果：作者写了 `frames: [4, 5]` 而这条动画只有 4 帧（0..3），
+    前端跳到不存在的帧 → 背景位移落到 sheet 之外 → 眨眼时宠物**凭空消失**
+    一瞬间。这属于「偶发、一闪而过」的故障，最难截图复现。
+    """
+    raw = raw_value.get('frames')
+    if raw is None:
+        raise _field_error(
+            f'{where}.{field}.frames', '缺少这个参数',
+            hint='写这一条 sheet 里用作眨眼的帧号，例如 "frames": [2, 3]。',
+        )
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise _field_error(
+            f'{where}.{field}.frames', '需要非空的帧号数组',
+            hint='例如 "frames": [2, 3]。',
+        )
+    out = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise _field_error(
+                f'{where}.{field}.frames', f'帧号必须是整数，实际是 {item!r}',
+                hint='帧号从 0 开始。',
+            )
+        if not (0 <= item < frames):
+            raise _field_error(
+                f'{where}.{field}.frames', f'第 {item} 帧不存在（这条动画只有 {frames} 帧，0..{frames - 1}）',
+                hint='眨眼用的是**同一张 sheet** 里的帧，因此帧号必须在 frames 范围内。',
+            )
+        out.append(item)
+    return out
+
+
+def _parse_motion(raw_value, where: str, *, frames: int, animated: bool) -> 'MotionSpec':
+    """解析 `motion` 块。缺失时返回 `None`（表示「不动」）。
+
+    ⚠️ **未知键一律报错**。解析器对动画规格里的未知键是**静默忽略**的
+    （历史行为），于是 `"amplitdue": 0.02` 这种拼写错误会静默不生效——
+    作者只会看到「我写了呼吸但它不动」，而这正是本项目最想避免的一类问题。
+    因此这里对 `motion` 内部的键**逐个白名单校验**。
+    """
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict):
+        raise _field_error(
+            f'{where}.motion', '需要对象',
+            hint='例如 "motion": { "breathe": { "amplitude": 0.02, "periodMs": 3200 } }。',
+        )
+
+    unknown = sorted(set(raw_value) - set(MOTION_KINDS))
+    if unknown:
+        raise _field_error(
+            f'{where}.motion.{unknown[0]}', '不认识这个运动类型',
+            hint=f'目前支持 {"、".join(MOTION_KINDS)}。'
+                 f'（这里对未知键报错而不是忽略——拼错了却静默不生效最难查。）',
+        )
+
+    spec = MotionSpec()
+
+    breathe = raw_value.get(MOTION_BREATHE)
+    if breathe is not None:
+        if not isinstance(breathe, dict):
+            raise _field_error(f'{where}.motion.breathe', '需要对象',
+                               hint='例如 { "amplitude": 0.02, "periodMs": 3200 }。')
+        bad = sorted(set(breathe) - {'amplitude', 'periodMs'})
+        if bad:
+            raise _field_error(
+                f'{where}.motion.breathe.{bad[0]}', '不认识这个参数',
+                hint='breathe 只接受 amplitude（幅度）与 periodMs（周期，毫秒）。',
+            )
+        spec.amplitude = _read_motion_number(
+            breathe, 'amplitude', *BREATHE_AMPLITUDE_RANGE,
+            where=where, field='motion.breathe', unit='缩放比例',
+        )
+        period = _read_motion_number(
+            breathe, 'periodMs', *BREATHE_PERIOD_RANGE,
+            where=where, field='motion.breathe', unit='毫秒',
+        )
+        spec.period_ms = int(round(period))
+
+    blink = raw_value.get(MOTION_BLINK)
+    if blink is not None:
+        if not isinstance(blink, dict):
+            raise _field_error(f'{where}.motion.blink', '需要对象',
+                               hint='例如 { "frames": [2, 3], "everyMs": [3000, 7000] }。')
+        bad = sorted(set(blink) - {'frames', 'everyMs', 'durationMs'})
+        if bad:
+            raise _field_error(
+                f'{where}.motion.blink.{bad[0]}', '不认识这个参数',
+                hint='blink 只接受 frames（用哪几帧）、everyMs（间隔区间）、durationMs（眨多久）。',
+            )
+        if animated:
+            # 动图容器没有「第 n 帧」可跳——整张图是浏览器在播。
+            raise _field_error(
+                f'{where}.motion.blink', '动图容器不能眨眼',
+                hint='动图由浏览器播放，插件无法跳到「第 n 帧」。'
+                     '要眨眼请改用帧序列（spritesheet）。',
+            )
+        spec.blink_frames = _read_motion_frames(blink, where=where, field='motion.blink', frames=frames)
+        every = blink.get('everyMs')
+        if (not isinstance(every, (list, tuple)) or len(every) != 2
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in every)):
+            raise _field_error(
+                f'{where}.motion.blink.everyMs', '需要 [最短, 最长] 两个毫秒数',
+                hint='例如 "everyMs": [3000, 7000]。',
+            )
+        low, high = float(every[0]), float(every[1])
+        if low > high:
+            raise _field_error(
+                f'{where}.motion.blink.everyMs', f'最短间隔（{low:g}）大于最长间隔（{high:g}）',
+                hint='写成 [最短, 最长]，例如 [3000, 7000]。',
+            )
+        for value in (low, high):
+            if not (BLINK_INTERVAL_RANGE[0] <= value <= BLINK_INTERVAL_RANGE[1]):
+                raise _field_error(
+                    f'{where}.motion.blink.everyMs',
+                    f'{value:g} 超出合法范围 {BLINK_INTERVAL_RANGE[0]} ~ {BLINK_INTERVAL_RANGE[1]}',
+                    hint='间隔是毫秒；比 300ms 更密就是「抽搐」，比 60s 更疏等于不眨。',
+                )
+        spec.blink_every_ms = [int(round(low)), int(round(high))]
+        spec.blink_duration_ms = int(round(_read_motion_number(
+            blink, 'durationMs', *BLINK_DURATION_RANGE,
+            where=where, field='motion.blink', unit='毫秒',
+        )))
+
+    return spec if spec.enabled else None
 
 
 def _parse_animated_layout(raw_value: dict, *, where: str, frames: int) -> tuple:

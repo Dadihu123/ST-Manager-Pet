@@ -10,7 +10,14 @@
  * 因此这里拿到的每个动作都已经是「最终结论 + 一句解释」。
  */
 
-import { DEFAULT_SCHEDULE_MS, frameGrid, frameSizeOf } from './animation.js';
+import {
+  DEFAULT_SCHEDULE_MS,
+  frameGrid,
+  frameSizeOf,
+  motionBlinks,
+  motionBreathes,
+  normalizeMotion,
+} from './animation.js';
 import { createAnimationPlayer, totalDuration } from './preview.js';
 
 const ACTION_LABELS = {
@@ -693,6 +700,10 @@ export function createSettingsPanel({
       cols: entry.cols,
       rows: entry.rows,
       frameMs: entry.frameMs || [],
+      // 程序化运动也要兜底带上：漏了的表现是「桌面在呼吸、面板里不动」
+      // ——而面板正是用户判断效果的地方。
+      motion: entry.motion,
+      motionOrigin: entry.motionOrigin,
     };
     return Object.assign({}, base, {
       size: frameSizeOf(base, entry, detail && detail.size),
@@ -1736,6 +1747,27 @@ export function createSettingsPanel({
           warning.message,
         ));
       }
+      // 程序化运动：说明这个动作为什么「一直在动」。
+      //
+      // 不说的话用户会以为「帧数写错了」——它明明是 1 帧却在动。
+      // ⚠️ 必须用**规范化后**的形状（见 `describeEntry` 的同一条说明）：
+      // `spec.motion` 是原始形状，直接读 `.amplitude` 恒为 undefined。
+      const motion = normalizeMotion(spec);
+      if (motionBreathes(motion) || motionBlinks(motion)) {
+        const bits = [];
+        if (motionBreathes(motion)) {
+          bits.push(`呼吸 ±${(motion.amplitude * 100).toFixed(1)}% / ${(motion.periodMs / 1000).toFixed(1)}s`);
+        }
+        if (motionBlinks(motion)) {
+          bits.push(`眨眼（第 ${motion.blinkFrames.join('、')} 帧，每 `
+            + `${(motion.blinkEveryMs[0] / 1000).toFixed(1)}–${(motion.blinkEveryMs[1] / 1000).toFixed(1)}s 一次）`);
+        }
+        side.appendChild(el(
+          'div',
+          'pet-preview-meta is-motion',
+          `程序化运动：${bits.join('；')}（不占额外帧，由合成器驱动）`,
+        ));
+      }
       if (entry && entry.kind !== 'animated') {
         side.appendChild(el('div', 'pet-preview-meta', entry.note || '这个动作没有图'));
       }
@@ -2551,6 +2583,15 @@ export function createSettingsPanel({
       return count > 1 ? `动图容器 · ${count} 帧 · 浏览器播放` : '动图容器';
     }
     const frames = Number(entry.frames) || 1;
+    // 有程序化运动时**不能**说「单帧（静态显示）」——它明明在动，
+    // 而「1 帧却在动」正是最容易让人以为包坏了的地方。
+    // ⚠️ 必须用**规范化后**的形状：`entry.motion` 是后端下发的原始形状
+    // （`{breathe: {amplitude, periodMs}}`），直接读 `.amplitude` 恒为 undefined。
+    const motion = normalizeMotion(entry);
+    const moving = motionBreathes(motion) || motionBlinks(motion);
+    if (frames <= 1 && moving) {
+      return '1 帧 + 程序化运动（呼吸/眨眼）';
+    }
     if (frames <= 1) return '单帧（静态显示）';
     const suffix = required ? '' : '（可选）';
     // 网格排布时把形状写出来：`frames` 与网格容量不一致是合法的
