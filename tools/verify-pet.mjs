@@ -356,6 +356,29 @@ async function main() {
       `action=${fallingAction}，y: ${yAtStart.toFixed(0)} → ${midFall.toFixed(0)}`,
     );
 
+    // ------------------------------------------------ ⑪b 空中不串其他动画
+    //
+    // 用户报障：「拖拽和坠落动画有时会被其他动画打断，然后在空中播放其他动画，
+    // 例如左右移动，例如闲置，甚至还出现了在空中多个动画交替出现的情况」。
+    //
+    // 这里在下落途中**高频采样**动作名：只要出现过任何非 fall 的动作，
+    // 就说明空中被别的动画抢走了。采样要够密——串动作往往只持续一两帧。
+    const airSamples = await page.evaluate(`(async () => {
+      const seen = [];
+      const start = performance.now();
+      while (performance.now() - start < 900) {
+        seen.push(window.__pet.root().dataset.petAction);
+        await new Promise((r) => requestAnimationFrame(r));
+      }
+      return { seen: [...new Set(seen)], count: seen.length };
+    })()`);
+    const airClean = airSamples.seen.every((name) => name === 'fall' || name === 'land' || name === 'idle');
+    record(
+      '⑪b 下坠途中不串其他动画（只有 fall，落地后才是 land / idle）',
+      airClean && airSamples.seen.includes('fall'),
+      `采样 ${airSamples.count} 次，出现的动作: ${airSamples.seen.join(',')}`,
+    );
+
     // ------------------------------------------------ ⑫ 最终停在地面
     await sleep(2500);
     const restInfo = await page.evaluate(`(() => {
@@ -366,6 +389,129 @@ async function main() {
       '⑫ 最终落在地面附近（不会飞到屏幕外）',
       Math.abs(restInfo.bottom - restInfo.viewportH) < 30,
       JSON.stringify(restInfo),
+    );
+    // 落地之后必须回到 idle。
+    //
+    // ⚠️ 用户报障的衍生现象：「如果不是以坠落动画落得地，那么就不会出现落地动画」。
+    // 根因是落地判定只看「冲击够不够重」（>60px/s），轻放就永远出不了 fall——
+    // 表现是**贴着地面一直播下落动画**，而且 rAF 永远停不下来（省电失效）。
+    // 所以这里不能只查位置，还要查它真的收尾了。
+    record(
+      '⑫b 落地后回到 idle（轻放也能收尾，不会一直播下落）',
+      restInfo.action === 'idle',
+      `落点 bottom=${restInfo.bottom.toFixed(1)} / 视口 ${restInfo.viewportH}，action=${restInfo.action}`,
+    );
+
+    // ------------------------------------------------ ⑫c 贴地轻放也要收尾
+    //
+    // 这是用户报障衍生现象的**精确复现**：把宠物拖到离地面很近的地方松手。
+    //
+    // 旧实现的落地判定要求冲击 > 60px/s。从这么低的地方放下，落地速度不足，
+    // 于是 `justLanded` 为假、状态机永远停在 `fall`——既没有落地动作，
+    // rAF 也永远停不下来（`fall` 是「必须继续跑」的状态）。
+    // 现在改用「离地→触地」的状态翻转（`touchedDown`）判落地。
+    const lowDrop = await page.evaluate(`(async () => {
+      // 先确保它站在地上
+      await new Promise((r) => setTimeout(r, 300));
+      const before = window.__pet.pos();
+      return {
+        cx: Math.round(before.x + before.w / 2),
+        groundY: Math.round(before.y + before.h / 2),
+      };
+    })()`);
+    // 用真实指针事件把它拎到贴近地面处再松手
+    await page.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed',
+      x: lowDrop.cx,
+      y: lowDrop.groundY,
+      button: 'left',
+      buttons: 1,
+      clickCount: 1,
+    });
+    await sleep(60);
+    // 移动到离地面只有十几像素的地方（落地冲击必然很小）
+    const hoverY = Math.round(lowDrop.groundY - 14);
+    await page.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved', x: lowDrop.cx + 60, y: hoverY, button: 'left', buttons: 1,
+    });
+    await sleep(60);
+    await page.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: lowDrop.cx + 60,
+      y: hoverY,
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+    // 给足时间：下坠 + 落地动作 + 收尾
+    await sleep(2200);
+    const lowDropResult = await page.evaluate(`(() => {
+      const pos = window.__pet.pos();
+      return {
+        action: window.__pet.root().dataset.petAction,
+        bottom: pos.y + pos.h,
+        viewportH: window.innerHeight,
+      };
+    })()`);
+    record(
+      '⑫c 贴着地面轻放也能落地收尾（冲击很小也不卡在 fall）',
+      lowDropResult.action === 'idle'
+        && Math.abs(lowDropResult.bottom - lowDropResult.viewportH) < 30,
+      `action=${lowDropResult.action}，bottom=${lowDropResult.bottom.toFixed(1)} / 视口 ${lowDropResult.viewportH}`,
+    );
+
+    // ------------------------------------------------ ⑫d 落地动作真的播了
+    //
+    // 用户报障：「如果不是以坠落动画落得地，那么就不会出现落地动画」
+    // （他自己说这算衍生现象）。根因修掉之后，**任何**下坠结束都要播 land——
+    // 而且不能只靠 `justLanded`（轻放时冲击不足，它不会置位）。
+    //
+    // ⚠️ 必须**重新读一次当前位置**再抓：上一段把它挪到了别处，
+    // 复用旧坐标会按在空气上（按下不命中宠物 → 根本没进拖拽态），
+    // 于是这条断言会莫名其妙地失败，而失败原因看起来像「落地动作没播」。
+    // 这是验收脚本自身最容易踩的坑。
+    const landStart = await page.evaluate(`(async () => {
+      await new Promise((r) => setTimeout(r, 400));
+      const pos = window.__pet.pos();
+      return {
+        cx: Math.round(pos.x + pos.w / 2),
+        cy: Math.round(pos.y + pos.h / 2),
+      };
+    })()`);
+    await page.send('Input.dispatchMouseEvent', {
+      type: 'mousePressed', x: landStart.cx, y: landStart.cy, button: 'left', buttons: 1, clickCount: 1,
+    });
+    await sleep(60);
+    // 拎到高处（保证有足够的下坠距离）
+    await page.send('Input.dispatchMouseEvent', {
+      type: 'mouseMoved', x: landStart.cx, y: Math.max(60, landStart.cy - 260), button: 'left', buttons: 1,
+    });
+    await sleep(60);
+    // 边落边采样：land 只播约 320ms，等落地后再读往往已经回 idle 了
+    const landPromise = page.evaluate(`(async () => {
+      const seen = [];
+      const start = performance.now();
+      while (performance.now() - start < 3000) {
+        const action = window.__pet.root().dataset.petAction;
+        if (seen[seen.length - 1] !== action) seen.push(action);
+        if (seen.includes('land')) break;
+        await new Promise((r) => requestAnimationFrame(r));
+      }
+      return seen;
+    })()`);
+    await page.send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased',
+      x: landStart.cx,
+      y: Math.max(60, landStart.cy - 260),
+      button: 'left',
+      buttons: 0,
+      clickCount: 1,
+    });
+    const landSeen = await landPromise;
+    record(
+      '⑫d 下坠结束时播了落地动作（land 真的出现，不是直接跳 idle）',
+      landSeen.includes('land'),
+      `观察到的动作序列: ${landSeen.join(' → ')}`,
     );
 
     // ------------------------------------------------ ⑬ 不推挤内容区

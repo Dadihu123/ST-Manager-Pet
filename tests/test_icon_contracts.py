@@ -270,6 +270,12 @@ def test_card_thumbnail_shows_only_first_frame():
     正确做法（两条都要满足）：
     1. `background-size: (方框宽 × 帧数) auto` + 左对齐；
     2. **逐卡片**用**它自己**的帧数（来自列表接口的 `pet.thumb`）。
+
+    ⚠️ 第三次踩的是**同一个成因的另一个位置**：动作网格的小图也写了那套
+    `data-` 契约，但几何函数的选择器里没有它 —— 于是整个动作区只剩文字。
+    因此这里不再钉死「选择器字面量恰好是 `.pet-card-thumb`」，
+    而是钉「它遍历的是**多个**框」+「动作网格也在覆盖范围内」。
+    钉字面量会让「把选择器扩成两个类名」这种**正确的**修改被判成失败。
     """
     with open(os.path.join(REPO_ROOT, 'frontend', 'panel.js'), encoding='utf-8') as handle:
         source = handle.read()
@@ -279,9 +285,15 @@ def test_card_thumbnail_shows_only_first_frame():
     assert 'boxWidth * frames' in source, '缩略图宽度没有乘以帧数'
     # 必须左对齐（居中会露出第 1、2 帧）
     assert "'left top'" in source, '缩略图应左对齐，否则会露出后续帧'
-    # ★ 必须逐卡片算：不能只取第一张
-    assert "querySelectorAll('.pet-card-thumb')" in source, (
-        '缩略图几何必须遍历**所有**卡片 —— 只算第一张会让其余形象没有缩略图'
+    # ★ 必须遍历**所有**框：不能只取第一个（`querySelector` 单数）
+    geometry = source[source.index('function applyThumbGeometry'):]
+    geometry = geometry[:geometry.index('\n  }')]
+    assert 'querySelectorAll' in geometry, (
+        '缩略图几何必须遍历**所有**框 —— 只算第一个会让其余形象没有缩略图'
+    )
+    assert '.pet-card-thumb' in geometry, '卡片缩略图要在覆盖范围内'
+    assert '.pet-action-preview' in geometry, (
+        '动作网格的小图也要在覆盖范围内 —— 漏掉它会让整个动作区只剩文字'
     )
     # 不能再对 spritesheet 用 contain 作为多帧的默认路径
     thumb_section = source[source.index('const thumb = el('):]

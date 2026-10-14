@@ -10,7 +10,7 @@
  * 因此这里拿到的每个动作都已经是「最终结论 + 一句解释」。
  */
 
-import { DEFAULT_SCHEDULE_MS } from './animation.js';
+import { DEFAULT_SCHEDULE_MS, frameSizeOf } from './animation.js';
 import { createAnimationPlayer, totalDuration } from './preview.js';
 
 const ACTION_LABELS = {
@@ -228,6 +228,199 @@ export function createSettingsPanel({
     return node;
   }
 
+  /**
+   * 把滑块的**已选进度**写进 CSS 变量（`plugin.css` 用它画色带）。
+   *
+   * 宿主预设编辑器用的是同一个手法（`--preset-editor-range-progress`）：
+   * 原生 `input[type=range]` 没有「已选比例」这个可样式化的部分，
+   * 只能由 JS 算出来交给 `linear-gradient`。
+   *
+   * 每次 `input` 都要调（拖动的每一帧），因此这里刻意写得极简：
+   * 一次 `Number`、一次夹取、一次字符串写入，不建对象、不查 DOM。
+   */
+  function syncSliderProgress(slider) {
+    if (!slider) return;
+    const min = Number(slider.min) || 0;
+    const max = Number(slider.max) || 0;
+    const value = Number(slider.value);
+    const span = max - min;
+    // 区间非法（max <= min）时给 0 而不是 NaN：NaN% 会让整条渐变失效，
+    // 表现是滑块变成一片透明（看起来像「坏了」）
+    const percent = span > 0 && Number.isFinite(value)
+      ? Math.round(Math.min(100, Math.max(0, ((value - min) / span) * 100)) * 100) / 100
+      : 0;
+    slider.style.setProperty('--pet-slider-progress', `${percent}%`);
+  }
+
+  /**
+   * 给一个**已存在的**滑块配一个可直接输入的数字框。
+   *
+   * 为什么单独拆出来而不是全走 `createSliderRow`：触发时间那两个滑块是
+   * 「一个读数、两个滑块」（下界 / 上界），不符合「一滑块一数值」的形状；
+   * 而且它们的接线方式被 `tests/test_frontend_wiring.py` 的
+   * 「松手才提交」契约钉住（`input` 只更新读数、`change` 才发请求），
+   * 那条契约必须原样保留。这里只补上「数字可输入」这一项能力。
+   *
+   * 夹取范围交给调用方（`clamp`），因为两个滑块的合法区间是**行为自己的**
+   * 默认区间，而不是全局的 200~3600000。
+   *
+   * @param {HTMLElement} slider 已接好线的 range
+   * @param {object} options
+   * @param {string} options.label 无障碍标签
+   * @param {function} options.clamp `(raw) => number` 夹取 + 按步长对齐
+   * @param {function} options.onInput `(value)` 实时回调（只更新读数）
+   * @param {function} options.onCommit `(value)` 确认回调（提交后端 / 写草稿）
+   * @param {function} [options.format] `(value) => string`
+   * @returns {{input: HTMLElement, push: function}} 数字框本身，以及
+   *   「夹取 → 同步两边 → 通知调用方」这个动作。
+   *
+   *   为什么要把 `push` 交出去：**滑块自己也要用它**。
+   *   重构时很容易只给数字框接上回调，而把滑块的 `input` / `change` 忘掉
+   *   ——表现是「拖滑块完全没反应、数字框却好用」（真实发生过，
+   *   被 `tools/verify-upload.mjs` 的 ⑲ 抓出来）。两边共用同一份逻辑，
+   *   就不会出现「只有一边能用」。
+   */
+  function attachNumberBox(slider, options) {
+    const clamp = options.clamp;
+    const format = typeof options.format === 'function'
+      ? options.format
+      : (value) => String(value);
+
+    const number = el('input', 'pet-slider-number');
+    number.type = 'number';
+    number.min = slider.min;
+    number.max = slider.max;
+    number.step = slider.step;
+    number.value = format(clamp(slider.value));
+    number.setAttribute('aria-label', `${options.label}（可直接输入）`);
+    number.dataset.marqueeIgnore = 'true';
+
+    /** 把某个值同步到滑块 + 数字框 + 进度条，并按需通知调用方。 */
+    const push = (raw, commit) => {
+      const value = clamp(raw);
+      slider.value = String(value);
+      number.value = format(value);
+      syncSliderProgress(slider);
+      if (options.onInput) options.onInput(value);
+      if (commit && options.onCommit) options.onCommit(value);
+      return value;
+    };
+
+    // 输入中只做**视觉回显**，不夹取数字框自己的显示值。
+    // 每次按键都夹取的话，用户想输 `10000` 时打完 `1` 就被夹成下限，
+    // 后面几位根本输不进去（真实踩过的输入框体验问题）。
+    number.addEventListener('input', () => {
+      const value = Number(number.value);
+      if (!Number.isFinite(value)) return;
+      const min = Number(slider.min);
+      const max = Number(slider.max);
+      const bounded = Math.min(Math.max(value, min), max);
+      slider.value = String(bounded);
+      syncSliderProgress(slider);
+      if (options.onInput) options.onInput(bounded);
+    });
+    // 失焦 / 回车才夹取并提交，同时把显示值规整成真正生效的那个数——
+    // 否则用户输入 999（超上限）会看到「显示 999、实际 3600000」这种错位
+    number.addEventListener('change', () => push(number.value, true));
+    number.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        push(number.value, true);
+        number.blur();
+      }
+    });
+    return { input: number, push };
+  }
+
+  /**
+   * 造一个「滑块 + 可直接输入的数字框」。
+   *
+   * 用户要求：「目前的数字调节不够方便，通过拖拽有时难以精确调整，
+   * 请同步支持直接选择数字部分进行输入修改，只要限制好输入数据的范围即可」。
+   *
+   * 设计要点：数字框与滑块共享**同一个夹取逻辑**（按步长对齐 + 夹到区间），
+   * 因此从哪边改都得到同一个合法值。两边各写一份夹取必然会在某次改动后不一致。
+   *
+   * @param {object} options
+   * @param {number} options.min 下限
+   * @param {number} options.max 上限
+   * @param {number} options.step 步长
+   * @param {number} options.value 初值
+   * @param {string} options.label 无障碍标签
+   * @param {string} [options.className] 给滑块的额外类
+   * @param {function} options.onInput `(value)` 实时回调（只更新读数）
+   * @param {function} [options.onCommit] `(value)` 确认回调（提交后端）
+   * @param {function} [options.format] `(value) => string`
+   * @returns {{slider: HTMLElement, number: HTMLElement, row: HTMLElement, set: function}}
+   */
+  function createSliderRow(options) {
+    const min = Number(options.min);
+    const max = Number(options.max);
+    const step = Number(options.step) || 1;
+
+    /**
+     * 夹到区间内并按步长对齐。
+     *
+     * 对齐不能省：数字框允许任意输入（`step` 只约束原生 spinner 与校验），
+     * 不对齐就会出现 `1.2300000000000002` 这种值，而后端会把它原样存下来。
+     */
+    const clamp = (raw) => {
+      const number = Number(raw);
+      const base = Number.isFinite(number) ? number : min;
+      const bounded = Math.min(Math.max(base, min), max);
+      const snapped = Math.round(bounded / step) * step;
+      // 浮点乘法会留尾巴（0.05 × 23 = 1.1500000000000001），
+      // 按步长的小数位数取整后再夹一次
+      const digits = (String(step).split('.')[1] || '').length;
+      const rounded = Number(snapped.toFixed(digits));
+      return Math.min(Math.max(rounded, min), max);
+    };
+
+    const slider = el('input', `pet-slider ${options.className || ''}`.trim());
+    slider.type = 'range';
+    slider.min = String(min);
+    slider.max = String(max);
+    slider.step = String(step);
+    slider.value = String(clamp(options.value));
+    slider.setAttribute('aria-label', options.label);
+
+    const box = attachNumberBox(slider, {
+      label: options.label,
+      clamp,
+      format: options.format,
+      onInput: options.onInput,
+      onCommit: options.onCommit,
+    });
+
+    // ⚠️ 滑块**自己**的回调也要接上。
+    //
+    // 只给数字框接线、把滑块的 `input`/`change` 忘掉，表现是
+    // 「拖滑块完全没反应，数字框却好用」——两边共用 `box.push`，
+    // 就不会出现只有一边能用的情况。
+    // 拖动时只回显（`push(..., false)`），松手才提交（`push(..., true)`），
+    // 否则一次拖动会打出几十个请求。
+    slider.addEventListener('input', () => box.push(slider.value, false));
+    slider.addEventListener('change', () => box.push(slider.value, true));
+
+    const row = el('div', 'pet-slider-row');
+    row.appendChild(slider);
+    row.appendChild(box.input);
+    syncSliderProgress(slider);
+
+    return {
+      slider,
+      number: box.input,
+      row,
+      /** 外部改了值（例如「恢复默认」）时就地刷新，不重建面板。 */
+      set(value) {
+        const next = clamp(value);
+        slider.value = String(next);
+        box.input.value = (options.format || String)(next);
+        syncSliderProgress(slider);
+      },
+    };
+  }
+
   function setNotice(kind, message) {
     notice = message ? { kind, message } : null;
     render();
@@ -314,13 +507,14 @@ export function createSettingsPanel({
   }
 
   /**
-   * 把「只显示第 0 帧」的几何写进**每一张**形象卡片的缩略图。
+   * 把「只显示第 0 帧」的几何写进**每一个**小预览框
+   * （形象卡片的缩略图 **与** 动作网格的小图）。
    *
-   * 关键点：帧图是**整条 spritesheet**，缩略图方框只有 40px。
+   * 关键点：帧图是**整条 spritesheet**，方框只有 40 / 56px。
    * 要让第 0 帧刚好填满方框，背景图必须按「单帧宽 × 帧数」放大，
    * 并且**左对齐**（`position 0 0`）——居中会把第 1、2 帧露进来。
    *
-   * ⚠️ **必须逐卡片算，且用每张卡片自己的帧数。** 真实踩过的 bug：
+   * ⚠️ **必须逐个框算，且用每个框自己的帧数。** 真实踩过的 bug：
    * 老实现用 `root.querySelector('.pet-card-thumb')` 只取**第一张**卡片，
    * 再用 `detail`（**当前选中**那个形象）的帧数去设它的几何。
    * 两个后果叠加：
@@ -333,10 +527,23 @@ export function createSettingsPanel({
    * 实测症状正是用户报的那个：小卡（列表第一张）有图，小满没有。
    * 现在帧数从**列表接口**拿（`list_pets()` 已经把每个形象的帧信息带回来了），
    * 因此每张卡片都能独立算对，也不依赖「当前选中了谁」。
+   *
+   * ⚠️ 动作网格的小图**也必须在这里一起处理**。原实现只查
+   * `.pet-card-thumb`，而 `renderActionTile()` 同样写了 `data-frames` /
+   * `data-layout` / `data-has-image`（注释还写着「按帧数放大 + 左对齐」），
+   * 却**没有任何人**去读它们——于是动作网格里的小图停在
+   * `background-size: auto`，只露出整条 spritesheet 左上角那 56×56 的一块
+   * （在 1536×576 的 idle 上正好落在**空白区域**），
+   * 表现为「动作网格里所有预览图都是空白的」（整片格子只有文字）。
+   * 这与上面那个卡片 bug 是**同一个成因**：加了一处预览框，忘了加进选择器。
+   *
+   * 因此这里改成**按 `data-` 契约选择**：任何写了 `data-frames` 的小框都会被
+   * 覆盖，将来再加一处也不会重蹈覆辙。没有 `data-has-image` 的框
+   * （例如「没有可用的图」那张卡）会被跳过，仍走单帧分支。
    */
   function applyThumbGeometry() {
     if (!root) return;
-    const boxes = root.querySelectorAll('.pet-card-thumb');
+    const boxes = root.querySelectorAll('.pet-card-thumb, .pet-action-preview');
     for (const box of boxes) {
       const frames = Math.max(1, Number(box.dataset.frames) || 1);
       const layout = box.dataset.layout === 'vertical' ? 'vertical' : 'horizontal';
@@ -429,17 +636,24 @@ export function createSettingsPanel({
     return list.find((item) => item.action === previewAction) || null;
   }
 
-  /** 当前预览的变体（多套动画时按 `previewVariant` 选）。 */
+  /**
+   * 当前预览的变体（多套动画时按 `previewVariant` 选）。
+   *
+   * 返回值里**必须带上单帧尺寸**：预览框要按真实宽高比把这一帧装进去，
+   * 而躺姿睡觉这类动作是横构图，不知道尺寸就会被压扁（用户报的那个）。
+   * 优先级与桌面宠物完全一致（`animation.js:frameSizeOf`）：
+   * **变体自带 > 动作条目 > 包级**。
+   */
   function previewSpec() {
     const entry = previewEntry();
     if (!entry) return null;
     const variants = entry.variants || [];
-    if (variants.length) {
-      return variants[Math.min(Math.max(0, previewVariant), variants.length - 1)];
-    }
-    if (!entry.url) return null;
+    const pick = variants.length
+      ? variants[Math.min(Math.max(0, previewVariant), variants.length - 1)]
+      : null;
+    if (!pick && !entry.url) return null;
     // 老版本后端只给主变体字段，这里兜底构一个
-    return {
+    const base = pick || {
       url: entry.url,
       frames: entry.frames,
       fps: entry.fps,
@@ -447,6 +661,9 @@ export function createSettingsPanel({
       layout: entry.layout,
       frameMs: entry.frameMs || [],
     };
+    return Object.assign({}, base, {
+      size: frameSizeOf(base, entry, detail && detail.size),
+    });
   }
 
   // ---------------------------------------------------------------- 操作
@@ -885,7 +1102,10 @@ export function createSettingsPanel({
       : `${pet.source === 'user' ? '自定义' : '内置'} · ${pet.animations ? pet.animations.length : 0} 个动作`;
     copy.appendChild(el('div', 'pet-card-meta', meta));
     if (pet.id === activeId) {
-      copy.appendChild(el('div', 'pet-card-meta', '当前使用中'));
+      // 用 `is-current` 上强调色：卡片上「正在用」与「正在看」是两个不同的
+      // 事实，用户报障时正是把两者看混了（详见 plugin.css 里 `.pet-card`
+      // 两种高亮的说明）。这行文字是最直白的那个信号，得让它显眼。
+      copy.appendChild(el('div', 'pet-card-meta is-current', '当前使用中'));
     }
     card.appendChild(copy);
     return card;
@@ -1016,6 +1236,11 @@ export function createSettingsPanel({
     const declared = Number(detail.declaredScale) || 1;
 
     // ---- 大小倍率
+    //
+    // 用 `createSliderRow`：滑块 + 可直接输入的数字框。
+    // 数字框的显示带 `×`（`formatScale`），与读数一致，用户一眼知道单位。
+    // 提交仍然只在 `change`（松手 / 失焦 / 回车）发生——一次拖动打几十个请求
+    // 是不可接受的，而且 `tools/verify-upload.mjs` 依赖这个时序。
     const field = el('div', 'pet-field');
     const labelRow = el('div', 'pet-slider-head');
     labelRow.appendChild(el('span', 'pet-field-label', '大小倍率'));
@@ -1023,31 +1248,40 @@ export function createSettingsPanel({
     labelRow.appendChild(readout);
     field.appendChild(labelRow);
 
-    const slider = el('input', 'pet-slider');
-    slider.type = 'range';
-    slider.min = String(min);
-    slider.max = String(max);
-    slider.step = String(SCALE_STEP);
-    slider.value = String(current);
-    slider.setAttribute('aria-label', '宠物大小倍率');
-    // 拖动时只更新读数（不请求），松手才提交 —— 否则一次拖动会打出几十个请求
-    slider.addEventListener('input', () => {
-      readout.textContent = formatScale(Number(slider.value));
-    });
-    slider.addEventListener('change', () => {
-      updateAppearance({ scale: Number(slider.value) });
-    });
-    field.appendChild(slider);
-
     // 实际像素高度比倍率更直观（用户真正在意的是「屏幕上多大」）
     const base = detail.size || {};
-    const pixels = base.h ? Math.round(base.h * current) : 0;
-    field.appendChild(el(
-      'div',
-      'pet-field-hint',
-      `范围 ${min}× ~ ${max}×；当前约 ${pixels}px 高。`
-      + (declared !== 1 ? `形象包建议 ${formatScale(declared)}。` : ''),
-    ));
+    const buildScaleHint = (value) => {
+      const pixels = base.h ? Math.round(base.h * value) : 0;
+      return `范围 ${min}× ~ ${max}×；当前约 ${pixels}px 高。`
+        + (declared !== 1 ? `形象包建议 ${formatScale(declared)}。` : '');
+    };
+    const hint = el('div', 'pet-field-hint', buildScaleHint(current));
+
+    const scaleRow = createSliderRow({
+      min,
+      max,
+      step: SCALE_STEP,
+      value: current,
+      label: '宠物大小倍率',
+      format: (value) => String(value),
+      onInput: (value) => {
+        readout.textContent = formatScale(value);
+        // 像素高度跟着实时更新（拖动时就能看到「屏幕上多大」）
+        hint.textContent = buildScaleHint(value);
+      },
+      onCommit: (value) => updateAppearance({ scale: value }),
+    });
+    // 保持「面板里第一个 .pet-slider 就是大小倍率」这个既有约定：
+    // `tools/verify-upload.mjs` 用它做缩放验证。
+    scaleRow.slider.classList.add('pet-slider-scale');
+    field.appendChild(scaleRow.row);
+    field.appendChild(hint);
+
+    // 区间两端提示（与宿主预设编辑器一致：最小 / 当前 / 最大）
+    const rangeRow = el('div', 'pet-slider-range');
+    rangeRow.appendChild(el('span', null, `${min}×`));
+    rangeRow.appendChild(el('span', null, `${max}×`));
+    field.appendChild(rangeRow);
 
     const resetRow = el('div', 'pet-panel-toolbar');
     resetRow.appendChild(button('恢复默认大小', 'is-icon', () => {
@@ -1212,6 +1446,11 @@ export function createSettingsPanel({
       // 两个滑块（下界 / 上界）。用两个而不是一个「区间滑块」：
       // 原生 `<input type="range">` 不支持双柄，而自己造一个双柄滑块
       // 要处理键盘可达性、指针捕获与边界交叉——为一个次要设置不值得。
+      //
+      // 每个滑块各自配一个**可直接输入的数字框**（用户要求「通过拖拽有时难以
+      // 精确调整，请同步支持直接选择数字部分进行输入修改」）。数字框与滑块
+      // 一起包进 `.pet-slider-row`，于是窄屏下换行的是「一条」而不是零散控件；
+      // `row.querySelector('[data-schedule-bound=...]')` 照样能找到滑块（后代选择）。
       const row = el('div', 'pet-schedule-row');
       for (const bound of ['min', 'max']) {
         const slider = el('input', 'pet-slider');
@@ -1242,17 +1481,43 @@ export function createSettingsPanel({
         };
         slider.addEventListener('input', live);
         // 松手才提交 —— 否则一次拖动会打出几十个请求
-        slider.addEventListener('change', () => {
+        const commit = () => {
           const low = Number(row.querySelector('[data-schedule-bound="min"]').value);
           const high = Number(row.querySelector('[data-schedule-bound="max"]').value);
           updateSchedule(behavior.key, {
             minIntervalMs: low,
             maxIntervalMs: high,
           });
+        };
+        slider.addEventListener('change', commit);
+
+        // 数字框的夹取范围与滑块**完全一致**（全局区间 + 100ms 步长对齐），
+        // 否则「拖出来的值」与「手输的值」会落在不同的格子上。
+        const low = Number(limits.scheduleMinMs) || SCHEDULE_FALLBACK_MIN_MS;
+        const high = Number(limits.scheduleMaxMs) || SCHEDULE_FALLBACK_MAX_MS;
+        const box = attachNumberBox(slider, {
+          label: `${behavior.label}的${bound === 'min' ? '最短' : '最长'}间隔（毫秒）`,
+          clamp: (raw) => {
+            const number = Number(raw);
+            const base = Number.isFinite(number) ? number : low;
+            const bounded = Math.min(Math.max(base, low), high);
+            return Math.round(bounded / 100) * 100;
+          },
+          // 输入过程中只更新读数（与滑块一致：绝不在这里发请求）
+          onInput: live,
+          onCommit: commit,
         });
-        row.appendChild(slider);
+        const boundRow = el('div', 'pet-slider-row');
+        boundRow.appendChild(slider);
+        boundRow.appendChild(box.input);
+        row.appendChild(boundRow);
       }
       field.appendChild(row);
+      // 区间两端提示（与宿主预设编辑器一致：最小 / 当前 / 最大）
+      const rangeRow = el('div', 'pet-slider-range');
+      rangeRow.appendChild(el('span', null, formatMs(limits.scheduleMinMs)));
+      rangeRow.appendChild(el('span', null, formatMs(limits.scheduleMaxMs)));
+      field.appendChild(rangeRow);
       field.appendChild(el(
         'div',
         'pet-field-hint',
@@ -1386,23 +1651,33 @@ export function createSettingsPanel({
     // ---- 速度倍率（预览用，只影响预览；桌面宠物走宿主表单的「动画速度」）
     const speedRow = el('div', 'pet-slider-head');
     speedRow.appendChild(el('span', 'pet-field-label', '预览速度'));
-    speedRow.appendChild(el('span', 'pet-slider-value', `${formatNumber(previewSpeed)}×`));
+    const speedReadout = el('span', 'pet-slider-value', `${formatNumber(previewSpeed)}×`);
+    speedRow.appendChild(speedReadout);
     side.appendChild(speedRow);
-    const slider = el('input', 'pet-slider');
-    slider.type = 'range';
-    slider.min = String(SPEED_MIN);
-    slider.max = String(SPEED_MAX);
-    slider.step = '0.05';
-    slider.value = String(previewSpeed);
-    slider.setAttribute('aria-label', '动画预览速度');
-    slider.dataset.previewSpeed = 'true';
-    slider.addEventListener('input', () => {
-      previewSpeed = Number(slider.value) || 1;
-      if (player) player.setSpeed(previewSpeed);
-      const readout = side.querySelector('.pet-slider-value');
-      if (readout) readout.textContent = `${formatNumber(previewSpeed)}×`;
+
+    // 预览速度是**纯本地**状态（不落盘），所以这里没有 `onCommit`：
+    // 拖动即生效，数字框回车 / 失焦也走同一个 `onInput`。
+    const speed = createSliderRow({
+      min: SPEED_MIN,
+      max: SPEED_MAX,
+      step: 0.05,
+      value: previewSpeed,
+      label: '动画预览速度',
+      format: (value) => String(value),
+      onInput: (value) => {
+        previewSpeed = value || 1;
+        if (player) player.setSpeed(previewSpeed);
+        speedReadout.textContent = `${formatNumber(previewSpeed)}×`;
+      },
     });
-    side.appendChild(slider);
+    // 既有约定：预览速度滑块带 `data-preview-speed`（`tools/verify-still.mjs` 用它）
+    speed.slider.dataset.previewSpeed = 'true';
+    side.appendChild(speed.row);
+    // 区间两端提示（与宿主预设编辑器一致：最小 / 当前 / 最大）
+    const speedRange = el('div', 'pet-slider-range');
+    speedRange.appendChild(el('span', null, `${SPEED_MIN}×`));
+    speedRange.appendChild(el('span', null, `${SPEED_MAX}×`));
+    side.appendChild(speedRange);
     side.appendChild(el(
       'div',
       'pet-field-hint',
@@ -1513,6 +1788,20 @@ export function createSettingsPanel({
   function formatScale(value) {
     const number = Number(value) || 1;
     return `${Math.round(number * 100) / 100}×`;
+  }
+
+  /**
+   * 把单个毫秒值格式化成给人看的时间（区间提示行用）。
+   *
+   * 与 `formatInterval` 的区别：那个渲染的是「最小~最大」一整段，
+   * 这个只渲染端点。逻辑共用同一套取整规则，免得同一份数据在两处
+   * 显示成「1 秒」和「1.0 秒」两种样子。
+   */
+  function formatMs(value) {
+    const seconds = (Number(value) || 0) / 1000;
+    if (seconds >= 10) return `${Math.round(seconds)} 秒`;
+    if (seconds >= 1) return `${Math.round(seconds * 10) / 10} 秒`;
+    return `${Math.round(seconds * 1000)} 毫秒`;
   }
 
   /**
@@ -1696,18 +1985,20 @@ export function createSettingsPanel({
     scaleHead.appendChild(scaleReadout);
     scaleField.appendChild(scaleHead);
 
-    const scaleSlider = el('input', 'pet-slider');
-    scaleSlider.type = 'range';
-    scaleSlider.min = String(limits.scaleMin || SCALE_MIN);
-    scaleSlider.max = String(limits.scaleMax || SCALE_MAX);
-    scaleSlider.step = String(SCALE_STEP);
-    scaleSlider.value = String(draftScale);
-    scaleSlider.setAttribute('aria-label', '新形象的大小倍率');
-    scaleSlider.addEventListener('input', () => {
-      draftScale = Number(scaleSlider.value);
-      scaleReadout.textContent = formatScale(draftScale);
+    // 草稿值是**纯本地**的（创建时才随表单提交），因此没有 `onCommit`。
+    const scale = createSliderRow({
+      min: limits.scaleMin || SCALE_MIN,
+      max: limits.scaleMax || SCALE_MAX,
+      step: SCALE_STEP,
+      value: draftScale,
+      label: '新形象的大小倍率',
+      format: (value) => String(value),
+      onInput: (value) => {
+        draftScale = value;
+        scaleReadout.textContent = formatScale(draftScale);
+      },
     });
-    scaleField.appendChild(scaleSlider);
+    scaleField.appendChild(scale.row);
     scaleField.appendChild(el(
       'div',
       'pet-field-hint',
@@ -1922,7 +2213,9 @@ export function createSettingsPanel({
         slider.setAttribute(
           'aria-label', `新形象的${behavior.label}${bound === 'min' ? '最短' : '最长'}间隔`,
         );
-        slider.addEventListener('input', () => {
+        // 草稿是纯本地状态（提交表单时才落盘），因此这里**没有**「松手才提交」
+        // 的顾虑：`input` 里直接更新草稿与读数即可，一个请求都不会发。
+        const sync = () => {
           const low = Number(row.querySelector('[data-create-schedule-bound="min"]').value);
           const high = Number(row.querySelector('[data-create-schedule-bound="max"]').value);
           readout.textContent = formatInterval(low, high);
@@ -1932,10 +2225,34 @@ export function createSettingsPanel({
               max: clampScheduleMs(high, preset.max),
             },
           });
+        };
+        slider.addEventListener('input', sync);
+
+        // 与形象详情里的两个滑块一样，配一个可直接输入的数字框
+        const lowLimit = Number(limits.scheduleMinMs) || SCHEDULE_FALLBACK_MIN_MS;
+        const highLimit = Number(limits.scheduleMaxMs) || SCHEDULE_FALLBACK_MAX_MS;
+        const box = attachNumberBox(slider, {
+          label: `新形象的${behavior.label}${bound === 'min' ? '最短' : '最长'}间隔（毫秒）`,
+          clamp: (raw) => {
+            const number = Number(raw);
+            const base = Number.isFinite(number) ? number : lowLimit;
+            const bounded = Math.min(Math.max(base, lowLimit), highLimit);
+            return Math.round(bounded / 100) * 100;
+          },
+          onInput: sync,
+          onCommit: sync,
         });
-        row.appendChild(slider);
+        const boundRow = el('div', 'pet-slider-row');
+        boundRow.appendChild(slider);
+        boundRow.appendChild(box.input);
+        row.appendChild(boundRow);
       }
       field.appendChild(row);
+      // 区间两端提示（与宿主预设编辑器一致：最小 / 当前 / 最大）
+      const rangeRow = el('div', 'pet-slider-range');
+      rangeRow.appendChild(el('span', null, formatMs(limits.scheduleMinMs)));
+      rangeRow.appendChild(el('span', null, formatMs(limits.scheduleMaxMs)));
+      field.appendChild(rangeRow);
       section.appendChild(field);
     }
     return section;

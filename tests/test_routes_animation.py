@@ -212,6 +212,88 @@ def test_preview_lists_actions_without_image(env):
             assert item['variants'], f'{name} 声明为 animated 却没有变体'
 
 
+def test_preview_forwards_per_action_and_variant_size(tmp_path):
+    """★ `/preview` 必须下发**单帧尺寸**，否则面板的预览框不知道真实比例。
+
+    用户报障：「预览动画框应该根据动作的比例来自动变化……否则看起来会很奇怪
+    （点名小卡的睡觉动作）」。
+
+    睡觉是躺姿、横构图（小卡是 627×353）。面板拿不到尺寸就只能按包级的
+    竖构图去铺，横图被压扁。尺寸在运行期包里是有的
+    （`AnimationVariant.to_dict()` 会写 `size`），但 `/preview` 曾经**没有透传**
+    ——数据算好了、接口没给，前端等于瞎猜。
+    """
+    builtin = tmp_path / 'resources' / 'pets'
+    data = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    data.mkdir(parents=True)
+
+    write_pack(builtin, 'shapes', payload={
+        'id': 'shapes',
+        'name': '比例',
+        'size': {'w': 384, 'h': 576},
+        'animations': {
+            # 包级是 2:3 竖构图，这个动作是横构图（躺姿）
+            'sleep': {'sheet': 'sleep.png', 'frames': 1, 'size': {'w': 627, 'h': 353}},
+            'idle': {'sheet': 'idle.png', 'frames': 1},
+        },
+    }, sheets={'sleep.png': 1, 'idle.png': 1})
+
+    store = PetStore(str(data), str(builtin))
+    api = FakeApi(data_dir=str(data))
+    app = build_app(api, store)
+    payload = json_of(app.test_client().get('/api/plugins/stm-pet/pets/shapes/preview'))
+
+    actions = {item['action']: item for item in payload['actions']}
+    sleep = actions['sleep']
+    # 动作级尺寸（变体缺失时的回落）
+    assert sleep['size'] == {'w': 627, 'h': 353}, '动作级尺寸要透传'
+    assert sleep['variants'][0]['size'] == {'w': 627, 'h': 353}, '变体级尺寸也要透传'
+
+    # 没有声明尺寸的动作不写字段（前端回落到包级，老行为不变）
+    assert actions['idle']['size'] is None, '没声明就该是 None，让前端回落到包级'
+
+    # 包级尺寸仍在顶层，供回落使用
+    assert payload['size'] == {'w': 384, 'h': 576}
+
+
+def test_preview_size_matches_runtime_pack(tmp_path):
+    """`/preview` 与 `/runtime` 的尺寸字段必须**同一套**（同源，不各算一份）。"""
+    builtin = tmp_path / 'resources' / 'pets'
+    data = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    data.mkdir(parents=True)
+
+    write_pack(builtin, 'same', payload={
+        'id': 'same',
+        'name': '同源',
+        'size': {'w': 384, 'h': 576},
+        'animations': {
+            'sleep': {'sheet': 'sleep.png', 'frames': 2, 'size': {'w': 500, 'h': 250}},
+            'idle': {'sheet': 'idle.png', 'frames': 1},
+        },
+    }, sheets={'sleep.png': 2, 'idle.png': 1})
+
+    store = PetStore(str(data), str(builtin))
+    api = FakeApi(data_dir=str(data))
+    app = build_app(api, store)
+    client = app.test_client()
+
+    preview = json_of(client.get('/api/plugins/stm-pet/pets/same/preview'))
+    runtime = json_of(client.get('/api/plugins/stm-pet/pets/same/runtime'))
+    # `/runtime` 把运行期包放在 `pet` 下面（`/preview` 是平铺的）
+    runtime_actions = runtime['pet']['actions']
+
+    preview_actions = {item['action']: item for item in preview['actions']}
+    assert preview_actions['sleep']['size'] == runtime_actions['sleep']['size'], (
+        '两个接口的尺寸必须一致——否则面板预览与桌面表现会对不上'
+    )
+    assert (
+        preview_actions['sleep']['variants'][0]['size']
+        == runtime_actions['sleep']['variants'][0]['size']
+    )
+
+
 def test_preview_works_for_builtin_pets(env):
     """★ 内置形象也要能预览（用户明确要求「默认的两个角色也应该支持上」）。"""
     _app, store, client, _api = env

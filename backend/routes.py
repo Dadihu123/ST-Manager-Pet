@@ -717,6 +717,13 @@ def register_routes(api, store: PetStore) -> None:
                     'frameMs': variant.get('frameMs') or [],
                     'weight': variant.get('weight'),
                     'frameSource': variant.get('frameSource'),
+                    # 单帧尺寸（可能缺省 = 沿用包级）。
+                    #
+                    # 必须透传：面板的预览框要按**真实宽高比**把这一帧装进去，
+                    # 而躺姿睡觉这类动作是横构图（例如 627×353），
+                    # 不知道尺寸就只能按包级的竖构图去铺，图会被压扁。
+                    # 与 `/runtime` 的 `actions` 保持同一套字段名。
+                    'size': variant.get('size'),
                 })
             summary.append({
                 'action': action,
@@ -730,6 +737,9 @@ def register_routes(api, store: PetStore) -> None:
                 'frameMs': entry.get('frameMs') or [],
                 'url': entry.get('url'),
                 'note': entry.get('note'),
+                # 动作级尺寸（作者在该动作的动画声明里覆盖包级时才有）。
+                # 它是变体尺寸缺失时的回落值，见 `frameSizeOf`。
+                'size': entry.get('size'),
                 'overridden': action in pack['overrides'],
                 'variants': variants,
             })

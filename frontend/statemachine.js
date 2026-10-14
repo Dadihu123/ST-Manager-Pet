@@ -36,12 +36,23 @@ export const REACT_ACTIONS = Object.freeze(['happy', 'sad', 'angry', 'click']);
  *
  * 注意 `drag` 被允许从**任意**状态进入（硬要求 1），因此这里不逐个列出，
  * 而是在 `canTransition` 里特判。
+ *
+ * ⚠️ `fall` 的出口只有 `land` 与 `drag`，**没有** `idle`。
+ *
+ * 这里曾经写着 `[LAND, IDLE, DRAG]`，而那个 `IDLE` 正是用户报的
+ * 「在空中播放别的动画」的入口：坠落期间任何**过期的定时器**
+ * （上一次播报的收尾、待机的随机触发、漫游倒计时）只要调到 `settle()`，
+ * 就能把宠物从 `fall` 直接拽进 `idle`——于是它在半空中播起了待机动画，
+ * 接着还能从 `idle` 走去 `walk` / `sleep`，看起来就是「空中好几个动画轮流播」。
+ *
+ * 移除它之后，那条路径变成一次**被拒绝并记录**的非法迁移（`onReject`），
+ * 而回到地面的唯一出口是 `land`——这正是物理上的事实。
  */
 const TRANSITIONS = {
   [STATES.IDLE]: [STATES.WALK, STATES.DRAG, STATES.SLEEP, STATES.REACT, STATES.FALL],
   [STATES.WALK]: [STATES.IDLE, STATES.DRAG, STATES.SLEEP, STATES.REACT, STATES.FALL],
   [STATES.DRAG]: [STATES.FALL, STATES.IDLE, STATES.WALK],
-  [STATES.FALL]: [STATES.LAND, STATES.IDLE, STATES.DRAG],
+  [STATES.FALL]: [STATES.LAND, STATES.DRAG],
   [STATES.LAND]: [STATES.IDLE, STATES.WALK, STATES.DRAG],
   [STATES.SLEEP]: [STATES.IDLE, STATES.WALK, STATES.DRAG, STATES.REACT],
   [STATES.REACT]: [STATES.IDLE, STATES.WALK, STATES.SLEEP, STATES.DRAG, STATES.REACT],
@@ -93,6 +104,26 @@ export function createStateMachine(options = {}) {
     if (history.length > 64) history.shift();
     safeHook(onChange, target, previous, meta);
     return true;
+  }
+
+  /**
+   * 语义化入口的公共实现：**先确认迁移合法，再写动作名**。
+   *
+   * @param {string} target 目标状态
+   * @param {string} action 目标状态下要播的动作名
+   * @param {string} reason 记进 `onReject` / `onChange` 的原因
+   * @param {object} meta 调用方给的附加信息（含 `now`）
+   * @returns {boolean} 迁移是否真的发生
+   */
+  function enter(target, action, reason, meta) {
+    // 同态重入（`canTransition` 对 from === to 恒为真）同样要更新动作名：
+    // `react` 态下连续两次播报就是靠它换的动作。
+    if (!canTransition(state, target)) {
+      safeHook(onReject, state, target, reason);
+      return false;
+    }
+    currentAction = action;
+    return transition(target, Object.assign({ reason }, meta));
   }
 
   /**
@@ -153,47 +184,49 @@ export function createStateMachine(options = {}) {
 
     // ------------------------------------------------------------ 语义化入口
 
+    // 下面这些入口都走 `enter()`：**先确认迁移合法，再写动作名**。
+    //
+    // 为什么不用「先写 currentAction、再 transition」那种顺序（旧写法）：
+    // 迁移被拒绝时动作名照样被改掉了，于是 `machine.state` 与
+    // `machine.action` 脱节——状态还停在 `fall`，动作名已经是 `idle`。
+    // 读取 `machine.action` 的地方（`dormant` / `animating` / 面板诊断）
+    // 就会得到一份自相矛盾的答案，而症状离原因非常远。
+    // 用户报的「空中播放别的动画」里就有一条是这个脱节造成的。
+
     /** 开始拖拽。硬要求 1：任何状态都能被打断。 */
     beginDrag(meta) {
       pendingReaction = '';
-      currentAction = 'drag';
-      return transition(STATES.DRAG, Object.assign({ reason: 'pointer-down' }, meta));
+      return enter(STATES.DRAG, 'drag', 'pointer-down', meta);
     },
 
     /** 松手 → 下落。 */
     release(meta) {
-      currentAction = 'fall';
-      return transition(STATES.FALL, Object.assign({ reason: 'pointer-up' }, meta));
+      return enter(STATES.FALL, 'fall', 'pointer-up', meta);
     },
 
     /** 触地。 */
     land(meta) {
-      currentAction = 'land';
-      return transition(STATES.LAND, Object.assign({ reason: 'touch-ground' }, meta));
+      return enter(STATES.LAND, 'land', 'touch-ground', meta);
     },
 
     /** 落地动作播完 → 回 idle。 */
     settle(meta) {
-      currentAction = 'idle';
-      return transition(STATES.IDLE, Object.assign({ reason: 'settled' }, meta));
+      return enter(STATES.IDLE, 'idle', 'settled', meta);
     },
 
     /** 开始水平移动。 */
     startWalk(meta) {
-      currentAction = 'walk';
-      return transition(STATES.WALK, Object.assign({ reason: 'walk' }, meta));
+      return enter(STATES.WALK, 'walk', 'walk', meta);
     },
 
     /** 停下。 */
     stopWalk(meta) {
-      currentAction = 'idle';
-      return transition(STATES.IDLE, Object.assign({ reason: 'stop' }, meta));
+      return enter(STATES.IDLE, 'idle', 'stop', meta);
     },
 
     /** 入睡。 */
     sleep(meta) {
-      currentAction = 'sleep';
-      return transition(STATES.SLEEP, Object.assign({ reason: 'idle-timeout' }, meta));
+      return enter(STATES.SLEEP, 'sleep', 'idle-timeout', meta);
     },
 
     /**
@@ -204,8 +237,7 @@ export function createStateMachine(options = {}) {
      */
     wake(meta = {}) {
       if (state === STATES.SLEEP) {
-        currentAction = 'idle';
-        return transition(STATES.IDLE, Object.assign({ reason: 'wake' }, meta));
+        return enter(STATES.IDLE, 'idle', 'wake', meta);
       }
       return true;
     },
@@ -215,6 +247,16 @@ export function createStateMachine(options = {}) {
      *
      * 硬要求 2：**sleep 期间收到核心事件要唤醒**——因此这里先无条件唤醒，
      * 再进入播报态（播报完由调用方调 `settle()` 回 idle）。
+     *
+     * 两个「不能抢」的状态：
+     *
+     * - `drag`：用户正抓着它，记下来等松手后再播；
+     * - `fall`：它还在空中。用户报的「空中播放别的动画」里，这一条也是来源之一
+     *   ——旧实现在 `fall` 期间会把 `currentAction` 改成 `happy`，虽然迁移被
+     *   拒绝（状态仍是 `fall`），但**动作名已经变了**，`machine.action`
+     *   与 `machine.state` 就此脱节。等它落地时，`applyActionForState()`
+     *   会看到一份自相矛盾的状态，播出来的东西不可预测。
+     *   现在与 `drag` 同等对待：排队，落地之后立刻播。
      */
     react(action, meta = {}) {
       const name = String(action || 'happy');
@@ -225,9 +267,18 @@ export function createStateMachine(options = {}) {
       // 唤醒优先于一切（哪怕当前已经在播放另一个播报）
       if (state === STATES.SLEEP) this.wake(meta);
 
-      if (state === STATES.DRAG) {
-        // 用户正抓着它——不要抢走拖拽态，记下来等松手后再播
+      if (state === STATES.DRAG || state === STATES.FALL) {
+        // 不要抢走拖拽 / 下落的态，记下来等它回到地面之后再播
         pendingReaction = name;
+        return false;
+      }
+      // 先确认迁移合法，**再**写动作名。
+      //
+      // 顺序反了（旧写法）会让 `currentAction` 在迁移被拒绝时也照样被改写，
+      // 于是「状态没变、动作名变了」——这种脱节在 `land` / `sleep` 这类
+      // 依赖 `machine.action` 的地方会表现出完全无关的症状。
+      if (!canTransition(state, STATES.REACT)) {
+        safeHook(onReject, state, STATES.REACT, `react:${name}`);
         return false;
       }
       currentAction = name;

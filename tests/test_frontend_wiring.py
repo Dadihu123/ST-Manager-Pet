@@ -42,6 +42,26 @@ def animation():
     return read('frontend/animation.js')
 
 
+@pytest.fixture(scope='module')
+def preview():
+    return read('frontend/preview.js')
+
+
+@pytest.fixture(scope='module')
+def statemachine():
+    return read('frontend/statemachine.js')
+
+
+@pytest.fixture(scope='module')
+def css():
+    return read('frontend/plugin.css')
+
+
+@pytest.fixture(scope='module')
+def routes_source():
+    return read('backend/routes.py')
+
+
 # ==================================================== 1. 标准图像接线
 
 
@@ -524,3 +544,436 @@ def test_schedule_keys_are_shared_between_panel_and_animation(panel, animation):
     assert 'SCHEDULE_BEHAVIORS' in animation
     # 面板导入的是 animation.js 的那一份，而不是自己再写一遍
     assert "from './animation.js'" in panel
+
+
+# ==================================================== 2. 预览框比例
+
+
+def test_panel_applies_geometry_to_every_small_preview(panel):
+    """★ 小预览框的几何必须覆盖**动作网格**，不能只覆盖卡片缩略图。
+
+    真实 bug（在真实浏览器里截图看出来的）：`renderActionTile()` 老老实实写了
+    `data-frames` / `data-layout` / `data-has-image`（注释还写着
+    「按帧数放大 + 左对齐」），但 `applyThumbGeometry()` 只查
+    `.pet-card-thumb` —— 于是动作网格里的小图停在 `background-size: auto`，
+    只露出整条 spritesheet 左上角那 56×56 的一块（在 1536×576 的 idle 上
+    正好落在**空白区域**），整个动作区只剩文字、没有一个预览图。
+
+    这与「卡片缩略图只有第一张有几何」是**同一个成因**：加了一处预览框，
+    忘了加进选择器。所以这里同时钉住「选择器覆盖两处」与
+    「动作网格确实写了那三个 data- 属性」。
+    """
+    body = panel[panel.index('function applyThumbGeometry()'):]
+    body = body[:body.index('\n  }')]
+    assert '.pet-card-thumb' in body, '卡片缩略图要处理'
+    assert '.pet-action-preview' in body, '动作网格的小图也要处理'
+    assert 'dataset.frames' in body and 'dataset.layout' in body, (
+        '几何要按每个框自己的帧数与排布算'
+    )
+    # 动作网格侧：三个 data- 属性都要写（几何applier 靠它们工作）
+    tile = panel[panel.index('function renderActionTile(entry)'):]
+    tile = tile[:tile.index('\n  }')]
+    for hook in ('preview.dataset.frames', 'preview.dataset.layout', 'preview.dataset.hasImage'):
+        assert hook in tile, f'{hook} 是几何契约，不能丢'
+
+
+def test_panel_preview_geometry_runs_after_dom_is_attached(panel):
+    """几何必须在 DOM 挂上之后算（否则 `clientWidth` 是 0，全按兜底值铺）。"""
+    body = panel[panel.index('    root.appendChild(body);'):]
+    body = body[:body.index('function renderPetCard')]
+    assert 'applyThumbGeometry()' in body, '挂上 DOM 之后要立刻算几何'
+
+
+def test_panel_passes_frame_size_into_the_preview(preview):
+    """★ 预览必须知道**单帧的真实尺寸**，否则横构图动作会被压扁。
+
+    用户报障：「预览动画框应该根据动作的比例来自动变化……否则看起来会很奇怪
+    （点名小卡的睡觉动作）」。
+
+    小卡的睡觉是躺姿、横构图（627×353），旧实现强行把一帧拉到框宽，
+    于是人物被压扁。修法是让 `applyFrameGeometry` 按真实比例做 `contain`，
+    而它需要尺寸——所以面板必须把尺寸一路传下去。
+    """
+    # 几何函数必须接受并使用尺寸参数
+    assert 'export function applyFrameGeometry(box, frames, layout, index, size, layer)' in preview, (
+        'applyFrameGeometry 必须接收单帧尺寸与内层'
+    )
+    assert 'boxWidth / frameWidth' in preview, '必须按真实宽高比做 contain 缩放'
+    # 底边对齐：用户明确要求「预览动画底部和预览框对齐」
+    assert 'boxHeight - shownHeight' in preview, '必须底边对齐（不是垂直居中）'
+    # 播放器要把变体尺寸喂给几何函数
+    assert 'variant ? variant.size : null' in preview, '播放器必须把尺寸传给几何函数'
+
+
+def test_preview_geometry_uses_an_inner_frame_layer(preview):
+    """★ 背景必须铺在「一帧大小」的**内层**上，否则留白处会露出邻帧。
+
+    按比例装入必然留白（横构图左右留、竖构图上下留），而 `background-image`
+    是按**整条** spritesheet 铺的——铺在外框上时，留白处露出来的正是
+    **相邻的帧**。实测：睡觉的预览框左边缘飘着一个「z」、右边缘挂着半个人影
+    （都是隔壁帧的内容），比原来的「压扁」更怪。
+
+    单个元素解决不了：`background-clip` 裁不了「背景里的某一块」，
+    而 `mask` / `clip-path` 会连**边框**一起裁掉（框就残缺了）。
+    因此改成「外框 + 内层」，内层只有一帧大小，邻帧物理上漏不出来。
+    """
+    # 播放器要创建内层
+    assert 'function createAnimationPlayer(options = {})' in preview
+    assert "layer.className = 'pet-preview-frame-layer'" in preview, '内层要有自己的类名'
+    assert 'box.appendChild(layer)' in preview, '内层要挂进外框'
+    # 背景图必须挂在**内层**上（而不是外框）
+    load = preview[preview.index('    load(spec, opts = {})'):]
+    load = load[:load.index('    /** 从头播。')]
+    assert 'layer.style.backgroundImage' in load, '背景图要挂在内层'
+    # 几何要写内层的尺寸与位置
+    body = preview[preview.index('export function applyFrameGeometry'):]
+    body = body[:body.index('\n}')]
+    assert 'target.style.width' in body and 'target.style.height' in body, (
+        '内层尺寸必须写成「一帧的大小」'
+    )
+    assert 'target.style.left' in body and 'target.style.top' in body, '内层要摆到居中 + 贴底'
+    # 内层是自己造的，必须自己回收（否则每次重渲染都堆一层）
+    dispose = preview[preview.index('    dispose() {'):]
+    dispose = dispose[:dispose.index('\n    },')]
+    assert 'removeChild' in dispose, 'dispose 要摘掉内层'
+
+
+def test_preview_payload_carries_frame_size(routes_source):
+    """`/preview` 必须下发单帧尺寸（否则面板拿不到横构图的真实比例）。"""
+    body = routes_source[routes_source.index('def preview_pet('):]
+    # 变体级与动作级都要有
+    assert body.count("'size'") >= 2, '变体与动作条目都要带 size'
+    assert "'size': variant.get('size')" in body, '变体级尺寸'
+    assert "'size': entry.get('size')" in body, '动作级尺寸（变体缺失时的回落）'
+
+
+def test_panel_resolves_preview_frame_size_with_the_shared_priority(panel):
+    """面板取单帧尺寸的优先级必须与桌面宠物**同源**（`frameSizeOf`）。"""
+    assert 'frameSizeOf' in panel, '必须复用 animation.js 的尺寸解析'
+    assert "import { DEFAULT_SCHEDULE_MS, frameSizeOf } from './animation.js'" in panel
+    body = panel[panel.index('function previewSpec()'):]
+    body = body[:body.index('\n  /**')]
+    assert 'frameSizeOf(base, entry, detail && detail.size)' in body, (
+        '优先级必须是 变体 > 动作条目 > 包级'
+    )
+    assert 'size:' in body, '解析出来的尺寸要挂进预览 spec'
+
+
+# ==================================================== 3. 空中不串动作
+
+
+def test_petview_lands_on_touch_down_not_only_on_hard_impact(petview):
+    """★ 落地判定必须用 `touchedDown`（状态翻转），不能只用 `justLanded`。
+
+    用户报障的衍生现象：「如果不是以坠落动画落得地，那么就不会出现落地动画」。
+
+    根因：`justLanded` 要求冲击 > 60px/s。从很低的地方放下（或贴着地面松手）
+    冲击不足，于是状态机永远停在 `fall`——既没有落地动作，rAF 也永远停不下来
+    （`fall` 属于「必须继续跑」的状态），表现为「宠物贴着地面一直播下落动画」。
+    """
+    body = petview[petview.index('function updateStateFromPhysics'):]
+    body = body[:body.index('\n  }')]
+    assert 'physics.touchedDown' in body, '必须用 touchedDown 判落地'
+    assert 'machine.land(' in body, '触地要进 land 态'
+
+
+def test_petview_blocks_ground_behaviors_while_airborne(petview):
+    """★ 空中不允许推进漫游 / 打盹 / idle 触发。
+
+    用户报障：「拖拽和坠落动画有时会被其他动画打断，然后在空中播放其他动画，
+    例如左右移动，例如闲置，甚至还出现了在空中多个动画交替出现的情况」。
+
+    根因：这些计时器都在 rAF 里按 dt 推进，而 `fall` 期间 rAF **正好在跑**
+    （它是「必须继续跑」的状态）。于是坠落途中漫游到点就去 `startWalk()`、
+    打盹到点就去 `sleep()`、idle 触发到点就直接改动作名。
+    """
+    body = petview[petview.index('function updateStateFromPhysics'):]
+    body = body[:body.index('\n  }')]
+    assert 'const airborne = !physics.grounded && !physics.dragging' in body, (
+        '必须有明确的「空中」判定'
+    )
+    assert 'cancelIdleWake()' in body, '空中要撤掉已排好的 idle 触发'
+    # 护栏必须**早于**漫游 / 打盹的推进（否则拦不住）
+    assert body.index('if (airborne)') < body.index('walkTimer -= dt * 1000'), (
+        '空中护栏必须挡在漫游倒计时之前'
+    )
+    assert body.index('if (airborne)') < body.index('lastSleepCheck = now'), (
+        '空中护栏必须挡在打盹计时之前'
+    )
+
+
+def test_petview_idle_trigger_requires_being_grounded(petview):
+    """idle 随机触发必须要求「站在地上」。
+
+    点击后的小弹跳刻意**不**进 `fall` 态（否则落地动作会打断点击动画），
+    于是弹跳期间状态是 idle 而宠物在空中。少了这条时，它会满足
+    「idle 且无占用」并排下一次小动作，在**空中**播起待机动画。
+    """
+    body = petview[petview.index('function idleTriggerEnabled()'):]
+    body = body[:body.index('\n  }')]
+    assert 'physics.grounded' in body, 'idle 触发必须要求站在地上'
+
+
+def test_petview_keeps_running_while_airborne(petview):
+    """空中必须继续跑 rAF，否则宠物会**悬在半空不动**。
+
+    点击弹跳期间状态是 idle/react 而 `physics.grounded` 为假。若循环
+    直接返回 `!physics.resting`，它会在弹到最高点时停掉——宠物卡在空中，
+    直到下一次交互才继续下落。
+    """
+    body = petview[petview.index('function shouldKeepRunning()'):]
+    body = body[:body.index('\n  }')]
+    assert 'if (!physics.grounded) return true' in body, '空中必须继续跑'
+
+
+def test_statemachine_has_no_fall_to_idle_escape(statemachine):
+    """★ `FALL` 的出口只有 `land` 与 `drag`——**没有** `idle`。
+
+    那个 `IDLE` 正是「在空中播放其他动画」的入口：坠落期间任何**过期的
+    定时器**只要调到 `settle()`，就能把宠物从 `fall` 直接拽进 `idle`，
+    接着还能从 `idle` 走去 `walk` / `sleep`——看起来就是空中好几个动画轮流播。
+    """
+    assert '[STATES.FALL]: [STATES.LAND, STATES.DRAG]' in statemachine, (
+        'FALL 的出口只能是 LAND / DRAG'
+    )
+
+
+def test_statemachine_semantic_entries_are_atomic(statemachine):
+    """语义化入口必须**先确认迁移合法、再写动作名**。
+
+    旧写法是「先写 `currentAction`、再 `transition`」：迁移被拒绝时动作名
+    照样被改掉了，于是 `machine.state` 与 `machine.action` 脱节——状态还停在
+    `fall`，动作名已经是 `idle`。读取 `machine.action` 的地方会得到
+    自相矛盾的答案，而症状离原因非常远。
+    """
+    assert 'function enter(target, action, reason, meta)' in statemachine, (
+        '必须有统一的原子入口'
+    )
+    body = statemachine[statemachine.index('function enter(target, action, reason, meta)'):]
+    body = body[:body.index('\n  }')]
+    # 顺序：先查合法性，再写动作名
+    assert body.index('canTransition(state, target)') < body.index('currentAction = action'), (
+        '必须先校验再改动作名'
+    )
+    # 所有语义化入口都要走它
+    for name in ('beginDrag', 'release', 'land', 'settle', 'startWalk', 'stopWalk', 'sleep'):
+        assert f'{name}(meta)' in statemachine, f'{name} 必须存在'
+    assert statemachine.count('return enter(') >= 7, '语义化入口都应走 enter()'
+
+
+def test_statemachine_react_queues_while_airborne(statemachine):
+    """空中播报必须排队，不能在半空中抢动作名。"""
+    body = statemachine[statemachine.index('react(action, meta = {})'):]
+    body = body[:body.index('\n    },')]
+    assert 'state === STATES.FALL' in body, 'fall 期间也要排队（与 drag 同等对待）'
+    assert 'pendingReaction = name' in body, '要记下排队的播报'
+
+
+def test_petview_guards_the_land_timer(petview):
+    """落地动作的收尾定时器必须复核当前状态。
+
+    它跨越了 `duration` 毫秒，期间用户完全可能又把它抓起来
+    （`land` → `drag` 是合法迁移）。不复核的话，定时器随后仍会执行
+    `settle()`——把**正在被拖拽**的宠物从 `drag` 拽进 `idle`，
+    于是松手时它不进入 `fall`，直接在半空中播待机动画。
+    """
+    body = petview[petview.index('function updateStateFromPhysics'):]
+    body = body[:body.index('\n  }')]
+    timer = body[body.index('actionTimer = setTimeout('):]
+    timer = timer[:timer.index('}, duration);')]
+    assert 'machine.state !== STATES.LAND' in timer, '收尾前必须复核状态'
+
+
+def test_petview_restores_idle_schedule_after_landing(petview):
+    """空中撤掉的 idle 排期要在回到地面时补回来。
+
+    点击弹跳**不产生任何状态迁移**（状态一直是 idle），而 `scheduleIdleWake()`
+    只在状态迁移时重排。不补的话，宠物从此再也不自己动一下，直到用户点它。
+    """
+    assert 'let wasAirborne = false' in petview, '要记住上一帧是否在空中'
+    body = petview[petview.index('function updateStateFromPhysics'):]
+    body = body[:body.index('\n  }')]
+    assert 'if (wasAirborne)' in body, '回到地面要识别这个边沿'
+    assert 'scheduleIdleWake()' in body, '并把排期补回来'
+
+
+# ==================================================== 4. 滑块与数字输入
+
+
+def test_panel_sliders_accept_direct_number_input(panel):
+    """★ 每个调节条都要能**直接输入数字**。
+
+    用户报障：「目前的数字调节不够方便，通过拖拽有时难以精确调整，
+    请同步支持直接选择数字部分进行输入修改，只要限制好输入数据的范围即可」。
+    """
+    assert 'function createSliderRow(' in panel, '必须有统一的「滑块 + 数字框」'
+    assert 'function attachNumberBox(' in panel, '数字框要能挂到既有滑块上'
+    assert "el('input', 'pet-slider-number')" in panel, '数字框要有自己的类名'
+    assert "number.type = 'number'" in panel, '必须是 number 输入'
+
+
+def test_panel_slider_row_wires_both_the_slider_and_the_number_box(panel):
+    """★ 滑块**自己**的回调也必须接上，不能只给数字框接线。
+
+    这个坑真实发生过：重构时只给数字框接了回调，把滑块的 `input`/`change`
+    忘掉了——表现是「拖滑块完全没反应，数字框却好用」。
+    由 `tools/verify-upload.mjs` 的 ⑲（拖滑块 → 宠物立刻变大）抓出来。
+    """
+    body = panel[panel.index('function createSliderRow(options)'):]
+    body = body[:body.index('\n  /**')]
+    assert "slider.addEventListener('input'" in body, '滑块自己的 input 必须接线'
+    assert "slider.addEventListener('change'" in body, '滑块自己的 change 必须接线'
+    # 两边共用同一份 push 逻辑，避免只有一边能用
+    assert 'box.push(slider.value, false)' in body, '拖动只回显'
+    assert 'box.push(slider.value, true)' in body, '松手才提交'
+
+
+def test_panel_number_input_clamps_to_the_same_range(panel):
+    """数字框与滑块必须共享**同一套夹取**，否则两边会给出不同的合法值。"""
+    body = panel[panel.index('function createSliderRow(options)'):]
+    body = body[:body.index('\n  /**')]
+    assert 'Math.min(Math.max(base, min), max)' in body, '必须夹到区间内'
+    # 数字框的 min/max 直接沿用滑块的，不另写一份
+    attach = panel[panel.index('function attachNumberBox('):]
+    attach = attach[:attach.index('\n  /**')]
+    assert 'number.min = slider.min' in attach, '范围要与滑块一致'
+    assert 'number.max = slider.max' in attach
+    assert 'number.step = slider.step' in attach
+
+
+def test_panel_number_input_commits_on_change_not_per_keystroke(panel):
+    """数字框要**失焦 / 回车才提交**。
+
+    每次按键都夹取的话，用户想输 `10000` 时打完 `1` 就被夹成下限，
+    后面几位根本输不进去（真实踩过的输入框体验问题）。
+    """
+    attach = panel[panel.index('function attachNumberBox('):]
+    attach = attach[:attach.index('\n  /**')]
+    assert "number.addEventListener('change'" in attach, '失焦 / 回车才提交'
+    assert "event.key === 'Enter'" in attach, '回车要能直接提交'
+    # `input` 里绝不能发请求（只做视觉回显）
+    handler = attach[attach.index("number.addEventListener('input'"):]
+    handler = handler[:handler.index('});')]
+    assert 'updateAppearance' not in handler, 'input 里不能提交'
+    assert 'updateSchedule' not in handler, 'input 里不能提交'
+
+
+def test_panel_slider_rows_keep_the_existing_dom_contract(panel):
+    """新增的数字框不能破坏既有的 `data-` 契约（验收脚本靠它们定位）。"""
+    for hook in (
+        'slider.dataset.scheduleBehavior',
+        'slider.dataset.scheduleBound',
+        'slider.dataset.createSchedule',
+        'slider.dataset.createScheduleBound',
+    ):
+        assert hook in panel, f'{hook} 是既有契约，不能丢'
+    assert "speed.slider.dataset.previewSpeed = 'true'" in panel, '预览速度的标记不能丢'
+
+
+def test_panel_schedule_slider_helpers_are_wired(panel):
+    """触发时间的两个滑块各自都要配上数字框。"""
+    body = panel[panel.index('function renderSchedule()'):]
+    body = body[:body.index('\n  /**')]
+    assert 'attachNumberBox(slider' in body, '触发时间滑块要有数字框'
+    assert "el('div', 'pet-slider-row')" in body, '滑块与数字框要包成一行'
+    create = panel[panel.index('function renderCreateSchedule()'):]
+    create = create[:create.index('\n  /**')]
+    assert 'attachNumberBox(slider' in create, '新建表单的滑块同样要有数字框'
+
+
+def test_panel_scale_and_speed_use_the_shared_slider_row(panel):
+    """倍率与预览速度要走统一的 `createSliderRow`（而不是各写一份）。"""
+    appearance = panel[panel.index('function renderAppearance()'):]
+    appearance = appearance[:appearance.index('\n  /**')]
+    assert 'createSliderRow({' in appearance, '大小倍率要用统一的行'
+    preview = panel[panel.index('function renderPreview()'):]
+    preview = preview[:preview.index('\n  /**')]
+    assert 'createSliderRow({' in preview, '预览速度要用统一的行'
+
+
+def test_panel_slider_progress_variable_is_set(panel):
+    """色带进度靠 `--pet-slider-progress`，必须由 JS 写入。
+
+    原生 `input[type=range]` 没有「已选比例」这个可样式化的部分，
+    只能由 JS 算出来交给 `linear-gradient`（与宿主的
+    `--preset-editor-range-progress` 同一手法）。
+    """
+    assert 'function syncSliderProgress(' in panel
+    assert "'--pet-slider-progress'" in panel, '变量名要与 CSS 对得上'
+    body = panel[panel.index('function syncSliderProgress('):]
+    body = body[:body.index('\n  }')]
+    assert 'slider.style.setProperty' in body
+    # 非法区间要给 0 而不是 NaN——NaN% 会让整条渐变失效（滑块看起来像坏了）
+    assert 'span > 0' in body, '区间非法时要给 0'
+
+
+def test_css_styles_the_slider_like_the_host_preset_editor(css):
+    """调节条样式要与宿主「预设全屏编辑器」对齐（用户明确点名）。"""
+    assert '.plugin-stm-pet .pet-slider {' in css, '滑块主规则必须在'
+    assert 'appearance: none' in css, '必须自己画，否则各浏览器外观不一致'
+    assert 'var(--pet-slider-progress, 0%)' in css, '色带要按进度变量绘制'
+    # 宿主用的是 --accent-action；插件曾经写 --accent-color（宿主根本没定义）
+    assert 'var(--accent-action, #7c5cff)' in css, '要用宿主真正存在的强调色变量'
+    assert '--accent-color' not in css, '宿主没有定义 --accent-color，用了必然回落'
+    # 手柄：`appearance: none` 之后不给形状的话手柄会整个消失
+    assert '::-webkit-slider-thumb' in css, 'WebKit 手柄必须自己画'
+    assert '::-moz-range-thumb' in css, 'Gecko 手柄必须自己画'
+    assert ':focus-visible' in css, '键盘可达性不能丢'
+
+
+def test_css_styles_the_card_selection_state(css):
+    """★ 左侧卡片的**选中态**必须有样式。
+
+    用户报障：「插件页面选中某个形象时，右侧已经发生了变化，但是左侧选中态
+    却不跟着走，始终选中的是当前使用中的形象」。
+
+    根因就是这里：`renderPetCard()` 两种类都加了（`is-selected` = 正在看、
+    `is-active` = 正在用），但 CSS 里**只定义了 `.is-active`**，
+    `.is-selected` 一条规则都没有——于是「正在看的」完全没有视觉反馈。
+    """
+    assert '.plugin-stm-pet .pet-card.is-selected' in css, '选中态必须有样式'
+    assert '.plugin-stm-pet .pet-card.is-active' in css, '使用中的样式要保留'
+    # 两者要能区分：选中态用 inset 色条（不占布局，不会让卡片抖）
+    selected = css[css.index('.plugin-stm-pet .pet-card.is-selected'):]
+    selected = selected[:selected.index('}')]
+    assert 'box-shadow' in selected, '选中态要有明确的视觉记号'
+    # 「当前使用中」的文字标记要显眼
+    assert '.plugin-stm-pet .pet-card-meta.is-current' in css
+
+
+def test_panel_marks_the_current_pet_meta(panel):
+    """「当前使用中」的文字标记要带上 `is-current`（CSS 靠它上色）。"""
+    assert "'pet-card-meta is-current'" in panel
+    body = panel[panel.index('function renderPetCard(pet)'):]
+    body = body[:body.index('\n  }')]
+    assert "if (pet.id === selectedId) card.classList.add('is-selected')" in body, (
+        '选中态要按 selectedId 打（不是 activeId）'
+    )
+    assert "if (pet.id === activeId) card.classList.add('is-active')" in body
+    assert "'当前使用中'" in body
+
+
+def test_css_preview_box_is_a_large_square(css):
+    """预览框要是**正方形**——横竖构图都不偏袒。
+
+    旧框是 112×168 的 2:3 竖框，恰好与站立动作同比例，所以一直没人发现问题；
+    而躺姿睡觉是横构图（小卡是 627×353），横图被强行拉进竖框就压扁了。
+    """
+    body = css[css.index('.plugin-stm-pet .pet-preview-box {'):]
+    body = body[:body.index('}')]
+    assert 'width: 168px' in body, '要更大（用户要求「大一些的正方形框」）'
+    assert 'height: 168px' in body, '必须是正方形'
+    assert 'max-width: 100%' in body, '窄屏下不能撑破容器'
+    # 内层是绝对定位的，外框必须是它的定位基准
+    assert 'position: relative' in body, '外框要作为内层的定位基准'
+    # 内层是直角矩形，不裁会盖住外框的圆角
+    assert 'overflow: hidden' in body, '要裁掉内层溢出（保住圆角）'
+
+
+def test_css_defines_the_preview_frame_layer(css):
+    """内层必须有样式：它是「一帧的窗口」，背景铺在它身上。"""
+    assert '.plugin-stm-pet .pet-preview-frame-layer' in css, '内层样式不能少'
+    body = css[css.index('.plugin-stm-pet .pet-preview-frame-layer'):]
+    body = body[:body.index('}')]
+    assert 'position: absolute' in body, '内层靠绝对定位摆在框内'
+    assert 'background-repeat: no-repeat' in body, '不能平铺（否则邻帧会重复出现）'

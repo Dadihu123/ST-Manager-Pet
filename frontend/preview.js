@@ -60,50 +60,106 @@ export function totalDuration(variant) {
 }
 
 /**
- * 把「只显示某一帧」的几何写进一个预览框。
+ * 把「只显示某一帧」的几何写进预览框。
  *
- * 与 `panel.js:applyThumbGeometry` 是同一套规则，但**必须**按单帧的
- * 原始宽高比来放大：预览框是固定尺寸的方框，而 spritesheet 是
- * `帧数 × 单帧`，所以「整条宽度 = 方框宽 × 帧数」只有在单帧与方框同宽高比时
- * 才刚好填满。这里统一用 `background-size: (框宽 × 帧数) auto` 并左对齐，
- * 高度方向可能略有余量（方框会 `contain` 住），视觉上仍然只看到一帧。
+ * 三条规则，缺一不可：
  *
- * @param {HTMLElement} box 预览框
+ * 1. **按单帧的真实宽高比等比缩放**（`contain` 语义），绝不拉伸。
+ * 2. **底边对齐**、水平居中。
+ * 3. 画面**只能露出一帧**——邻帧不能从留白里漏出来（见下面 `layer` 的说明）。
+ *
+ * 为什么必须这样（用户报障「看起来会很奇怪，点名小卡的睡觉动作」）：
+ * 旧实现把「单帧宽 = 框宽 × 帧数」写死，也就是**强行把一帧拉到框宽**。
+ * 站立动作是 2:3 竖构图，恰好与旧框（112×168）同比例，所以看不出问题；
+ * 而小卡的睡觉是躺姿、横构图（627×353），被强行拉进竖框之后人物被压扁，
+ * 看起来像被踩过——这正是用户看到的那一幕。
+ *
+ * 底边对齐而不是垂直居中：宠物站在地面上，「脚底」是所有动作共有的参照线。
+ * 垂直居中会让横躺的睡觉动作浮在半空、与站立的动作对不齐，
+ * 切换动作时画面上下跳。用户明确要求「预览动画底部和预览框对齐」。
+ *
+ * ⚠️ **为什么需要 `layer`（内层元素）**：
+ * 按比例装入之后必然有留白（横构图左右留、竖构图上下留），而
+ * `background-image` 是**按整条 spritesheet 铺**的——留白处露出来的正是
+ * **相邻的帧**。实测能看到：睡觉的预览框左边缘飘着一个「z」、右边缘
+ * 挂着半个人影（都是隔壁帧的内容）。这比原来的「压扁」更怪。
+ *
+ * 单个元素解决不了：`background-clip` 裁不了「背景里的某一块」，
+ * 而 `mask` / `clip-path` 会连**边框**一起裁掉（框就残缺了）。
+ * 因此结构改成「外框 + 内层」：内层就是**一帧的大小**，
+ * 背景被它自己的盒子裁住，邻帧物理上不可能漏出来。
+ *
+ * @param {HTMLElement} box 外框（固定正方形，负责边框与留白）
  * @param {number} frames 帧数
  * @param {string} layout `horizontal` / `vertical`
  * @param {number} index 要显示的帧号
+ * @param {object} [size] 单帧原始尺寸 `{w, h}`；缺省时退回「按框的形状铺满」
+ *   （老后端不下发尺寸，此时行为与从前一致，不会更差）
+ * @param {HTMLElement} [layer] 真正承载背景图的内层元素。**强烈建议传**：
+ *   不传就退回「在 `box` 上直接铺」，那样留白处会露出邻帧。
  */
-export function applyFrameGeometry(box, frames, layout, index) {
+export function applyFrameGeometry(box, frames, layout, index, size, layer) {
   if (!box) return;
+  const target = layer || box;
   const count = Math.max(1, Math.floor(Number(frames) || 1));
   const at = Math.min(Math.max(0, Math.floor(Number(index) || 0)), count - 1);
-  const width = box.clientWidth || 64;
-  const height = box.clientHeight || 64;
-  if (count <= 1) {
-    box.style.backgroundSize = 'contain';
-    box.style.backgroundPosition = 'center';
-    return;
+  const boxWidth = box.clientWidth || 64;
+  const boxHeight = box.clientHeight || 64;
+
+  const frameWidth = Number(size && size.w) || 0;
+  const frameHeight = Number(size && size.h) || 0;
+  const known = frameWidth > 0 && frameHeight > 0;
+
+  // 等比缩放到框内（`contain`）。尺寸未知时退回「按框铺满」，
+  // 即旧的 1:1 映射——宁可不知道比例，也不要把图缩成一个点。
+  const fit = known
+    ? Math.min(boxWidth / frameWidth, boxHeight / frameHeight)
+    : 1;
+  const shownWidth = known ? frameWidth * fit : boxWidth;
+  const shownHeight = known ? frameHeight * fit : boxHeight;
+
+  // 一整条 spritesheet 的显示尺寸
+  const sheetWidth = layout === 'vertical' ? shownWidth : shownWidth * count;
+  const sheetHeight = layout === 'vertical' ? shownHeight * count : shownHeight;
+
+  if (target !== box) {
+    // 内层 = **一帧**的大小。背景铺的是整条 sheet，但只在这个盒子里可见，
+    // 因此留白处是外框自己的底色，邻帧漏不出来。
+    target.style.width = `${shownWidth}px`;
+    target.style.height = `${shownHeight}px`;
+    // 在框内摆位：水平居中 + 底边对齐
+    target.style.left = `${(boxWidth - shownWidth) / 2}px`;
+    target.style.top = `${boxHeight - shownHeight}px`;
   }
-  if (layout === 'vertical') {
-    box.style.backgroundSize = `auto ${height * count}px`;
-    box.style.backgroundPosition = `center ${-at * height}px`;
-  } else {
-    box.style.backgroundSize = `${width * count}px auto`;
-    box.style.backgroundPosition = `${-at * width}px top`;
-  }
+
+  target.style.backgroundSize = `${sheetWidth}px ${sheetHeight}px`;
+
+  // 在内层（一帧的窗口）里把第 `at` 帧挪到窗口位置。
+  // 这里**不需要**再加居中/贴底的偏移——那是外框摆内层的事，
+  // 混在一起会让两个方向的偏移互相污染。
+  target.style.backgroundPosition = layout === 'vertical'
+    ? `0px ${-at * shownHeight}px`
+    : `${-at * shownWidth}px 0px`;
 }
 
 /**
  * 创建一个播放器。
  *
  * @param {object} options
- * @param {HTMLElement} options.box 预览框（背景图 + 帧位移都在它身上）
+ * @param {HTMLElement} options.box 预览框（固定正方形，负责边框与留白）
  * @param {number} [options.speed] 速度倍率（越大越慢），与桌面宠物的语义一致
  * @param {function} [options.onFrame] `(index, frames)` 每帧回调（显示「第 n / N 帧」）
  * @param {function} [options.onEnd] 非循环动画播完时回调
  */
 export function createAnimationPlayer(options = {}) {
   const box = options.box;
+  // 内层：真正承载背景图的那一层（见 `applyFrameGeometry` 里对邻帧泄漏的说明）。
+  // 由播放器自己创建，调用方不必知道这个结构——它只是「让一帧被裁住」的手段。
+  const layer = box ? document.createElement('div') : null;
+  if (layer) {
+    layer.className = 'pet-preview-frame-layer';
+    box.appendChild(layer);
+  }
   let speed = Number(options.speed) > 0 ? Number(options.speed) : 1;
   const onFrame = typeof options.onFrame === 'function' ? options.onFrame : null;
   const onEnd = typeof options.onEnd === 'function' ? options.onEnd : null;
@@ -155,7 +211,14 @@ export function createAnimationPlayer(options = {}) {
   }
 
   function draw() {
-    applyFrameGeometry(box, frames, variant ? variant.layout : 'horizontal', index);
+    applyFrameGeometry(
+      box,
+      frames,
+      variant ? variant.layout : 'horizontal',
+      index,
+      variant ? variant.size : null,
+      layer,
+    );
   }
 
   return {
@@ -187,7 +250,11 @@ export function createAnimationPlayer(options = {}) {
       durations = frameDurations(source);
       loop = source.loop !== false;
       index = 0;
-      if (box) {
+      if (layer) {
+        // 背景图挂在**内层**（外框只负责边框与留白）
+        layer.style.backgroundImage = source.url ? `url("${source.url}")` : 'none';
+        layer.style.backgroundRepeat = 'no-repeat';
+      } else if (box) {
         box.style.backgroundImage = source.url ? `url("${source.url}")` : 'none';
         box.style.backgroundRepeat = 'no-repeat';
       }
@@ -242,6 +309,9 @@ export function createAnimationPlayer(options = {}) {
     dispose() {
       this.stop();
       variant = null;
+      // 内层是自己造的，得自己摘掉——否则每次重渲染都会在框里堆一层
+      // （面板 `render()` 会重建 DOM，但 `dispose()` 也可能被单独调用）
+      if (layer && layer.parentNode) layer.parentNode.removeChild(layer);
       return this;
     },
   };

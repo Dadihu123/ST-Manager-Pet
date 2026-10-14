@@ -178,13 +178,61 @@
   font: inherit;
 }
 
+/* 卡片有**两种**互相独立的高亮，必须能同时看出来：
+ *
+ * - `is-selected`：用户正在**看**这一个（右栏显示的是它）。
+ *   点击左侧任意一张卡就会切到这里。
+ * - `is-active`：这一个正在**用**（桌面上跑的是它）。
+ *   只有「设为当前形象」才会改变它。
+ *
+ * ⚠️ 用户报障：「选中某个形象时，右侧已经发生了变化，但是左侧选中态却不跟着走，
+ * 始终选中的是当前使用中的形象」。
+ *
+ * 原因就是这里：`renderPetCard()` 两种类都加了，但 CSS 里**只定义了
+ * `.is-active`**，`.is-selected` 一条规则都没有。于是「正在看的」在视觉上
+ * 完全没有反馈，而「正在用的」一直亮着——用户看到的自然是「选中态不跟着走」。
+ *
+ * 修法不是给 `is-selected` 随便加个底色，而是把两者的**视觉权重排开**：
+ * 选中（正在看）是用户此刻的操作焦点，给最强的反馈（左侧色条 + 描边 + 底色）；
+ * 使用中（在跑）是背景事实，降为**次要**信号（一枚小圆点 + 轻微的描边），
+ * 避免两个强高亮互相打架——那样用户还是分不清哪个是哪个。
+ */
 .plugin-stm-pet .pet-card:hover {
   border-color: var(--action-border, rgba(120, 120, 200, 0.5));
 }
 
-.plugin-stm-pet .pet-card.is-active {
-  border-color: var(--accent-color, #7c5cff);
+/* 正在看：最强反馈。
+ *
+ * `box-shadow` 而不是 `border-left`：卡片本身已有 1px 边框，
+ * 再加一条 3px 左边框会让内容整体右移（宽度是 `width: 100%` + `box-sizing`
+ * 之外的视觉差），切换选中时卡片会「抖」一下。
+ * `inset` 阴影画在边框内侧，不占布局，因此不会位移。 */
+.plugin-stm-pet .pet-card.is-selected {
+  border-color: var(--accent-action, #7c5cff);
   background: var(--surface-container-raised, rgba(124, 92, 255, 0.08));
+  box-shadow: inset 3px 0 0 0 var(--accent-action, #7c5cff);
+}
+
+/* 正在用：次要信号。
+ *
+ * 只留描边与极淡的底色，**不加** inset 色条——色条是「选中」的专属记号，
+ * 两者都用就等于都没用。真正的文字说明在卡片里的「当前使用中」一行。 */
+.plugin-stm-pet .pet-card.is-active {
+  border-color: var(--accent-action, #7c5cff);
+  background: var(--surface-container-raised, rgba(124, 92, 255, 0.04));
+}
+
+/* 既是选中又是使用中（默认打开面板时的状态）：回到最强的那一档，
+ * 否则「正在用的那个」反而比「正在看的那个」显得弱。 */
+.plugin-stm-pet .pet-card.is-selected.is-active {
+  background: var(--surface-container-raised, rgba(124, 92, 255, 0.1));
+  box-shadow: inset 3px 0 0 0 var(--accent-action, #7c5cff);
+}
+
+/* 「当前使用中」的文字标记：用强调色，与普通 meta 行区分开 */
+.plugin-stm-pet .pet-card-meta.is-current {
+  color: var(--accent-action, #7c5cff);
+  font-weight: 600;
 }
 
 .plugin-stm-pet .pet-card.is-broken {
@@ -279,7 +327,7 @@
   font-size: 9px;
   padding: 1px 4px;
   border-radius: 6px;
-  background: var(--accent-color, #7c5cff);
+  background: var(--accent-action, #7c5cff);
   color: var(--content-on-accent, #fff);
 }
 
@@ -301,19 +349,55 @@
   margin-bottom: 10px;
 }
 
-/* 预览框：固定尺寸的方框，帧位移靠 `background-position`（与宠物本体同规则）。
+/* 预览框：**正方形**的固定外框，里面再放一层「一帧大小」的内层。
  *
  * `background-size` / `background-position` 由 JS 写入（`preview.js`）——
- * 因为要按帧数与排布算，CSS 里表达不了。这里只给几何与外观。 */
+ * 因为要按帧数、排布与单帧原始宽高比算，CSS 里表达不了。这里只给几何与外观。
+ *
+ * ⚠️ 为什么是**正方形**而不是原来的 112×168 竖框：
+ * 旧框是 2:3 竖构图，恰好与站立动作同比例，所以一直没人发现问题；
+ * 而躺姿睡觉是横构图（小卡是 627×353），横图被强行拉进竖框就压扁了
+ * ——用户报的「看起来会很奇怪（点名小卡的睡觉动作）」就是这个。
+ *
+ * 正方形是唯一「对横竖构图都不偏袒」的外框形状：`preview.js` 在里面按
+ * 单帧真实比例做 `contain` 缩放并底边对齐，于是竖构图用满高度、
+ * 横构图用满宽度，两者都不变形、脚底还对齐。
+ *
+ * 尺寸比旧框更大（用户要求「搞个固定的大一些的正方形框」）：
+ * 168px 与旧框的高一致，因此面板布局不会变高，只是更宽。
+ * `max-width: 100%` 保证窄屏（面板右栏可能只有两百多像素）下不撑破容器。 */
 .plugin-stm-pet .pet-preview-box {
-  width: 112px;
+  /* `relative` 是内层定位的基准。这里用 `position: relative` 是安全的：
+   * 契约测试禁止的是 `fixed` / `sticky`（会逃出文档流、盖住宿主 UI），
+   * `relative` 不改变布局也不产生新的层叠上下文风险。 */
+  position: relative;
+  width: 168px;
   height: 168px;
+  max-width: 100%;
   flex: 0 0 auto;
   border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.1));
   border-radius: 10px;
   background-color: var(--surface-container-raised, rgba(0, 0, 0, 0.02));
-  background-repeat: no-repeat;
+  /* 裁掉内层的圆角溢出（内层是直角矩形，不裁会盖住外框的圆角） */
+  overflow: hidden;
   /* 默认平滑插值（与宠物本体的默认一致：写实插画硬边会出现块状锯齿） */
+  image-rendering: auto;
+}
+
+/* 内层：**一帧的大小**，背景图铺在它身上。
+ *
+ * 为什么不直接把背景铺在外框上：按比例装入必然留白，而
+ * `background-image` 是按**整条** spritesheet 铺的——留白处露出来的正是
+ * **相邻的帧**。实测能看到睡觉的预览框左边缘飘着一个「z」、右边缘挂着
+ * 半个人影（都是隔壁帧）。把背景放进「一帧大小」的内层之后，
+ * 它被自己的盒子裁住，邻帧物理上漏不出来。
+ *
+ * 尺寸与位置由 JS 逐帧写（`left` / `top` / `width` / `height`）。 */
+.plugin-stm-pet .pet-preview-frame-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  background-repeat: no-repeat;
   image-rendering: auto;
 }
 
@@ -340,7 +424,7 @@
 .plugin-stm-pet .pet-preview-frame {
   font-size: 11px;
   font-variant-numeric: tabular-nums;
-  color: var(--accent-color, #7c5cff);
+  color: var(--accent-action, #7c5cff);
 }
 
 .plugin-stm-pet .pet-preview-variants {
@@ -398,8 +482,8 @@
 }
 
 .plugin-stm-pet .pet-button.is-primary {
-  background: var(--accent-color, #7c5cff);
-  border-color: var(--accent-color, #7c5cff);
+  background: var(--accent-action, #7c5cff);
+  border-color: var(--accent-action, #7c5cff);
   color: var(--content-on-accent, #fff);
 }
 
@@ -495,7 +579,7 @@
   font-weight: 600;
   padding: 1px 6px;
   border-radius: 6px;
-  background: var(--accent-color, #7c5cff);
+  background: var(--accent-action, #7c5cff);
   color: var(--content-on-accent, #fff);
 }
 
@@ -527,7 +611,7 @@
   border-radius: 10px;
   border: 1px solid var(--border-default, rgba(0, 0, 0, 0.12));
   border-left-width: 3px;
-  border-left-color: var(--accent-color, #7c5cff);
+  border-left-color: var(--accent-action, #7c5cff);
   background: var(--surface-container, transparent);
 }
 
@@ -557,16 +641,62 @@
 
 /* ---------------------------------------------------------------- 滑块 */
 
-/* 大小倍率滑块。
+/* 调节条：与宿主「预设全屏编辑器」里的 `.preset-editor-range` 同一套外观
+ * （用户明确要求「调整为预设全屏编辑器中的调节条样式」）。
+ *
+ * 为什么必须自己画而不能只留 `accent-color`：
+ * 原生 range 的外观由各浏览器自定（Chrome 是灰色胶囊、Firefox 是另一套），
+ * 在宿主的深色主题下几乎看不清进度。宿主那套的做法是
+ * `appearance: none` + 用 `linear-gradient` 把「已选区间」画出来，
+ * 进度值由 JS 写进 `--pet-slider-progress`（与宿主的
+ * `--preset-editor-range-progress` 同一手法）。
  *
  * 宽度 100% 且 `min-width: 0`：面板右栏在窄屏下会变成单列，
  * 不给 `min-width: 0` 时 range 的默认宽度会把容器撑破。 */
 .plugin-stm-pet .pet-slider {
   width: 100%;
   min-width: 0;
+  height: 0.45rem;
   margin: 2px 0 4px;
-  accent-color: var(--accent-color, #7c5cff);
+  appearance: none;
+  -webkit-appearance: none;
+  border-radius: 999px;
+  background: linear-gradient(
+    to right,
+    var(--accent-action, #7c5cff) 0 var(--pet-slider-progress, 0%),
+    var(--surface-container-raised, rgba(0, 0, 0, 0.12)) var(--pet-slider-progress, 0%) 100%
+  );
   cursor: pointer;
+}
+
+/* 手柄（WebKit / Blink）。`appearance: none` 之后必须自己给形状，
+ * 否则手柄会**整个消失**（只剩一条无法拖动的色带）。 */
+.plugin-stm-pet .pet-slider::-webkit-slider-thumb {
+  width: 1rem;
+  height: 1rem;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 2px solid var(--surface-page, #ffffff);
+  border-radius: 50%;
+  background: var(--accent-action, #7c5cff);
+  box-shadow: 0 0 0 1px var(--accent-action, #7c5cff);
+}
+
+/* 手柄（Gecko）。Firefox 不接受 `::-webkit-slider-thumb`，
+ * 少了这条规则时手柄会退回原生外观，与色带对不上。 */
+.plugin-stm-pet .pet-slider::-moz-range-thumb {
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid var(--surface-page, #ffffff);
+  border-radius: 50%;
+  background: var(--accent-action, #7c5cff);
+  box-shadow: 0 0 0 1px var(--accent-action, #7c5cff);
+}
+
+/* 键盘可达性：焦点环必须可见（滑块是纯键盘可操作控件） */
+.plugin-stm-pet .pet-slider:focus-visible {
+  outline: 2px solid var(--accent-action, #7c5cff);
+  outline-offset: 4px;
 }
 
 .plugin-stm-pet .pet-slider-head {
@@ -580,7 +710,58 @@
   font-size: 12px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  color: var(--accent-color, #7c5cff);
+  color: var(--accent-action, #7c5cff);
+}
+
+/* 滑块 + 数字框一行。
+ *
+ * 用户要求「通过拖拽有时难以精确调整，请同步支持直接选择数字部分进行输入修改」，
+ * 因此每个滑块右边都配一个可直接输入的数值框。
+ * `flex-wrap` 保证窄屏下数字框换行而不是把滑块挤没。 */
+.plugin-stm-pet .pet-slider-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.plugin-stm-pet .pet-slider-row .pet-slider {
+  flex: 1 1 120px;
+  width: auto;
+  margin: 2px 0 4px;
+}
+
+/* 数字输入框：等宽数字 + 居中，宽度只够放 4~5 位数，
+ * 免得它抢走滑块的横向空间（滑块才是主要交互方式）。 */
+.plugin-stm-pet .pet-slider-number {
+  flex: 0 0 auto;
+  width: 4.6rem;
+  padding: 3px 4px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default, rgba(0, 0, 0, 0.14));
+  background: var(--surface-container, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.plugin-stm-pet .pet-slider-number:focus-visible {
+  outline: 2px solid var(--accent-action, #7c5cff);
+  outline-offset: 1px;
+  border-color: var(--accent-action, #7c5cff);
+}
+
+/* 区间两端提示（与宿主预设编辑器一致：最小 / 当前 / 最大 一行小字） */
+.plugin-stm-pet .pet-slider-range {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--content-muted, rgba(0, 0, 0, 0.55));
 }
 
 /* ------------------------------------------------ 触发时间的双滑块一行 */
@@ -634,7 +815,7 @@
 }
 
 .plugin-stm-pet .pet-choice.is-active {
-  border-color: var(--accent-color, #7c5cff);
+  border-color: var(--accent-action, #7c5cff);
   background: var(--surface-container-raised, rgba(124, 92, 255, 0.08));
   font-weight: 600;
 }

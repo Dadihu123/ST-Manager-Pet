@@ -212,6 +212,14 @@ export function createPetView(options = {}) {
   let currentVariant = null;
   /** idle 的「随机触发」进行中（播完要回静止，而不是留在循环里）。 */
   let idleBurst = false;
+  /**
+   * 上一帧是否处于「离地」状态。
+   *
+   * 用来识别「刚回到地面」这个边沿：空中会撤掉 idle 排期（见
+   * `updateStateFromPhysics` 的空中护栏），而点击弹跳不产生状态迁移，
+   * 因此没有别的地方会把它排回来。
+   */
+  let wasAirborne = false;
   let rafId = 0;
   let running = false;
   let lastFrameAt = 0;
@@ -601,6 +609,13 @@ export function createPetView(options = {}) {
     if (throttle.paused) return false;
     if (physics.dragging || gesture.phase === 'pending') return true;
     if (machine.state === STATES.FALL || machine.state === STATES.WALK) return true;
+    // 空中（例如点击后的小弹跳）也必须继续跑。
+    //
+    // `handleClick()` 刻意**不**进 `fall` 态（否则落地动作会打断点击动画），
+    // 于是弹跳期间状态是 `idle`/`react` 而 `physics.grounded` 为假。
+    // 若在这里就返回 `!physics.resting`，循环会在弹到最高点时停掉——
+    // 宠物**悬在半空不动**，直到下一次交互才继续下落（真实故障）。
+    if (!physics.grounded) return true;
     if (machine.state === STATES.REACT || machine.state === STATES.LAND) {
       // 一次性动作：播完就停
       return !clock.finished;
@@ -625,12 +640,39 @@ export function createPetView(options = {}) {
   function updateStateFromPhysics(dt, now) {
     const state = machine.state;
 
-    if (physics.justLanded && (state === STATES.FALL || state === STATES.DRAG)) {
+    // ---- 落地判定
+    //
+    // 用 `touchedDown`（离地→触地的**状态翻转**）而不是 `justLanded`
+    // （冲击够不够重）。两者的分工见 `physics.js` 里 `touchedDown` 的说明。
+    //
+    // 用 `justLanded` 的旧写法有两个真实故障：
+    // 1. 从很低的地方放下 / 贴着地面松手时冲击不足 60px/s，于是永远不落地
+    //    —— 宠物贴在屏幕上一直播下落动画，而且 rAF 永不停止（`fall` 属于
+    //    「必须继续跑」的状态，省电直接失效）；
+    // 2. 用户报的「不是以坠落动画落得地就没有落地动画」，同源。
+    //
+    // 允许的来源只有 `fall` 与 `drag`：
+    // - `fall`：正常路径（松手 → 下坠 → 触地）；
+    // - `drag`：防御性保留。物理在拖拽期间**不推进**（`step()` 直接返回），
+    //   因此 `touchedDown` 理论上不会在 `drag` 态为真；留着它只是为了
+    //   万一将来「拖拽中也跑物理」时不会退化成「永远不落地」。
+    //   `react` **刻意排除**：点击后的小弹跳不切 `fall`（见 `handleClick()`），
+    //   因此也不该被落地动作打断——那是点击反馈的一部分。
+    if (physics.touchedDown && (state === STATES.FALL || state === STATES.DRAG)) {
       machine.land({ now });
       // 落地动作播完回 idle（一次性）
       const duration = actionDurationMs('land', 180);
       clearTimeout(actionTimer);
       actionTimer = setTimeout(() => {
+        // ⚠️ 必须复核当前状态：这个定时器跨越了 `duration` 毫秒，
+        // 期间用户完全可能又把它抓起来（`land` → `drag` 是合法迁移）。
+        // 不复核的话，落地动作还没播完就被拖走，这个定时器随后仍会执行
+        // `settle()`——把**正在被拖拽**的宠物从 `drag` 拽进 `idle`，
+        // 于是松手时它不进入 `fall`，直接在半空中播待机动画。
+        if (machine.state !== STATES.LAND) {
+          wake();
+          return;
+        }
         const pending = machine.takePendingReaction();
         if (pending) {
           machine.react(pending, { now: performance.now() });
@@ -641,6 +683,38 @@ export function createPetView(options = {}) {
         wake();
       }, duration);
       return;
+    }
+
+    // ---- 空中护栏
+    //
+    // 只要**离地且不在拖拽中**，就不允许推进任何「地面行为」：
+    // 漫游倒计时、打盹计时、idle 随机触发。
+    //
+    // 用户报的「空中播放别的动画，甚至多个动画交替出现」就出在这里：
+    // 这些计时器都在 rAF 里按 dt 推进，而 `fall` 期间 rAF **正好在跑**
+    // （它是「必须继续跑」的状态）。于是坠落途中漫游到点 → `startWalk()`
+    // （`fall` → `walk` 不在表里，会被拒绝，但倒计时已经被消耗掉），
+    // 打盹到点 → `sleep()`（同样被拒绝），而 `idleBurst` 那条路径
+    // 会直接改动作名，宠物就在半空中播起了待机动画。
+    //
+    // 从源头掐掉比逐个迁移去拒绝更稳：这些行为在物理上就要求「站在地上」。
+    const airborne = !physics.grounded && !physics.dragging;
+    if (airborne) {
+      // 已经排好的 idle 触发也要撤掉（它可能在起跳之前就排好了）
+      cancelIdleWake();
+      wasAirborne = true;
+      return;
+    }
+    // 刚回到地面：把空中撤掉的那次 idle 排期补回来。
+    //
+    // 为什么必须补：`scheduleIdleWake()` 只在**状态迁移**时重排
+    // （`onStateEnter` 进入 idle、`finishIdleBurst` 收尾、降频恢复）。
+    // 而「点击后的小弹跳」不产生任何状态迁移（状态一直是 idle），
+    // 于是空中撤掉排期之后就再也没有人去排它——宠物从此再也不自己动一下，
+    // 直到用户点它一次。这个补排就是那条路径的收尾。
+    if (wasAirborne) {
+      wasAirborne = false;
+      if (machine.state === STATES.IDLE && !idleBurst) scheduleIdleWake();
     }
 
     if (state === STATES.WALK) {
@@ -695,7 +769,15 @@ export function createPetView(options = {}) {
       && machine.state === STATES.IDLE
       && !idleBurst
       && gesture.phase === 'done'
-      && !physics.dragging;
+      && !physics.dragging
+      // 必须**站在地上**才谈得上「闲着动一下」。
+      //
+      // 少了这一条时，点击后的小弹跳（`handleClick()` 给了一个上抛初速度，
+      // 而它刻意不进 `fall` 态）会让宠物在**空中**满足「idle 且无占用」，
+      // 于是排下一次小动作——弹跳只有 0.3 秒，排期是 6~18 秒，
+      // 通常赶不上；但只要系统卡一下（或动画速度调到 4×）就会撞上，
+      // 表现为「点一下它，它跳起来的时候突然播待机动画」。
+      && physics.grounded;
   }
 
   /** 清掉待执行的 idle 触发（任何交互 / 状态变化都要调）。 */

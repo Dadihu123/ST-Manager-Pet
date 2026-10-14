@@ -75,8 +75,23 @@ export function createPhysics(options = {}) {
   let grounded = false;
   let dragging = false;
   let inputActive = false;
-  /** 本步内是否发生过「刚触地」（用于触发 land 动作，一次性）。 */
+  /** 本步内是否发生过「砸下来」（**重**触地，一次性）。 */
   let justLanded = false;
+  /**
+   * 本步内是否发生过「离地 → 触地」的**状态翻转**（一次性）。
+   *
+   * 为什么它与 `justLanded` 必须分开：两者回答的是不同的问题。
+   *
+   * - `justLanded` 回答「砸得够不够重」——它是**动画选择**的依据，
+   *   轻贴地面不该播「落地」那一套（会像在发抖）。
+   * - `touchedDown` 回答「它现在回到地面了吗」——它是**状态迁移**的依据。
+   *
+   * 合在一起用会漏掉真实故障：用户把宠物从很低的地方放下（或贴着地面松开），
+   * 冲击速度不到 60px/s，于是 `justLanded` 为假 → 状态机永远停在 `fall`，
+   * 既没有落地动作，rAF 也永远停不下来（`fall` 是「必须继续跑」的状态），
+   * 表现为「宠物贴着地面一直播下落的动画」。这正是用户报的那个衍生现象。
+   */
+  let touchedDown = false;
 
   const halfWidth = () => size.width / 2;
 
@@ -97,7 +112,6 @@ export function createPhysics(options = {}) {
       // 拖拽期间由指针事件直接写位置，物理不参与（否则会跟手失败）
       return;
     }
-    justLanded = false;
 
     // 重力
     vy += params.gravity * dt;
@@ -138,6 +152,13 @@ export function createPhysics(options = {}) {
         vy = 0;
         grounded = true;
       }
+      // 只在**真的落到地面**（而不是弹回去的那一下）时置位。
+      //
+      // 反弹时 `grounded` 仍为假——宠物确实还在空中，因此不算「回来了」。
+      // 若在这里无条件置位，宠物会在弹起的那一瞬间被判成落地，
+      // 于是「落地动作 + 空中继续上抛」同时发生，看起来又是一次空中串动作。
+      if (!wasGrounded && grounded) touchedDown = true;
+      // 「砸得够不够重」是**动画选择**的依据（轻贴地面不播落地那套）
       if (!wasGrounded && impactOccurred(impact)) justLanded = true;
     } else {
       grounded = false;
@@ -162,6 +183,13 @@ export function createPhysics(options = {}) {
     get grounded() { return grounded; },
     get dragging() { return dragging; },
     get justLanded() { return justLanded; },
+    /**
+     * 本步内是否刚从**空中回到地面**（一次性，含轻贴地面）。
+     *
+     * 与 `justLanded` 的区别见文件内 `touchedDown` 的说明：
+     * 这个是**状态迁移**的依据（`fall` → `land`），那个是**动画选择**的依据。
+     */
+    get touchedDown() { return touchedDown; },
     get bounds() { return { width: bounds.width, height: bounds.height }; },
     get size() { return { width: size.width, height: size.height }; },
     get params() { return Object.assign({}, params); },
@@ -255,9 +283,26 @@ export function createPhysics(options = {}) {
      * 推进物理。用**累加器 + 固定步长**：无论 `dt` 多大或多小，
      * 走的都是同样大小的物理步，因此表现与帧率无关（§4.1 / §8 陷阱 10）。
      *
+     * 一次性标记（`justLanded` / `touchedDown`）在**每次 `advance()` 开头**
+     * 清掉，而不是在每个内部 `step()` 开头清。
+     *
+     * 为什么：一帧内可能补算**多步**（累加器，最多 `MAX_STEPS_PER_FRAME` 步）。
+     * 放在 `step()` 里清的话，只有**最后一步**的结论能被调用方看到——
+     * 落地恰好发生在倒数第二步时，标记会被最后一步擦掉，
+     * 表现为「这次落地莫名其妙没触发落地动作」（时有时无，极难复现）。
+     *
      * @returns {{steps: number, dx: number, dy: number}} 本帧实际走了几步与位移
      */
     advance(dt) {
+      // 本帧的一次性标记先清空，再让内部各步去置位（见上）。
+      //
+      // ⚠️ 必须在 `dragging` 分支**之前**清：拖拽期间 `step()` 根本不会跑，
+      // 若这时不清，上一次自由下落留下的 `touchedDown` 会一直为真——
+      // 于是用户刚把宠物抓起来（`drag` 态）就会被判成「落地」，
+      // 它在手里播起了落地动画。
+      justLanded = false;
+      touchedDown = false;
+
       if (dragging) {
         accumulator = 0;
         return { steps: 0, dx: 0, dy: 0 };

@@ -355,6 +355,72 @@ test('物理：慢速贴地不触发 justLanded（不算"砸下来"）', () => {
   assert.equal(body.justLanded, false);
 });
 
+test('物理：已经站在地面的宠物不会反复报告 touchedDown', () => {
+  // `touchedDown` 是「离地 → 触地」的**边沿**，不是「现在在地面上」这个电平。
+  // 若它退化成电平，`fall` 之后每帧都会判一次落地，落地动作会被无限重播。
+  const body = physicsAt({ y: 600 });
+  for (let index = 0; index < 5; index += 1) body.advance(FIXED_STEP);
+  assert.equal(body.grounded, true);
+  for (let index = 0; index < 5; index += 1) {
+    body.advance(FIXED_STEP);
+    assert.equal(body.touchedDown, false, '一直在地面上，不该再有落地边沿');
+  }
+});
+
+test('物理：从空中轻轻落到地面会置 touchedDown 但不置 justLanded', () => {
+  // 这是用户报障的核心场景：把宠物拖到离地很近的地方松手。
+  // 冲击不足 60px/s，`justLanded` 为假——只靠它就永远出不了 fall 状态。
+  const body = physicsAt({ y: 560, physics: { gravity: 40, bounce: 0 } });
+  let touched = false;
+  let heavy = false;
+  for (let index = 0; index < 300; index += 1) {
+    body.advance(FIXED_STEP);
+    if (body.touchedDown) touched = true;
+    if (body.justLanded) heavy = true;
+  }
+  assert.equal(body.grounded, true, '应该落到地面');
+  assert.ok(touched, '轻落也要置 touchedDown——否则状态机出不了 fall');
+  assert.equal(heavy, false, '重力很小时冲击不足，不该算"砸下来"');
+});
+
+test('物理：touchedDown 是离地→触地的翻转，弹起时不算落地', () => {
+  // 反弹时 `grounded` 仍为假（宠物确实还在空中）。若在弹起那一瞬就判成
+  // 「回来了」，落地动作会与「空中继续上抛」同时发生——又是一次空中串动作。
+  const body = physicsAt({ y: 100 });
+  const touchedAt = [];
+  for (let index = 0; index < 400; index += 1) {
+    body.advance(FIXED_STEP);
+    if (body.touchedDown) touchedAt.push(index);
+  }
+  assert.ok(touchedAt.length >= 1, '至少要有一次真正的落地');
+  assert.equal(body.grounded, true, '最终应停在地面');
+});
+
+test('物理：touchedDown 是每帧一次的标记（一帧多步不会漏掉落地）', () => {
+  // 一帧内可能补算多步（累加器，最多 60 步）。若标记在**每个内部步**开头清，
+  // 只有最后一步的结论能被看到——落地恰在倒数第二步时会被擦掉，
+  // 表现为「这次落地莫名其妙没触发落地动作」（时有时无，极难复现）。
+  const body = physicsAt({ y: 500, physics: { bounce: 0 } });
+  // 一次性推进约 40 个固定步：落地必然发生在**中间**某一步，
+  // 而不是被擦掉的最后一步
+  body.advance(0.34);
+  assert.equal(body.grounded, true, '这一帧内应该已经落地');
+  assert.ok(body.touchedDown, '落地发生在帧中间也不能漏报');
+});
+
+test('物理：拖拽期间不清标记会误判落地（防回归）', () => {
+  // 拖拽时 `step()` 根本不跑。若不在 `advance()` 开头清标记，
+  // 上一次自由下落留下的 touchedDown 会一直为真——
+  // 用户刚把宠物抓起来就会被判成「落地」，它在手里播落地动画。
+  const body = physicsAt({ y: 100 });
+  for (let index = 0; index < 200; index += 1) body.advance(FIXED_STEP);
+  assert.equal(body.grounded, true);
+  body.beginDrag(300, 300);
+  body.advance(FIXED_STEP);
+  assert.equal(body.touchedDown, false, '抓在手里不该被判成落地');
+  assert.equal(body.justLanded, false);
+});
+
 test('物理：行走用 walkSpeed，停下后摩擦减速到 0', () => {
   const body = physicsAt({ y: 600, x: 300 });
   body.walk(1);
@@ -491,6 +557,61 @@ test('状态机：非法迁移被拒绝', () => {
   assert.equal(canTransition(STATES.LAND, STATES.SLEEP), false, '落地瞬间不该直接睡');
   assert.equal(canTransition(STATES.DRAG, STATES.SLEEP), false, '被抓着时不该睡');
   assert.equal(canTransition('nonsense', STATES.IDLE), false);
+});
+
+test('状态机：空中不能直接回 idle（必须经过 land）', () => {
+  // ⚠️ 这条是用户报障「在空中播放其他动画，甚至多个动画交替出现」的核心。
+  //
+  // 表里曾经有 `FALL → IDLE`，而它正是那条路径的入口：坠落期间任何**过期的
+  // 定时器**（上一次播报的收尾、待机的随机触发、漫游倒计时）只要调到
+  // `settle()`，就能把宠物从 fall 直接拽进 idle——于是它在半空中播起待机
+  // 动画，接着还能从 idle 走去 walk / sleep，看起来就是「空中好几个动画轮流播」。
+  //
+  // 回到地面的唯一出口必须是 `land`——这正是物理上的事实。
+  assert.equal(canTransition(STATES.FALL, STATES.IDLE), false, '空中不能直接回 idle');
+  assert.equal(canTransition(STATES.FALL, STATES.WALK), false, '空中不能开始走');
+  assert.equal(canTransition(STATES.FALL, STATES.SLEEP), false, '空中不能睡');
+  assert.equal(canTransition(STATES.FALL, STATES.REACT), false, '空中不能抢播报');
+  assert.ok(canTransition(STATES.FALL, STATES.LAND), '落地是唯一正常出口');
+  assert.ok(canTransition(STATES.FALL, STATES.DRAG), '空中仍可被抓住（硬要求 1）');
+});
+
+test('状态机：空中调 settle() 被拒绝，且不污染动作名', () => {
+  // 迁移被拒绝时动作名也**不能**被改掉。旧写法是「先写 currentAction、
+  // 再 transition」，于是状态停在 fall、动作名已经变成 idle，
+  // `machine.action` 与 `machine.state` 就此脱节——读取它的地方
+  // （dormant / animating / 面板诊断）会得到自相矛盾的答案。
+  const machine = createStateMachine();
+  machine.beginDrag({ now: 0 });
+  machine.release({ now: 1 });
+  assert.equal(machine.state, STATES.FALL);
+  assert.equal(machine.action, 'fall');
+
+  assert.equal(machine.settle({ now: 2 }), false, '空中回 idle 必须被拒绝');
+  assert.equal(machine.state, STATES.FALL, '状态不该变');
+  assert.equal(machine.action, 'fall', '动作名也不该被改掉（不能脱节）');
+
+  assert.equal(machine.startWalk({ now: 3 }), false, '空中开始走必须被拒绝');
+  assert.equal(machine.action, 'fall', '被拒绝的迁移不该改动作名');
+
+  assert.equal(machine.sleep({ now: 4 }), false, '空中入睡必须被拒绝');
+  assert.equal(machine.action, 'fall');
+});
+
+test('状态机：空中播报被排队，落地后立刻播（而不是半空中播）', () => {
+  // 用户报的「空中播放别的动画」里这一条也是来源：旧实现在 fall 期间会把
+  // `currentAction` 改成 happy（虽然迁移被拒绝），动作名与状态脱节。
+  // 现在与 drag 同等对待：排队，回到地面后再播。
+  const machine = createStateMachine();
+  machine.beginDrag({ now: 0 });
+  machine.release({ now: 1 });
+  assert.equal(machine.react('happy', { now: 2 }), false, '空中不该抢播报');
+  assert.equal(machine.action, 'fall', '动作名保持 fall');
+  assert.equal(machine.pendingReaction, 'happy', '但请求要记下来');
+
+  machine.land({ now: 3 });
+  assert.equal(machine.state, STATES.LAND);
+  assert.equal(machine.takePendingReaction(), 'happy', '落地后能取回排队的播报');
 });
 
 test('状态机：硬要求 1——任何状态都能被 drag 打断', () => {
