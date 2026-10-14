@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { frameGrid, gridPosition } from '../../frontend/animation.js';
+import { frameGrid, framePage, framePageCount } from '../../frontend/animation.js';
 import { frameDurations, totalDuration, applyFrameGeometry } from '../../frontend/preview.js';
 
 /**
@@ -543,18 +543,145 @@ test('frameGrid：非法输入不产生 0 或 NaN', () => {
   }
 });
 
-test('gridPosition：行优先，且帧号被夹在合法范围', () => {
+test('framePage：行优先定位（单页语义与从前一致）', () => {
   const grid = { cols: 4, rows: 4 };
-  assert.deepEqual(gridPosition(0, grid, 13), { col: 0, row: 0 });
-  assert.deepEqual(gridPosition(3, grid, 13), { col: 3, row: 0 });
-  assert.deepEqual(gridPosition(4, grid, 13), { col: 0, row: 1 });
-  assert.deepEqual(gridPosition(12, grid, 13), { col: 0, row: 3 });
+  const pos = (i, frames) => {
+    const at = framePage(i, grid, frames);
+    return { col: at.col, row: at.row };
+  };
+  assert.deepEqual(pos(0, 13), { col: 0, row: 0 });
+  assert.deepEqual(pos(3, 13), { col: 3, row: 0 });
+  assert.deepEqual(pos(4, 13), { col: 0, row: 1 });
+  assert.deepEqual(pos(12, 13), { col: 0, row: 3 });
   // 越界夹到最后一帧（不是落到空格子上）
-  assert.deepEqual(gridPosition(99, grid, 13), { col: 0, row: 3 });
-  assert.deepEqual(gridPosition(-5, grid, 13), { col: 0, row: 0 });
-  // 不给帧数时上限是网格容量
-  assert.deepEqual(gridPosition(99, grid), { col: 3, row: 3 });
+  assert.deepEqual(pos(99, 13), { col: 0, row: 3 });
+  assert.deepEqual(pos(-5, 13), { col: 0, row: 0 });
 });
+
+// ============================================================ 多页（pages）
+//
+// 多页与单页的差别全在**换页**上：换页要换 `background-image`（一次解码），
+// 而换格只改 `background-position`（零成本）。因此坐标要分成两件事：
+// 「在哪一页」（决定用哪张图）与「页里哪一格」（决定背景位移）。
+//
+// 帧序是**页优先、页内行优先**：先把第 0 页走完，再进第 1 页。
+// 这与单页内 `grid` 的顺序完全一致，因此是自然扩展。
+
+
+test('★ framePage：页优先、页内行优先', () => {
+  // 2×2 网格，每页 4 帧，共 8 帧
+  const grid = { cols: 2, rows: 2 };
+  const expected = [
+    { page: 0, local: 0, col: 0, row: 0 },
+    { page: 0, local: 1, col: 1, row: 0 },
+    { page: 0, local: 2, col: 0, row: 1 },
+    { page: 0, local: 3, col: 1, row: 1 },
+    { page: 1, local: 0, col: 0, row: 0 },   // ★ 第 4 帧换页，回到左上角
+    { page: 1, local: 1, col: 1, row: 0 },
+    { page: 1, local: 2, col: 0, row: 1 },
+    { page: 1, local: 3, col: 1, row: 1 },
+  ];
+  for (const [index, want] of expected.entries()) {
+    assert.deepEqual(framePage(index, grid, 8), want, `第 ${index} 帧`);
+  }
+});
+
+test('★ framePage：单页时与单页定位完全一致（多页是自然扩展）', () => {
+  // 单页包（绝大多数）的坐标必须与从前**逐值一致**，否则多页特性会
+  // 悄悄改变所有既有形象的播放。
+  const cases = [
+    { grid: { cols: 4, rows: 1 }, frames: 4 },
+    { grid: { cols: 1, rows: 4 }, frames: 4 },
+    { grid: { cols: 4, rows: 4 }, frames: 13 },
+  ];
+  for (const item of cases) {
+    for (let i = 0; i < item.frames; i += 1) {
+      const at = framePage(i, item.grid, item.frames);
+      assert.equal(at.page, 0, '单页时永远在第 0 页');
+      assert.equal(at.local, i, '页内帧号就是全局帧号');
+      assert.equal(at.col, i % item.grid.cols);
+      assert.equal(at.row, Math.floor(i / item.grid.cols));
+    }
+  }
+});
+
+test('framePage：越界夹到最后一帧，不落到空格子上', () => {
+  const grid = { cols: 2, rows: 2 };
+  assert.deepEqual(framePage(99, grid, 6), framePage(5, grid, 6));
+  assert.deepEqual(framePage(-3, grid, 6), { page: 0, local: 0, col: 0, row: 0 });
+});
+
+test('framePage：退化输入不产生 NaN 或负值', () => {
+  for (const bad of [
+    { cols: 0, rows: 0 }, { cols: -2, rows: 1 }, { cols: NaN, rows: NaN },
+    null, undefined, {},
+  ]) {
+    const at = framePage(0, bad, 1);
+    for (const key of ['page', 'local', 'col', 'row']) {
+      assert.ok(Number.isInteger(at[key]) && at[key] >= 0,
+        `${JSON.stringify(bad)} → ${key}=${at[key]}`);
+    }
+  }
+});
+
+test('framePageCount：页数由后端下发的 pages 决定（磁盘事实）', () => {
+  assert.equal(framePageCount({ pages: ['a', 'b'] }), 2);
+  assert.equal(framePageCount({ pages: ['a'] }), 1);
+  // 单页包没有 pages → 1
+  assert.equal(framePageCount({ url: 'a' }), 1);
+  assert.equal(framePageCount({}), 1);
+  assert.equal(framePageCount(null), 1);
+  // 空数组视为「没给」
+  assert.equal(framePageCount({ pages: [] }), 1);
+});
+
+test('★ 预览几何：多页时返回正确的页号（播放器靠它换图）', () => {
+  // `applyFrameGeometry` 不碰 `background-image`（只有播放器知道 URL 列表），
+  // 但它算出的 `page` 是播放器换页的**唯一依据**——算错就会铺错图。
+  const box = fakeBox(168, 168);
+  const layer = fakeLayer();
+  const grid = { cols: 2, rows: 2 };
+  for (const [index, wantPage] of [[0, 0], [3, 0], [4, 1], [7, 1]]) {
+    const at = applyFrameGeometry(box, grid, 8, index, { w: 100, h: 100 }, layer);
+    assert.equal(at.page, wantPage, `第 ${index} 帧应在第 ${wantPage} 页`);
+  }
+});
+
+test('★ 预览几何：跨页时页内位移回到左上角（不是累加）', () => {
+  // 第 4 帧是第 1 页的第 0 格，位移必须是 (0,0)——累加的话它会跑到
+  // 第 1 页的右下角，看起来像「每过一页就偏一格」。
+  const box = fakeBox(168, 168);
+  const layer = fakeLayer();
+  const grid = { cols: 2, rows: 2 };
+  const first = applyFrameGeometry(box, grid, 8, 0, { w: 100, h: 100 }, layer);
+  const offset0 = { x: layer.offset.x, y: layer.offset.y };
+  const crossed = applyFrameGeometry(box, grid, 8, 4, { w: 100, h: 100 }, layer);
+  assert.equal(crossed.page, 1);
+  assert.equal(crossed.local, 0);
+  assert.deepEqual(
+    { x: layer.offset.x, y: layer.offset.y },
+    offset0,
+    '换页后的第 0 格位移应与第 0 页的第 0 格相同',
+  );
+});
+
+test('预览几何：多页时整条 sheet 仍按**每页**的行列数铺', () => {
+  // 每页形状相同，因此 sheet 尺寸公式不变——变的只是「铺哪一张图」。
+  const box = fakeBox(168, 168);
+  const layer = fakeLayer();
+  applyFrameGeometry(box, { cols: 3, rows: 2 }, 12, 0, { w: 100, h: 100 }, layer);
+  const perPage = layer.size;
+  // 6 格/页 × 2 页 = 12 帧，但整条尺寸只反映**一页**（3×2），不是 12 格
+  const cellW = perFrameWidth(perPage, 3);
+  assert.ok(cellW > 0);
+  const onePage = geom(168, 6, { cols: 3, rows: 2 }, 0, { w: 100, h: 100 });
+  assert.deepEqual(perPage, onePage.layer.size, '整条尺寸应与同网格的单页一致');
+});
+
+/** 从整条尺寸与列数反推单帧宽（便于断言）。 */
+function perFrameWidth(sheet, cols) {
+  return sheet ? sheet.w / cols : 0;
+}
 
 test('预览几何：帧号越界被夹到合法范围', () => {
   const over = geom(168, 4, 'horizontal', 99, { w: 64, h: 64 });

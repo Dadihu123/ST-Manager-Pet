@@ -130,13 +130,20 @@ def test_grid_without_any_direction_is_an_error():
 
 
 def test_grid_too_small_for_frames_is_an_error():
-    """帧放不下：作者一定算错了，不能静默丢帧。"""
+    """帧放不下：作者一定算错了，不能静默丢帧。
+
+    静默丢帧是最坏的后果——宠物只播前 16 帧，而作者以为 20 帧都在，
+    且包能读、宠物能跑，完全没有报错可循。
+    """
     with pytest.raises(Exception) as info:
         _variant({'sheet': 'a.png', 'frames': 20, 'cols': 4, 'rows': 4})
     assert info.value.code == CODE_PACK_FIELD_INVALID
-    # 错误信息要指出「需要多少行」，否则作者还得自己算
+    # 错误信息要指出「声明了几格、实际需要多少」
     assert '20' in info.value.user_msg
-    assert '5' in info.value.hint, f'提示里应给出需要的行数: {info.value.hint}'
+    assert '16' in info.value.user_msg, f'应说明网格只有 16 格: {info.value.user_msg}'
+    # 提示里要给出**可执行的修法**：需要几页 / 或把网格调大
+    assert '2 页' in info.value.hint, f'提示里应给出需要的页数: {info.value.hint}'
+    assert 'cols' in info.value.hint or 'rows' in info.value.hint
 
 
 def test_layout_conflicting_with_cols_is_an_error():

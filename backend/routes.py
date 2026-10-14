@@ -250,7 +250,8 @@ def register_routes(api, store: PetStore) -> None:
 
         走插件自己的路由而不是宿主资产通路，原因见模块 docstring。
 
-        `?vi=<n>` 选第几套动画（多套动画按权重随机选一套时用，默认第 0 套）。
+        `?vi=<n>` 选第几套动画（多套动画按权重随机选一套时用，默认第 0 套）；
+        `?pg=<n>` 选第几**页**（多页 sheet，默认第 0 页）。
         """
         if not PET_ID_PATTERN.match(str(pet_id or '')):
             raise PetError(
@@ -273,12 +274,18 @@ def register_routes(api, store: PetStore) -> None:
             # 非法参数按第 0 套处理，而不是 400：这是**图片**路由，
             # 前端拼 URL 时多一个脏参数不该让整张图取不到。
             variant = 0
+        try:
+            page = max(0, int(request.args.get('pg') or 0))
+        except (TypeError, ValueError):
+            page = 0
 
-        path, source = store.resolve_frame_path(pet_id, action, variant=variant)
+        path, source = store.resolve_frame_path(
+            pet_id, action, variant=variant, page=page,
+        )
         if not path or not os.path.isfile(path):
             raise PetError(
                 'pack_animation_missing',
-                f'动作 {action} 没有可用的图（第 {variant} 套）',
+                f'动作 {action} 没有可用的图（第 {variant} 套、第 {page} 页）',
                 user_msg='这个动作还没有图。',
                 http_status=404,
             )
@@ -716,6 +723,10 @@ def register_routes(api, store: PetStore) -> None:
                 variants.append({
                     'index': index,
                     'url': variant.get('url', ''),
+                    # 多页：每一页的 URL。**必须透传**，否则面板预览器
+                    # 只播得到第一页——而后端与桌面宠物都在正常切页，
+                    # 表现为「桌面上对、面板预览里只播前几帧」。
+                    'pages': variant.get('pages') or [],
                     'frames': variant.get('frames'),
                     'fps': variant.get('fps'),
                     'loop': variant.get('loop'),
@@ -728,6 +739,10 @@ def register_routes(api, store: PetStore) -> None:
                     'frameMs': variant.get('frameMs') or [],
                     'weight': variant.get('weight'),
                     'frameSource': variant.get('frameSource'),
+                    # 显存估算：面板要把它显示给用户（用户看不到显存，
+                    # 因此「这个形象重不重」只能由插件告诉他）。
+                    'decodeBytes': variant.get('decodeBytes') or 0,
+                    'pageCount': variant.get('pageCount') or 1,
                     # 单帧尺寸（可能缺省 = 沿用包级）。
                     #
                     # 必须透传：面板的预览框要按**真实宽高比**把这一帧装进去，
@@ -747,6 +762,10 @@ def register_routes(api, store: PetStore) -> None:
                 'layout': entry.get('layout'),
                 'cols': entry.get('cols'),
                 'rows': entry.get('rows'),
+                # 多页：主变体的页数组（前端不必先钻进 `variants` 才知道有几页）
+                'pages': entry.get('pages') or [],
+                'decodeBytes': entry.get('decodeBytes') or 0,
+                'pageCount': entry.get('pageCount') or 1,
                 'frameMs': entry.get('frameMs') or [],
                 'url': entry.get('url'),
                 'note': entry.get('note'),
@@ -771,6 +790,9 @@ def register_routes(api, store: PetStore) -> None:
             'overrides': pack.get('overrides', []),
             'staleOverrides': pack.get('staleOverrides', []),
             'missingRequired': pack['missingRequired'],
+            # 显存预算：面板据此判断「这个动作重不重」并给出提示。
+            'decodeBytes': pack.get('decodeBytes', 0),
+            'decodeBudgetBytes': pack.get('decodeBudgetBytes', 0),
             # 标准图像（不播动画时显示的那一帧）。面板用它在预览区标出
             # 「静止时会显示这一张」，并让用户知道当前是作者声明的还是回落的。
             'still': pack.get('still'),

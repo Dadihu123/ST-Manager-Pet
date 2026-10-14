@@ -165,25 +165,46 @@ export function frameGrid(source) {
 }
 
 /**
- * 第 `index` 帧在网格里的**行列位置**（行优先：先从左到右，再从上到下）。
+ * 一套动画有几页（至少 1）。
  *
- * 行优先是用户明确要求的顺序（「先遍历行，再遍历列」），也是
- * `horizontal` 的历史行为（`cols=N, rows=1` 时行优先退化成「从左到右」）。
+ * 页数的**权威来源是后端下发的 `pages` 数组长度**——「磁盘上有几张图」
+ * 是客观事实。这里只在后端没给 `pages` 时退回 1（老后端 / 单页包）。
  *
- * @param {number} index 帧号（会被夹到合法范围）
- * @param {object} grid `{cols, rows}`
- * @param {number} [frames] 帧数；给了就把帧号夹在 `[0, frames-1]`
- * @returns {{col: number, row: number}} 两个都是非负整数
+ * @param {object} source 形如 `{pages: [url, ...]}`
+ * @returns {number} >= 1 的整数
  */
-export function gridPosition(index, grid, frames) {
+export function framePageCount(source) {
+  const list = source && Array.isArray(source.pages) ? source.pages : null;
+  if (!list || !list.length) return 1;
+  return list.length;
+}
+
+/**
+ * 把**全局帧号**折算成 `{page, local, col, row}`——多页切帧的全部坐标逻辑。
+ *
+ * 帧序是**页优先、页内行优先**：先把第 0 页从左到右、从上到下走完，
+ * 再进第 1 页。这与单页内 `grid` 排布的顺序完全一致，因此
+ * 「单页 → 多页」是一次自然的扩展，作者不必重新理解播放顺序。
+ *
+ * 与后端 `pack.frame_page` 是同一套规则的两份实现，**必须保持一致**。
+ * 之所以两边各写一份：运行期定义里已经有算好的 `cols` / `rows`，
+ * 但前端还有几条**自己造** spec 的路径（老后端不下发网格、单帧兜底、
+ * 测试夹具），那些地方没有后端结论可用。
+ *
+ * @param {number} index 全局帧号（会被夹到 `[0, frames-1]`）
+ * @param {object} grid 每页的网格 `{cols, rows}`
+ * @param {number} frames 整个动画的帧数（跨页）
+ * @returns {{page: number, local: number, col: number, row: number}}
+ */
+export function framePage(index, grid, frames) {
   const cols = Math.max(1, Math.floor(Number(grid && grid.cols) || 1));
   const rows = Math.max(1, Math.floor(Number(grid && grid.rows) || 1));
-  const capacity = cols * rows;
-  const limit = frames === undefined
-    ? capacity
-    : Math.min(capacity, Math.max(1, Math.floor(Number(frames) || 1)));
-  const at = Math.min(Math.max(0, Math.floor(Number(index) || 0)), limit - 1);
-  return { col: at % cols, row: Math.floor(at / cols) };
+  const perPage = cols * rows;
+  const count = Math.max(1, Math.floor(Number(frames) || 1));
+  const at = Math.min(Math.max(0, Math.floor(Number(index) || 0)), count - 1);
+  const page = Math.floor(at / perPage);
+  const local = at % perPage;
+  return { page, local, col: local % cols, row: Math.floor(local / cols) };
 }
 
 /**
@@ -239,33 +260,47 @@ export function playableVariants(entry) {
   const list = Array.isArray(source.variants) ? source.variants : [];
   const playable = list.filter((item) => item && item.url);
   if (playable.length) {
-    return playable.map((item) => ({
-      url: String(item.url),
-      frames: Math.max(1, Math.floor(Number(item.frames) || 1)),
-      fps: Number(item.fps) || 0,
-      loop: item.loop !== false,
-      layout: item.layout === 'vertical' ? 'vertical' : 'horizontal',
-      // 网格几何：**原样带上**后端算好的值（缺失时 `frameGrid` 会按 layout 推）。
-      cols: Math.max(0, Math.floor(Number(item.cols) || 0)),
-      rows: Math.max(0, Math.floor(Number(item.rows) || 0)),
-      frameMs: Array.isArray(item.frameMs) ? item.frameMs.slice() : [],
-      weight: normalizeWeight(item.weight),
-      size: item.size || undefined,
-    }));
+    return playable.map((item) => normalizeVariant(item));
   }
   if (!source.url) return [];
-  return [{
-    url: String(source.url),
+  return [normalizeVariant(Object.assign({ weight: DEFAULT_WEIGHT }, source))];
+}
+
+/**
+ * 把运行期定义里的一个变体规范化成前端可播的形状。
+ *
+ * 关键点是**多页**：`pages` 是每一页的图 URL 数组。单页时后端只给 `url`
+ * （没有 `pages`），这里补成长度为 1 的数组，于是下游只有一种形状要处理
+ * ——「有时是数组、有时是字符串」是最容易漏判的那种差异。
+ *
+ * @param {object} item 后端下发的变体
+ * @returns {object} 规范化后的变体
+ */
+function normalizeVariant(item) {
+  const source = item || {};
+  const url = String(source.url || '');
+  // `pages` 优先；缺失时用单个 `url` 兜底（单页包 / 老后端）。
+  // 过滤掉空 URL：某一页的图缺失时后端会给空串，留着它会让
+  // 「第 3 页丢了」表现为「切到第 3 页时画面变空白」——不如在这里就丢掉，
+  // 让 `pageCount` 反映真实可播的页数。
+  const rawPages = Array.isArray(source.pages) ? source.pages : null;
+  const pages = (rawPages && rawPages.length ? rawPages : [url])
+    .map((page) => String(page || ''))
+    .filter(Boolean);
+  return {
+    url,
+    pages,
     frames: Math.max(1, Math.floor(Number(source.frames) || 1)),
     fps: Number(source.fps) || 0,
     loop: source.loop !== false,
     layout: source.layout === 'vertical' ? 'vertical' : 'horizontal',
+    // 网格几何：**原样带上**后端算好的值（缺失时 `frameGrid` 会按 layout 推）。
     cols: Math.max(0, Math.floor(Number(source.cols) || 0)),
     rows: Math.max(0, Math.floor(Number(source.rows) || 0)),
     frameMs: Array.isArray(source.frameMs) ? source.frameMs.slice() : [],
-    weight: DEFAULT_WEIGHT,
+    weight: normalizeWeight(source.weight),
     size: source.size || undefined,
-  }];
+  };
 }
 
 /**

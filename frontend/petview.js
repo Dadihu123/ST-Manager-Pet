@@ -18,8 +18,9 @@ import {
   animationDuration,
   createBehaviorScheduler,
   frameGrid,
+  framePage,
+  framePageCount,
   frameSizeOf,
-  gridPosition,
   playableVariants,
   pickVariantIndex,
   stillFrame,
@@ -212,6 +213,25 @@ export function createPetView(options = {}) {
   let currentAction = 'idle';
   /** 当前正在播的**变体**（多套动画里选中的那套）；`null` 表示无图。 */
   let currentVariant = null;
+  /**
+   * 当前**已经铺在 sprite 上**的是第几页（多页 sheet）。
+   *
+   * 必须记住它：切页要换 `background-image`（一次解码），而换格只改
+   * `background-position`（零成本）。不知道当前在哪一页就会每帧都重设
+   * 背景图，那会让浏览器反复重新解码同一张图。
+   */
+  let currentPage = 0;
+  /**
+   * 已经**预热过**的页 URL 集合。
+   *
+   * 为什么需要它：切页要换图，而第一次换到某一页时那张图还没解码完，
+   * 表现是「动画走到第 2 页时卡一下」。因此在播放期间**提前**把下一页
+   * 用 `new Image()` 拉进缓存。
+   *
+   * 为什么用集合而不是「只记住下一页」：同一页会被反复经过（循环动画），
+   * 记下来就不会每次经过都重新 `new Image()`（那会白白建对象）。
+   */
+  const warmedPages = new Set();
   /** idle 的「随机触发」进行中（播完要回静止，而不是留在循环里）。 */
   let idleBurst = false;
   /**
@@ -380,12 +400,21 @@ export function createPetView(options = {}) {
       // 整条 sheet 的显示尺寸 = 单帧显示尺寸 × 行列数。`horizontal` 是
       // `cols=frames, rows=1`、`vertical` 是 `cols=1, rows=frames`，
       // 三者共用这一条公式，因此不可能出现「某种排布算错」。
+      //
+      // ⚠️ 这里用**网格容量**（cols × rows）而不是帧数：装不满的网格
+      // （例如 4×4 只放 13 帧）末行是空的，但背景图仍是完整的 4×4 张图。
+      // 多页时这个公式不变——**每页的形状相同**，只是换一张图。
       const grid = frameGrid(variant);
-      sprite.style.backgroundImage = `url("${variant.url}")`;
       sprite.style.backgroundSize = `${width * grid.cols}px ${height * grid.rows}px`;
       sprite.style.backgroundRepeat = 'no-repeat';
+      // 换动作要从第 0 页开始：`currentPage` 是上一个动作的，必须清掉，
+      // 否则新动作会沿用旧页号，而那个页号可能超出新动作的页数
+      // ——表现是「换动作后第一帧显示空白」。
+      currentPage = -1;
+      showPage(0);
     } else {
       sprite.style.backgroundImage = 'none';
+      currentPage = 0;
     }
 
     if (animated) {
@@ -445,10 +474,66 @@ export function createPetView(options = {}) {
     // 与 `setAction` 同一条公式（见那里的说明）：网格几何决定铺法。
     // 标准图像可以是网格排布 sheet 里的**任意一帧**，因此这里也必须按
     // 行列算偏移——按「单行 + 第 frame 帧」算的话，网格 sheet 会取错帧。
+    //
+    // 标准图像**不支持多页**（它按定义就是「一帧」），因此用 `framePage`
+    // 在那一页内定位就够了：`still.frames` 是那一页里的帧数。
     const grid = frameGrid(still);
     sprite.style.backgroundSize = `${width * grid.cols}px ${height * grid.rows}px`;
-    const at = gridPosition(still.frame, grid, still.frames);
+    const at = framePage(still.frame, grid, still.frames);
     sprite.style.backgroundPosition = `${-at.col * width}px ${-at.row * height}px`;
+    // 标准图像画的不是「当前变体」，页号要跟着清掉——否则下一次 `showPage`
+    // 会因为 `currentPage` 还停在旧值而跳过写背景图，宠物会一直显示标准图像。
+    currentPage = -1;
+  }
+
+  /**
+   * 把某一页的图铺到 sprite 上（**只在真的换页时**动 `background-image`）。
+   *
+   * 为什么要有这个函数而不是每次直接写：换 `background-image` 会触发一次
+   * 解码，而换格（`background-position`）不会。循环动画每经过一次页边界
+   * 都会调到这里，不做「同一页就跳过」的判断就会反复重设同一张图。
+   *
+   * 换页之后顺手**预热下一页**（见 `warmPage`）：等真正走到那一页时
+   * 它已经在缓存里，观感上没有停顿。
+   */
+  function showPage(page) {
+    const variant = currentVariant;
+    if (!variant) return;
+    const pages = variant.pages || [];
+    if (!pages.length) return;
+    // 页号越界 → 夹到最后一页（而不是留空）。越界通常来自「后端下发的
+    // 页数比实际可播的少」（某一页的图丢了），此时宁可重复最后一页，
+    // 也不要让宠物凭空消失。
+    const index = Math.min(Math.max(0, Math.floor(Number(page) || 0)), pages.length - 1);
+    if (index !== currentPage) {
+      sprite.style.backgroundImage = `url("${pages[index]}")`;
+      currentPage = index;
+    }
+    // 预热下一页（循环时最后一页的下一页是第 0 页）
+    const next = index + 1 < pages.length ? index + 1 : 0;
+    if (next !== index) warmPage(pages[next]);
+  }
+
+  /**
+   * 提前把一页拉进浏览器缓存。
+   *
+   * 用 `new Image()` 而不是 `fetch`：前者走的是与 `background-image`
+   * **同一条**资源缓存，因此预热过的页在真正切过去时是即时可用的。
+   * `fetch` 只填 HTTP 缓存，解码仍要重来一遍。
+   *
+   * `warmedPages` 只记 URL 不记图对象：图对象本身由浏览器持有，
+   * 我们不该自己攥着一堆 `Image`（那反而会阻止它们被回收）。
+   */
+  function warmPage(url) {
+    if (!url || warmedPages.has(url)) return;
+    warmedPages.add(url);
+    try {
+      const image = new Image();
+      image.decoding = 'async';
+      image.src = url;
+    } catch {
+      // 预热失败不影响功能：真正切过去时浏览器会正常加载
+    }
   }
 
   /** 把当前帧写进 `background-position`（只改绘制，不触发 layout）。 */
@@ -459,7 +544,9 @@ export function createPetView(options = {}) {
       return;
     }
     const index = clock.frames > 1 ? clock.index : 0;
-    const at = gridPosition(index, frameGrid(variant), variant.frames);
+    const at = framePage(index, frameGrid(variant), variant.frames);
+    // 先保证是**正确的页**（多页时可能已经跨页），再写页内位移。
+    showPage(at.page);
     sprite.style.backgroundPosition = `${-at.col * width}px ${-at.row * height}px`;
   }
 
@@ -1180,6 +1267,16 @@ export function createPetView(options = {}) {
     get animSpeed() { return animSpeed; },
     /** 当前选中的变体下标（多套动画时有用）。 */
     get variantIndex() { return Number(root.dataset.petVariant || -1); },
+    /**
+     * 多页 sheet 的播放状态（验收脚本与排查用）。
+     *
+     * 暴露 `page` 是必要的：多页切帧的结果是**渲染结果**，
+     * 源码里看不出「现在铺的是哪一页」——没有这个值就只能靠量像素去猜。
+     */
+    get page() { return currentPage; },
+    get pageCount() {
+      return currentVariant ? framePageCount(currentVariant) : 1;
+    },
     /** idle 是否正在播一次随机小动作。 */
     get idleBursting() { return idleBurst; },
     /** 手势阶段（排查「点击没反应 / 一碰就飞」用）。 */

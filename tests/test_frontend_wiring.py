@@ -675,10 +675,16 @@ def test_preview_geometry_uses_an_inner_frame_layer(preview):
     assert 'function createAnimationPlayer(options = {})' in preview
     assert "layer.className = 'pet-preview-frame-layer'" in preview, '内层要有自己的类名'
     assert 'box.appendChild(layer)' in preview, '内层要挂进外框'
-    # 背景图必须挂在**内层**上（而不是外框）
-    load = preview[preview.index('    load(spec, opts = {})'):]
-    load = load[:load.index('    /** 从头播。')]
-    assert 'layer.style.backgroundImage' in load, '背景图要挂在内层'
+    # 背景图必须挂在**内层**上（而不是外框）。
+    #
+    # ⚠️ 它现在由 `draw()` 铺而不是 `load()`：多页时「第 0 帧在哪一页」
+    # 要先算出来才知道该铺哪张图，而 `load()` 里还没有那个结论。
+    # 因此判据是「铺图这件事发生在 draw 里、且写的是 layer」——
+    # 钉死 `load()` 会把这次正确的搬移判成失败。
+    draw = preview[preview.index('  function draw() {'):]
+    draw = draw[:draw.index('\n  }')]
+    assert 'node.style.backgroundImage' in draw, '背景图要在 draw 里铺（多页要先算页号）'
+    assert 'layer || box' in draw, '背景图要优先挂在内层'
     # 几何要写内层的尺寸与位置
     body = preview[preview.index('export function applyFrameGeometry'):]
     body = body[:body.index('\n}')]

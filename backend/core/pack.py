@@ -117,10 +117,33 @@ ALLOWED_SHEET_EXTENSIONS = frozenset({'.png', '.webp', '.gif', '.avif', '.svg'})
 IMPORT_SOURCE_EXTENSIONS = frozenset({'.jpg', '.jpeg', '.bmp', '.tif', '.tiff'})
 
 #: 字段上限（既用于解析校验，也用于导入安全 §3.4）。
-MAX_FRAMES = 256
+#:
+#: `MAX_FRAMES` 从 256 提到 1024，是为了配合**多页 sheet**：
+#: 一页（4096² 上限下）能装几十到几百帧，几页就能上千。上限本身仍要存在
+#: ——它拦的是「填错了位数」，不是「动画很长」。
+MAX_FRAMES = 1024
+
+#: 一个动作最多拆成几页。
+#:
+#: 上限的依据是**解码显存**而不是磁盘：每页 4096² 解出来是 64 MiB，
+#: 8 页就是 512 MiB。前端只预取下一页，但浏览器的图片缓存是会话级的，
+#: 长时间循环最终会把所有页都拉进来。因此这个上限同时是
+#: 「一个动作最多吃掉多少显存」的护栏。
+MAX_PAGES = 8
+
+#: 单个变体的**解码像素**预算（宽 × 高 × 帧数）。超过就**警告**（不拒绝）。
+#:
+#: 为什么是警告而不是拒绝：显存是否够用取决于用户的机器，插件无法知道。
+#: 而且「帧数多」本身不是错误——作者可能就是要做一段长动画。
+#: 但用户有权知道「这个动作要占多少显存」，因此后端算出来、面板显示出来，
+#: 由用户自己决定要不要用这个形象。
+#:
+#: 128 MiB ≈ 2 页 4096²（每页 64 MiB）。超过它的形象在低配机器上
+#: 切页时会明显卡顿。
+DECODE_BUDGET_BYTES = 128 * 1024 * 1024
+
 DEFAULT_MAX_SHEET_PIXELS = 4096
 MAX_FPS = 60
-
 # ---------------------------------------------------------------- 帧排布
 #
 # 三种排布，但**只有一种几何**：帧总是落在一个 `cols × rows` 的网格里。
@@ -152,6 +175,9 @@ def frame_grid(layout: str, frames: int, cols: int = 0, rows: int = 0) -> tuple:
 
     这是整个排布系统的收敛点：解析器、运行期定义、前端三处渲染
     （桌面宠物 / 面板预览 / 缩略图）全都只认它算出来的这一对数。
+
+    ⚠️ 这里的 `frames` 是**一页**里排了几帧，不是整个动画的帧数。
+    多页时每页的形状相同（见 `frame_page`），因此几何只需要算一次。
 
     `cols` / `rows` 为 0 表示「没声明，按排布推导」：
 
@@ -189,6 +215,85 @@ def frame_grid(layout: str, frames: int, cols: int = 0, rows: int = 0) -> tuple:
     if name == LAYOUT_VERTICAL:
         return 1, count
     return count, 1
+
+
+def frame_page(index: int, grid: tuple, frames: int) -> tuple:
+    """把**全局帧号**折算成 `(page, local, col, row)`。
+
+    多页 sheet 的全部坐标逻辑就是这一个函数：第 `index` 帧在哪一页、
+    页内第几格、第几行第几列。前端与后端都调它，因此不可能出现
+    「桌面宠物算的页与面板预览算的页不一致」。
+
+    帧序是**页优先、页内行优先**：先把第 0 页从左到右、从上到下走完，
+    再进第 1 页。这与 `grid` 排布在单页内的顺序完全一致，因此
+    「单页 → 多页」是一次自然的扩展，作者不必重新理解播放顺序。
+
+    ⚠️ **每页的形状相同**（都是 `cols × rows`）。因此最后一页可能装不满，
+    末尾几格是透明的——这与 `grid` 排布允许「帧数少于网格容量」是同一条规则。
+    不做「最后一页按剩余帧数变小」是因为那会引出**逐页几何**：
+    前端要维护一个 `pageGrids[]`，预览与缩略图也要各处理一遍，
+    而省下的只是最后一页的透明格（PNG 里几乎不占字节）。
+
+    Args:
+        index: 全局帧号（会被夹到 `[0, frames-1]`）。
+        grid: `(cols, rows)`——**每页**的形状（见 `frame_grid`）。
+        frames: 整个动画的帧数（跨页）。
+
+    Returns:
+        tuple: `(page, local, col, row)`，四个都是非负整数。
+    """
+    cols = max(1, int(grid[0] or 1))
+    rows = max(1, int(grid[1] or 1))
+    per_page = cols * rows
+    count = max(1, int(frames or 1))
+    at = min(max(0, int(index or 0)), count - 1)
+    page = at // per_page
+    local = at % per_page
+    return page, local, local % cols, local // cols
+
+
+def frame_page_count(grid: tuple, frames: int) -> int:
+    """这个动画需要几页（至少 1）。"""
+    cols = max(1, int(grid[0] or 1))
+    rows = max(1, int(grid[1] or 1))
+    count = max(1, int(frames or 1))
+    return max(1, -(-count // (cols * rows)))
+
+
+def page_capacity(frames: int, pages: int, cols: int = 0, rows: int = 0) -> int:
+    """算出**每页的网格容量**（一页最多排几帧）。
+
+    两条路径，顺序不能反：
+
+    1. 作者声明了 `cols` **且** `rows` → 容量就是 `cols × rows`。
+       写了 4×4 就是「每页 16 帧」——这是最该被尊重的写法。
+    2. 否则按「总帧数平均分到各页」推：`ceil(frames / 页数)`。
+       单页时它就等于 `frames`，因此 `layout` 的推导与从前**完全一致**。
+
+    反过来（先用 `frames / pages` 求每页帧数、再拿它去推网格）会让作者声明的
+    4×4 被改写成 4×3 之类的东西，表现是「我明明写了 4×4，它却按别的形状切图」。
+
+    这是**唯一的**容量推导点：解析器与 `AnimationVariant.per_page` /
+    `ResolvedVariant.per_page` 全都调它。三处各写一遍的话，
+    「解析时报错说装不下、运行期却按另一个容量切图」这类不一致迟早出现。
+    """
+    declared_cols = max(0, int(cols or 0))
+    declared_rows = max(0, int(rows or 0))
+    if declared_cols and declared_rows:
+        return declared_cols * declared_rows
+    page_count = max(1, int(pages or 1))
+    count = max(1, int(frames or 1))
+    return max(1, -(-count // page_count))
+
+
+def decode_bytes(frames: int, width: int, height: int) -> int:
+    """解码后占用的字节数（RGBA = 每像素 4 字节）。
+
+    **这才是真正的容量瓶颈**：一张 4096² 的 sheet 解出来是 64 MiB 常驻显存，
+    与它的 PNG 是 1 MB 还是 9 MB 无关。因此「能放多少帧」由像素总数决定，
+    而不是文件大小。
+    """
+    return max(0, int(frames or 0)) * max(0, int(width or 0)) * max(0, int(height or 0)) * 4
 
 #: 帧率下限。允许**小数**（0.5fps = 每帧 2 秒）。
 #:
@@ -359,7 +464,16 @@ class AnimationVariant:
     观感立刻不像复读机。作者只要多画几张图，不必让引擎理解「语义」。
     """
 
-    sheet: str = ''
+    #: **一页或多页** sheet 的相对路径。
+    #:
+    #: 单页时长度为 1（绝大多数包）；多页时每页都是同样的 `cols × rows` 网格，
+    #: 帧序是**页优先、页内行优先**（见 `frame_page`）。
+    #:
+    #: 为什么需要多页：单图的解码像素上限（4096² ≈ 16.8 Mpx ≈ 60 MiB 显存）
+    #: 是一道硬墙，网格化只能把这道墙用满（约 7 倍），要再往上就只能加页。
+    #: 而显存是**页数 × 每页大小**，因此页数必须由作者显式声明、
+    #: 由 `MAX_PAGES` 与 `DECODE_BUDGET_BYTES` 约束，而不是「想加就加」。
+    sheets: list = field(default_factory=list)
     frames: int = 1
     #: 帧率。**允许小数**（见 `MIN_FPS`）——帧数少时整数档太粗。
     fps: float = 8
@@ -394,6 +508,16 @@ class AnimationVariant:
     size: dict = None
 
     @property
+    def sheet(self) -> str:
+        """**第一页**的路径（单页包的全部，多页包的主页）。
+
+        保留这个名字是因为它被大量既有代码读取（回退链、尺寸反推、
+        覆盖解析…），而「第一页」正是那些地方想要的语义。
+        多页相关的新代码请用 `sheets`。
+        """
+        return self.sheets[0] if self.sheets else ''
+
+    @property
     def total_ms(self) -> float:
         """播完一轮的毫秒数（非均匀时长下是逐帧之和）。"""
         if self.frame_ms:
@@ -411,22 +535,41 @@ class AnimationVariant:
         return round(self.frames * 1000.0 / total, 2)
 
     @property
+    def per_page(self) -> int:
+        """一页的**网格容量**（每页最多排几帧）。见 `page_capacity`。"""
+        return page_capacity(self.frames, len(self.sheets), self.cols, self.rows)
+
+    @property
     def grid(self) -> tuple:
-        """生效的 `(cols, rows)`（见 `frame_grid`）。"""
-        return frame_grid(self.layout, self.frames, self.cols, self.rows)
+        """生效的 `(cols, rows)`（**每页**的形状，见 `frame_grid`）。"""
+        return frame_grid(self.layout, self.per_page, self.cols, self.rows)
 
     @property
     def capacity(self) -> int:
-        """这个网格能装几帧（`cols × rows`）。
+        """每页能装几帧（`cols × rows`）。
 
-        与 `frames` 的差值就是**空着的格子数**——`grid` 排布允许装不满
-        （例如 4×4 的网格只放 13 帧），那 3 个空格子是透明的。
+        与「实际排了几帧」的差值就是**空着的格子数**——网格允许装不满
+        （例如 4×4 只放 13 帧），那些格子是透明的。
         """
         cols, rows = self.grid
         return cols * rows
 
+    @property
+    def page_count(self) -> int:
+        """这个动画有几页——**就是声明了几张 sheet**。
+
+        为什么是「声明的页数」而不是「帧数算出来的页数」：两者不一致时
+        必须以前者为准，因为「磁盘上有几张图」是客观事实，而帧数是作者的意图。
+        用后者会让「我给了 3 页，它只用了 2 页」变成静默发生的事——
+        多出来的那一页永远不会被播到，作者却以为它在用。
+        这种不一致由解析器**报错**拦下（见 `_parse_variant`），
+        因此这里的两个数在合法包里总是相等。
+        """
+        return max(1, len(self.sheets))
+
     def to_dict(self) -> dict:
-        # ⚠️ 这里写的是**作者意图**（`layout`），**不**写推导出来的 `cols` / `rows`。
+        # ⚠️ 这里写的是**作者意图**（`layout` / `sheet(s)`），**不**写推导出来的
+        # `cols` / `rows`。
         #
         # 两种形状各司其职，不能混：
         # - `AnimationVariant.to_dict()` → `pet.json` 的形状（作者写的意图）；
@@ -436,7 +579,6 @@ class AnimationVariant:
         # 与 `cols: 4, rows: 1`，再读回来时两个字段并存——而它们表达的是同一件事，
         # 一旦校验规则认为「并存即冲突」，导出再导入就会报错。
         payload = {
-            'sheet': self.sheet,
             'frames': self.frames,
             'fps': self.fps,
             'loop': self.loop,
@@ -444,6 +586,12 @@ class AnimationVariant:
             'frameMs': list(self.frame_ms),
             'weight': self.weight,
         }
+        # 单页写 `sheet`（字符串）、多页写 `sheets`（数组）：
+        # 单页是绝大多数包的形态，不该因为引擎支持多页就变啰嗦。
+        if len(self.sheets) > 1:
+            payload['sheets'] = list(self.sheets)
+        else:
+            payload['sheet'] = self.sheet
         # 只在**真的声明了**独立尺寸时才写这个字段：绝大多数包不该多出噪音
         if self.size:
             payload['size'] = dict(self.size)
@@ -572,9 +720,13 @@ class AnimationSpec:
 
 @dataclass
 class ResolvedVariant:
-    """解析后的**一套**动画（图 URL 由 store 层填，这里只有帧参数）。"""
+    """解析后的**一套**动画（图 URL 由 store 层填，这里只有帧参数）。
 
-    sheet: str = ''
+    `sheets` 是**多页**的路径列表（单页时长度为 1）。store 层会为每一页
+    各算一个 URL，前端按「页优先、页内行优先」的帧序换页换格。
+    """
+
+    sheets: list = field(default_factory=list)
     frames: int = 1
     fps: float = 8
     loop: bool = True
@@ -588,13 +740,27 @@ class ResolvedVariant:
     size: dict = None
 
     @property
+    def sheet(self) -> str:
+        """**第一页**的路径（见 `AnimationVariant.sheet`）。"""
+        return self.sheets[0] if self.sheets else ''
+
+    @property
+    def per_page(self) -> int:
+        """一页的网格容量（见 `page_capacity`）。"""
+        return page_capacity(self.frames, len(self.sheets), self.cols, self.rows)
+
+    @property
     def grid(self) -> tuple:
-        return frame_grid(self.layout, self.frames, self.cols, self.rows)
+        return frame_grid(self.layout, self.per_page, self.cols, self.rows)
+
+    @property
+    def page_count(self) -> int:
+        """这个动画有几页——**就是声明了几张 sheet**（见 `AnimationVariant.page_count`）。"""
+        return max(1, len(self.sheets))
 
     def to_dict(self) -> dict:
         cols, rows = self.grid
         payload = {
-            'sheet': self.sheet,
             'frames': self.frames,
             'fps': self.fps,
             'loop': self.loop,
@@ -604,6 +770,12 @@ class ResolvedVariant:
             'frameMs': list(self.frame_ms),
             'weight': self.weight,
         }
+        # 单页写 `sheet` / 多页写 `sheets`：与 `AnimationVariant.to_dict()`
+        # 同一取舍（单页不该变啰嗦）。
+        if len(self.sheets) > 1:
+            payload['sheets'] = list(self.sheets)
+        else:
+            payload['sheet'] = self.sheet
         if self.size:
             payload['size'] = dict(self.size)
         return payload
@@ -617,6 +789,7 @@ class ResolvedAction:
     #: 最终真正使用的动作名；``''`` 表示连回退链都落空（只有 idle 全缺时可能）。
     source: str = ''
     kind: str = KIND_NONE
+    #: **第一页**的路径（多页时见 `variants[].sheets`）。
     sheet: str = ''
     frames: int = 0
     fps: float = 0
@@ -667,7 +840,6 @@ class ResolvedAction:
         if self.size:
             payload['size'] = dict(self.size)
         return payload
-
 
 @dataclass
 class StillImage:
@@ -816,7 +988,7 @@ class PetPack:
                 continue
             # 只认**真的有图**的变体：多套动画里允许某一套的 sheet 为空
             # （作者临时撤掉一张图），它不该把整个动作拖成「只位移」。
-            playable = [variant for variant in spec.variants if variant.sheet]
+            playable = [variant for variant in spec.variants if variant.sheets]
             if playable:
                 # 命中的是对侧方向化动作 → 需要镜像
                 mirrored = bool(opposite) and candidate == opposite
@@ -846,7 +1018,7 @@ class PetPack:
                     chain=chain, note=note,
                     variants=[
                         ResolvedVariant(
-                            sheet=variant.sheet, frames=variant.frames,
+                            sheets=list(variant.sheets), frames=variant.frames,
                             fps=variant.fps, loop=variant.loop,
                             layout=variant.layout,
                             cols=variant.cols, rows=variant.rows,
@@ -896,7 +1068,7 @@ class PetPack:
             # `ResolvedAction.size` 是「主变体的尺寸」，而标准图像就是它的主变体。
             size=dict(still.size) if still.size else None,
             variants=[ResolvedVariant(
-                sheet=still.sheet, frames=still.frames, fps=1, loop=False,
+                sheets=[still.sheet], frames=still.frames, fps=1, loop=False,
                 layout=still.layout, cols=still_cols, rows=still_rows,
                 size=dict(still.size) if still.size else None,
             )],
@@ -977,10 +1149,12 @@ class PetPack:
             return None
         for spec in self.animations.values():
             for variant in spec.variants:
-                if not variant.sheet or not variant.size:
+                if not variant.size:
                     continue
-                if to_posix(variant.sheet).strip() == target:
-                    return dict(variant.size)
+                # 多页的每一页都可能是标准图像的来源，因此逐页比对
+                for page in variant.sheets:
+                    if page and to_posix(page).strip() == target:
+                        return dict(variant.size)
         return None
 
     def missing_required(self) -> list:
@@ -1444,16 +1618,8 @@ def _parse_variant(
     `animations.idle.variants[1]`），这样用户能直接知道是**哪一套**写错了。
     """
     variant = AnimationVariant()
-
-    raw_sheet = raw_value.get('sheet', '')
-    if raw_sheet is None:
-        raw_sheet = ''
-    if not isinstance(raw_sheet, str):
-        raise _field_error(f'{where}.sheet', '应为字符串', hint='sheet 写文件名文本。')
-    # sheet 可以为空：表示「这套动画存在但只位移不播帧」（回退链的降级语义）
-    variant.sheet = (
-        _validate_sheet_path(raw_sheet, where=action, allow_source_jpeg=allow_source_jpeg)
-        if raw_sheet.strip() else ''
+    variant.sheets = _read_sheets(
+        raw_value, where=where, action=action, allow_source_jpeg=allow_source_jpeg,
     )
 
     variant.frames = _read_positive_int(raw_value, 'frames', 1, low=1, high=MAX_FRAMES)
@@ -1463,9 +1629,65 @@ def _parse_variant(
 
     # 排布：`horizontal` / `vertical` / `grid`，统一折算成 `(cols, rows)`
     # （见 `frame_grid` 与 `_parse_layout`）。
-    variant.layout, variant.cols, variant.rows = _parse_layout(
-        raw_value, where=where, frames=variant.frames,
+    #
+    # ⚠️ 传给 `_parse_layout` 的是**一页的网格容量**，不是整个动画的帧数：
+    # 多页时用总帧数去推 `cols` 会得到「一行 200 列」，每页的几何全错。
+    #
+    # 这里**不能**读 `variant.per_page`——那个属性依赖 `variant.cols` /
+    # `variant.rows`，而它们正是 `_parse_layout` 的返回值。先读属性会拿到 0，
+    # 于是容量退化成「总帧数 ÷ 页数」，报错时指向的字段与数字都跟着错
+    # （实测：声明 8×8 两页 200 帧时，错误指向 `.rows` 并说「装不下 100 帧」）。
+    # 因此复用同一个 `page_capacity`，但把**原始声明值**喂给它。
+    raw_cols = raw_value.get('cols')
+    raw_rows = raw_value.get('rows')
+    per_page = page_capacity(
+        variant.frames,
+        len(variant.sheets),
+        raw_cols if isinstance(raw_cols, int) and not isinstance(raw_cols, bool) else 0,
+        raw_rows if isinstance(raw_rows, int) and not isinstance(raw_rows, bool) else 0,
     )
+
+    variant.layout, variant.cols, variant.rows = _parse_layout(
+        raw_value, where=where, frames=per_page,
+    )
+
+    # 容量校验：网格必须真的装得下**全部**帧，否则末尾那些帧无处可放。
+    #
+    # 单页与多页共用这一条规则（`pages = 1` 时它退化成原来的单页校验）——
+    # 分成两条写的话，多页那条很容易漏掉「单页也要查」，
+    # 而漏掉的后果是**静默丢帧**：宠物只播前 16 帧，作者以为 20 帧都在。
+    cols, rows = variant.grid
+    per_page_capacity = cols * rows
+    pages = max(1, len(variant.sheets))
+    total_capacity = per_page_capacity * pages
+    if total_capacity < variant.frames:
+        field = f'{where}.sheets' if pages > 1 else (
+            f'{where}.rows' if 'rows' in raw_value else f'{where}.cols'
+        )
+        scope = f'{pages} 页 × {cols}×{rows}' if pages > 1 else f'{cols}×{rows}'
+        raise _field_error(
+            field,
+            f'{scope} 装不下 {variant.frames} 帧（只有 {total_capacity} 格）',
+            hint=f'每页 {cols}×{rows} = {per_page_capacity} 格，'
+                 f'{pages} 页共 {total_capacity} 格。'
+                 f'需要 {-(-variant.frames // per_page_capacity)} 页，'
+                 f'或把 cols / rows 调大。',
+        )
+
+    # 反过来：**每一页都要用得上**（只对多页有意义）。
+    # 声明的页数超过实际需要的页数时，多出来的那几页永远不会被播到
+    # ——作者却以为它在用。这属于「我明明给了 3 页，它只播了 2 页」
+    # 这类最难查的问题，因此直接报错而不是静默接受。
+    needed = -(-variant.frames // per_page_capacity)
+    if needed < pages:
+        raise _field_error(
+            f'{where}.sheets',
+            f'声明了 {pages} 页，但 {variant.frames} 帧只需要 {needed} 页'
+            f'（每页 {per_page_capacity} 格）',
+            hint=f'第 {needed + 1} 页起一帧都不会被播到。'
+                 f'把 sheets 删到 {needed} 项，或把帧数提到 {needed * per_page_capacity + 1} 以上'
+                 f'（最多 {total_capacity}）。',
+        )
 
     # 这一套动画**自己的**单帧尺寸（可选）。不写就沿用包级 `size`。
     variant.size = _parse_variant_size(raw_value.get('size'), where)
@@ -1473,6 +1695,78 @@ def _parse_variant(
     if with_weight:
         variant.weight = _read_weight(raw_value, 'weight')
     return variant
+
+
+def _read_sheets(raw_value: dict, *, where: str, action: str,
+                 allow_source_jpeg: bool = False) -> list:
+    """读**一页或多页** sheet 路径，返回列表（长度 >= 1；没图时是 `[]`）。
+
+    接受两种写法：
+
+    - `"sheet": "walk.png"` —— 单页（绝大多数包）；
+    - `"sheets": ["walk-0.png", "walk-1.png"]` —— 多页。
+
+    两者**互斥**：同时写会报错，而不是挑一个。挑错的那个表现是
+    「我明明给了 2 页，它只播了第 1 页」——而包能读、宠物能跑，
+    作者只会以为是引擎的 bug（与 §2.5 的教训一致）。
+
+    `sheets` 长度为 1 是合法的（等价于 `sheet`），因为工具生成时
+    不必特判「只有一页」这个情况。
+
+    空列表 / 空字符串表示「这套动画存在但只位移不播帧」——
+    那是回退链的降级语义，不是错误。
+    """
+    has_single = 'sheet' in raw_value
+    has_multi = 'sheets' in raw_value
+    if has_single and has_multi:
+        raise _field_error(
+            f'{where}.sheets', '与 sheet 同时出现',
+            hint='单页写 "sheet": "walk.png"，多页写 "sheets": ["walk-0.png", "walk-1.png"]，'
+                 '两者只能选一个。',
+        )
+
+    if has_multi:
+        raw_list = raw_value.get('sheets')
+        if raw_list is None:
+            return []
+        if not isinstance(raw_list, list):
+            raise _field_error(
+                f'{where}.sheets', '应为数组',
+                hint='写成 ["walk-0.png", "walk-1.png"]：每一页一个文件名。',
+            )
+        if len(raw_list) > MAX_PAGES:
+            raise _field_error(
+                f'{where}.sheets', f'最多 {MAX_PAGES} 页，实际 {len(raw_list)}',
+                hint=f'一个动作最多拆 {MAX_PAGES} 页。每页 4096×4096 解出来是 64 MiB '
+                     '显存，页数越多占得越多。',
+            )
+        paths = []
+        for index, item in enumerate(raw_list):
+            if item is None or (isinstance(item, str) and not item.strip()):
+                raise _field_error(
+                    f'{where}.sheets[{index}]', '不能为空',
+                    hint='每一页都要有一个文件名；不想要的那一页请整项删掉。',
+                )
+            if not isinstance(item, str):
+                raise _field_error(
+                    f'{where}.sheets[{index}]', '应为字符串',
+                    hint='每一页写一个文件名，例如 "walk-0.png"。',
+                )
+            paths.append(_validate_sheet_path(
+                item, where=action, allow_source_jpeg=allow_source_jpeg,
+            ))
+        return paths
+
+    raw_sheet = raw_value.get('sheet', '')
+    if raw_sheet is None:
+        raw_sheet = ''
+    if not isinstance(raw_sheet, str):
+        raise _field_error(f'{where}.sheet', '应为字符串', hint='sheet 写文件名文本。')
+    if not raw_sheet.strip():
+        return []
+    return [_validate_sheet_path(
+        raw_sheet, where=action, allow_source_jpeg=allow_source_jpeg,
+    )]
 
 
 def _parse_layout(raw_value: dict, *, where: str, frames: int) -> tuple:
@@ -1689,7 +1983,7 @@ def _parse_animation(action: str, raw_value, *, allow_source_jpeg: bool = False)
         # 顶层不该再混写单套字段（见 docstring）
         stray = sorted(
             key for key in (
-                'sheet', 'frames', 'fps', 'loop', 'layout', 'cols', 'rows',
+                'sheet', 'sheets', 'frames', 'fps', 'loop', 'layout', 'cols', 'rows',
                 'frameMs', 'size',
             )
             if key in raw_value

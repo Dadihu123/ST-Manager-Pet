@@ -71,6 +71,7 @@ from .imports import (
 from .pack import (
     ACTION_FALLBACKS,
     ALLOWED_SHEET_EXTENSIONS,
+    DECODE_BUDGET_BYTES,
     DEFAULT_SCALE,
     IMPORT_SOURCE_EXTENSIONS,
     KIND_ANIMATED,
@@ -85,6 +86,7 @@ from .pack import (
     PetPack,
     SCALE_RANGE,
     Trigger,
+    decode_bytes,
     loads as loads_pack,
     parse_schedule,
 )
@@ -224,18 +226,35 @@ def clamp_schedule_ms(value) -> int:
     return int(min(max(number, MIN_SCHEDULE_MS), MAX_SCHEDULE_MS))
 
 
+def _variant_has_image(item: dict) -> bool:
+    """这个变体条目**至少有一页**真的有图吗？
+
+    单页变体写 `url`、多页写 `pages`——两种形状都要认。
+    只看 `url` 会让多页变体被判成「没图」而整条丢掉
+    （更糟的是 `item['url']` 会 KeyError → 后端 500，整个形象打不开）。
+    """
+    if item.get('url'):
+        return True
+    return any(item.get('pages') or [])
+
+
 def _pack_declares_sheet(processed: dict, sheet: str) -> bool:
     """这张 sheet 是不是包里**某个动作**已经声明的图。
 
     为什么要查：标准图像指向包内文件时，用户给的是**文件名**。
     不查的话，一个拼错的文件名会写进 `pet.json`，
     而后果是「形象能加载、标准图像空白」——比直接报错难查得多。
+
+    多页动作的每一页都算「已声明」——标准图像可以从任意一页取一帧。
     """
     wanted = to_posix(sheet)
     for outcome in (processed or {}).values():
         declared = to_posix(outcome.get('sheet') or '')
         if declared and declared == wanted:
             return True
+        for page in outcome.get('sheets') or []:
+            if page and to_posix(page) == wanted:
+                return True
     return False
 
 
@@ -977,29 +996,29 @@ class PetStore:
 
     # ---------------------------------------------------- 覆盖与帧解析
 
-    def resolve_frame_path(self, pet_id: str, action: str, *, variant: int = 0) -> tuple:
+    def resolve_frame_path(self, pet_id: str, action: str, *, variant: int = 0,
+                           page: int = 0) -> tuple:
         """按两层覆盖解析某动作实际该用哪张图。
 
         Args:
             pet_id: 形象 id。
             action: 动作名。
             variant: 第几套动画（多套动画按权重随机选一套时用；默认第一套）。
+            page: 第几**页**（多页 sheet；默认第一页）。
 
         Returns:
             `(absolute_path, source)`；`source` ∈ `{'override', 'pack', 'builtin'}`。
-            该动作（或该套动画）没有可用图时返回 `('', 'none')`。
+            该动作（或该套动画、该页）没有可用图时返回 `('', 'none')`。
 
         **内置形象只读**（用户要求「插件自带的宠物不应该允许用户修改」）：
         内置形象的解析**直接跳过 `overrides/`**，因此磁盘上遗留的覆盖文件
         不会生效（面板会提示并提供一键清理，见 `list_pet_overrides`）。
 
-        单动作覆盖（`overrides/<action>.<ext>`）**只作用于第一套动画**：
-        覆盖的语义是「这个动作换成我的图」，而不是「这个动作的第 N 套换成我的图」。
-        多套动画的其余几套只能由包自己提供——这样规则简单，也不会出现
-        「上传一张图后另外两套动画静默消失」这种怪事。
-
-        Raises:
-            PetError: 路径非法。
+        单动作覆盖（`overrides/<action>.<ext>`）**只作用于第一套动画的第 0 页**：
+        覆盖的语义是「这个动作换成我的图」，而不是「这个动作的第 N 套 / 第 N 页
+        换成我的图」。多页的其余几页只能由包自己提供——这样规则简单，
+        也不会出现「上传一张图后其余几页静默消失」这种怪事。
+        用户想换一个多页动作，正确做法是把它拆成多个动作，或者改包。
         """
         pet_id = sanitize_pet_id(pet_id)
         action = str(action or '').strip()
@@ -1046,9 +1065,9 @@ class PetStore:
             action = STILL_ACTION  # 继续走下面的通用路径，用 `pack.resolve('still')`
             index = 0
 
-        # 1) 单动作覆盖 —— 只对**用户形象**、且只对**第一套**动画生效。
+        # 1) 单动作覆盖 —— 只对**用户形象**、且只对**第一套动画的第 0 页**生效。
         #    内置形象不读覆盖目录，否则「不可修改」就只是 UI 层面的假象。
-        if index == 0 and not self._is_builtin_only(pet_id):
+        if index == 0 and page == 0 and not self._is_builtin_only(pet_id):
             override_dir = os.path.join(user_dir, OVERRIDES_DIRNAME)
             for extension in _IMAGE_EXTENSIONS:
                 candidate = os.path.join(override_dir, f'{action}{extension}')
@@ -1067,7 +1086,12 @@ class PetStore:
         variants = resolved.variants or []
         if not (0 <= index < len(variants)):
             return '', 'none'
-        relative = to_posix(variants[index].sheet)
+        # 页号越界 → 没有图（而不是回落到第 0 页：那会让「第 3 页丢了」
+        # 表现为「第 3 页显示的是第 1 页」，属于最难查的一类问题）
+        sheets = variants[index].sheets or []
+        if not (0 <= page < len(sheets)):
+            return '', 'none'
+        relative = to_posix(sheets[page])
         if not relative:
             return '', 'none'
         for root, source in ((user_dir, 'pack'), (self.builtin_pet_dir(pet_id), 'builtin')):
@@ -1169,6 +1193,26 @@ class PetStore:
             'staleOverrides': stale_overrides,
             'directory': to_posix(os.path.relpath(directory, self.data_dir))
             if source == 'user' else '',
+            # **显存占用**：整个形象解码后要占多少（各动作主变体之和）。
+            #
+            # 为什么要把这件事摆到用户面前：真正的容量瓶颈是解码后的像素，
+            # 而不是文件大小——一张 4096² 的 sheet 解出来是 64 MiB 常驻显存，
+            # 与它的 PNG 是 1 MB 还是 9 MB 无关。用户看不到显存，
+            # 因此「这个形象重不重」只能由插件告诉他。
+            #
+            # 只算**主变体**：多套动画按权重随机播，同一时刻只有一套在播，
+            # 但前端会预取下一页，因此实际占用介于「最大那一套」与「全部之和」
+            # 之间。给一个偏保守的上界比给一个乐观的下界有用。
+            'decodeBytes': sum(
+                decode_bytes(
+                    action.get('frames') or 0,
+                    (action.get('size') or pack.size).get('w', 0),
+                    (action.get('size') or pack.size).get('h', 0),
+                )
+                for action in actions.values()
+                if action.get('kind') == KIND_ANIMATED
+            ),
+            'decodeBudgetBytes': DECODE_BUDGET_BYTES,
         }
 
     def _runtime_still(self, pet_id: str, pack: PetPack) -> dict:
@@ -1231,33 +1275,82 @@ class PetStore:
 
         variants = []
         for index, variant in enumerate(resolved.variants):
-            path, frame_source = self.resolve_frame_path(pet_id, action, variant=index)
             item = variant.to_dict()
-            # `variant=index` **必须传**：不传的话每套动画都会拼出同一个 URL
-            # （`?v=` 只跟文件内容有关，而 `idle` 的两套动画是两个不同的文件、
-            # 版本号不同，看起来「恰好」是对的——但只要两套指向同一个文件
-            # （例如作者让两套共用一张图、只改帧时长），URL 就会撞在一起，
-            # 前端按 `vi` 区分变体的逻辑随即失效）。
-            item['url'] = (
-                self.frame_url(pet_id, action, path, variant=index) if path else ''
+            # 每一页各算一个 URL。`variant=index` **必须传**：不传的话每套动画
+            # 都会拼出同一个 URL（`?v=` 只跟文件内容有关，而 `idle` 的两套动画
+            # 是两个不同的文件、版本号不同，看起来「恰好」是对的——但只要两套
+            # 指向同一个文件（例如作者让两套共用一张图、只改帧时长），URL 就会
+            # 撞在一起，前端按 `vi` 区分变体的逻辑随即失效）。
+            urls = []
+            sources = []
+            for page_index in range(len(variant.sheets)):
+                path, frame_source = self.resolve_frame_path(
+                    pet_id, action, variant=index, page=page_index,
+                )
+                urls.append(
+                    self.frame_url(pet_id, action, path, variant=index, page=page_index)
+                    if path else ''
+                )
+                sources.append(frame_source)
+            item['urls'] = urls
+            # **两种形状都写**，让 `url` 成为一个**永远可用**的判据。
+            #
+            # 为什么要冗余：`url` 是「这一套有没有图」的通用读法——前端
+            # `frameSizeOf` 的回落链、面板的 `previewEntry`、若干验收脚本
+            # 都读它。多页时只写 `pages` 会让那些地方拿到 `undefined`，
+            # 表现是「多页动作在面板里显示成没有图」。
+            #
+            # 单页时**不写** `pages`：URL 形状与从前逐字节一致，
+            # 既有的强缓存全部继续命中。
+            item['url'] = urls[0] if urls else ''
+            if len(variant.sheets) > 1:
+                item['pages'] = urls
+            item['frameSource'] = sources[0] if sources else 'none'
+            item['pageSources'] = sources
+            # **解码显存**估算：这才是真正的容量瓶颈（见 `pack.decode_bytes`）。
+            # 用户看不到显存，因此后端算出来、面板显示出来——他有权知道
+            # 「这个动作要占多少」，然后自己决定要不要用这个形象。
+            frame_size = variant.size or pack.size
+            item['decodeBytes'] = decode_bytes(
+                variant.frames, frame_size.get('w', 0), frame_size.get('h', 0),
             )
-            item['frameSource'] = frame_source
+            item['pageCount'] = len(variant.sheets)
             variants.append(item)
 
         # 只保留**真的有图**的变体：声明了 sheet 但文件缺失的那套留着，
         # 前端会拿到一个空 URL 并跳过它（按权重抽取时不能选中空图）。
-        playable = [item for item in variants if item['url']]
+        #
+        # ⚠️ 判据是「**至少有一页**有图」，不是「主 URL 非空」：
+        # 多页变体没有 `url` 键（它写的是 `pages`），用 `item['url']` 会直接
+        # KeyError——而那是**后端 500**，整个形象都打不开。
+        # 第一页丢了但后面几页在时也要留着：播到缺失的那一页时前端会夹到
+        # 最后一页，比整个动作退化成「只位移」好得多。
+        playable = [item for item in variants if _variant_has_image(item)]
         entry['variants'] = playable
         if playable:
             primary = playable[0]
-            entry['url'] = primary['url']
+            # `url` 是**第一页**的 URL。多页变体没有单数 `url`，这里补上它
+            # 而不是留空：`url` 是「这个动作有没有图」的通用判据（前端与
+            # 若干测试都读它），留空会让多页动作看起来像「没有图」。
+            # 真正决定铺哪张图的是 `pages`。
+            entry['url'] = primary.get('url') or (primary.get('pages') or [''])[0]
             entry['frameSource'] = primary['frameSource']
             # 主变体透传：老前端只读这些字段，因此它们必须与 `variants[0]` 一致
             entry['frames'] = primary['frames']
             entry['fps'] = primary['fps']
             entry['loop'] = primary['loop']
             entry['layout'] = primary['layout']
+            entry['cols'] = primary['cols']
+            entry['rows'] = primary['rows']
             entry['frameMs'] = list(primary['frameMs'])
+            entry['decodeBytes'] = primary.get('decodeBytes', 0)
+            entry['pageCount'] = primary.get('pageCount', 1)
+            # 多页：把主变体的页数组也透传到动作层，前端不必先钻进 `variants`
+            # 才知道「这个动作有几页」。
+            if primary.get('pages'):
+                entry['pages'] = list(primary['pages'])
+            else:
+                entry.pop('pages', None)
         else:
             # 声明了 sheet 但一张图都找不到 → 退化为静态，并说明原因
             entry['kind'] = 'static'
@@ -1266,12 +1359,16 @@ class PetStore:
             entry['note'] = '这张图在形象包里找不到，将只移动位置、不播放动画。'
         return entry
 
-    def frame_url(self, pet_id: str, action: str, path: str = '', *, variant: int = 0) -> str:
-        """给某动作（某套动画）的图拼一个**带版本**的 URL。
+    def frame_url(self, pet_id: str, action: str, path: str = '', *, variant: int = 0,
+                  page: int = 0) -> str:
+        """给某动作（某套动画、某一页）的图拼一个**带版本**的 URL。
 
-        内容变了就换 URL，便于强缓存。`variant` 只影响路径（`?vi=`），
-        版本号仍取自实际文件——两套动画指向同一个文件时 URL 不同，
-        但各自的缓存键都是内容相关的。
+        内容变了就换 URL，便于强缓存。`variant` / `page` 只影响路径
+        （`?vi=` / `?pg=`），版本号仍取自实际文件——两套动画指向同一个文件时
+        URL 不同，但各自的缓存键都是内容相关的。
+
+        `page` 为 0 时**不写** `pg` 参数：单页包（绝大多数）的 URL 与从前
+        逐字节一致，因此既有的强缓存全部继续命中。
         """
         pet_id = sanitize_pet_id(pet_id)
         action = str(action or '').strip()
@@ -1279,6 +1376,10 @@ class PetStore:
             index = max(0, int(variant))
         except (TypeError, ValueError):
             index = 0
+        try:
+            page_index = max(0, int(page))
+        except (TypeError, ValueError):
+            page_index = 0
         version = ''
         if path and os.path.isfile(path):
             try:
@@ -1289,6 +1390,8 @@ class PetStore:
         query = []
         if index > 0:
             query.append(f'vi={index}')
+        if page_index > 0:
+            query.append(f'pg={page_index}')
         if version:
             query.append(f'v={version}')
         suffix = f'?{"&".join(query)}' if query else ''
@@ -1710,7 +1813,13 @@ class PetStore:
             processed[action] = {
                 'sheet': to_posix(primary.sheet),
                 'extension': os.path.splitext(primary.sheet)[1],
-                'frames': max(1, int(primary.frames)),
+                # 多页动作的**全部**页都要登记：标准图像可以从任意一页取一帧，
+                # 只登记第一页会让「用第 2 页的某一帧当门面」被误判成
+                # 「这张图不在包里」而拒绝保存。
+                'sheets': [to_posix(item) for item in primary.sheets],
+                # 帧数取**每页**的容量而不是总帧数：标准图像要按页内的
+                # 网格算「第 frame 帧在第几格」，用总帧数会算到别的页去。
+                'frames': max(1, int(primary.capacity)),
             }
         return processed
 
@@ -2245,11 +2354,13 @@ class PetStore:
 
         names = set()
         for action in pack.animations:
-            # **每一套**动画的图都要带上：只导出主变体的话，
-            # 「导出再导入」会静默丢掉其余几套（用户会以为是自己弄丢的）。
+            # **每一套动画的每一页**都要带上：只导出主变体的话，
+            # 「导出再导入」会静默丢掉其余几套；只导出第一页的话，
+            # 会丢掉后面几页——而包能读、宠物能跑，只是那个动作少了一半帧。
             for variant in pack.animations[action].variants:
-                if variant.sheet:
-                    names.add(to_posix(variant.sheet))
+                for page in variant.sheets:
+                    if page:
+                        names.add(to_posix(page))
             # 覆盖图也要带上，否则导出再导入会丢用户改动
             path, source = self.resolve_frame_path(pack.id, action)
             if path and source == 'override':

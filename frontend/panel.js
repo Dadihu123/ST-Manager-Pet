@@ -685,6 +685,7 @@ export function createSettingsPanel({
     // 老版本后端只给主变体字段，这里兜底构一个
     const base = pick || {
       url: entry.url,
+      pages: entry.pages,
       frames: entry.frames,
       fps: entry.fps,
       loop: entry.loop,
@@ -700,6 +701,12 @@ export function createSettingsPanel({
       // 「老后端不下发网格」，此时行为与从前完全一致。
       cols: frameGrid(base).cols,
       rows: frameGrid(base).rows,
+      // 多页：`pages` 是每一页的图 URL。单页时后端只给 `url`，
+      // 这里补成长度 1 的数组——播放器因此只有一种形状要处理
+      // （「有时是数组、有时是字符串」是最容易漏判的那种差异）。
+      pages: (Array.isArray(base.pages) && base.pages.length
+        ? base.pages
+        : [base.url]).filter(Boolean),
     });
   }
 
@@ -1686,11 +1693,28 @@ export function createSettingsPanel({
       const layoutNote = shape.cols > 1 && shape.rows > 1
         ? ` · ${shape.cols}×${shape.rows} 网格`
         : (shape.cols === 1 ? ' · 竖排' : '');
+      // 多页时把页数写出来：**显存**是真正的容量瓶颈（一张 4096² 的 sheet
+      // 解出来是 64 MiB，与 PNG 是 1 MB 还是 9 MB 无关），而用户看不到显存。
+      const pages = Array.isArray(spec.pages) ? spec.pages.length : 1;
+      const pageNote = pages > 1 ? ` · ${pages} 页` : '';
       side.appendChild(el(
         'div',
         'pet-preview-meta',
-        `${frames} 帧${layoutNote} · ${pace} · ${spec.loop === false ? '播一遍' : '循环'}`,
+        `${frames} 帧${layoutNote}${pageNote} · ${pace} · ${spec.loop === false ? '播一遍' : '循环'}`,
       ));
+      // 显存占用：超过预算就**显眼提示**，但不禁用——够不够用取决于用户的机器，
+      // 插件无法知道，因此把事实摆出来由用户自己决定。
+      const decode = Number(entry && entry.decodeBytes) || 0;
+      if (decode > 0) {
+        const budget = Number(detail && detail.decodeBudgetBytes) || 0;
+        const heavy = budget > 0 && decode > budget;
+        side.appendChild(el(
+          'div',
+          heavy ? 'pet-preview-meta is-warn' : 'pet-preview-meta',
+          `解码后约占 ${formatBytes(decode)} 显存`
+          + (heavy ? '（较大，低配机器切页时可能卡顿）' : ''),
+        ));
+      }
       if (entry && entry.kind !== 'animated') {
         side.appendChild(el('div', 'pet-preview-meta', entry.note || '这个动作没有图'));
       }
@@ -1865,6 +1889,25 @@ export function createSettingsPanel({
     const number = Number(value);
     if (!Number.isFinite(number)) return '0';
     return String(Math.round(number * 100) / 100);
+  }
+
+  /**
+   * 字节数的人读格式（显存提示用）。
+   *
+   * 用 1024 进制（与后端 `imports.format_bytes` 一致）：同一个数字在
+   * 后端报错信息与面板提示里必须显示成同一个值，否则用户会以为
+   * 「提示说的 128 MB」和「面板说的 128 MB」是两回事。
+   */
+  function formatBytes(value) {
+    let number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return '0 B';
+    for (const unit of ['B', 'KB', 'MB', 'GB']) {
+      if (number < 1024 || unit === 'GB') {
+        return unit === 'B' ? `${Math.round(number)} B` : `${number.toFixed(1)} ${unit}`;
+      }
+      number /= 1024;
+    }
+    return `${number.toFixed(1)} GB`;
   }
 
   /** 内置形象的遗留覆盖提示 + 一键清理。 */

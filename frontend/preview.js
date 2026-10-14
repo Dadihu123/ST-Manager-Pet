@@ -21,7 +21,7 @@
  *    否则会留下一个仍在跑 rAF 的定时器（§2.9 的清理纪律）。
  */
 
-import { frameGrid, gridPosition } from './animation.js';
+import { frameGrid, framePage, framePageCount } from './animation.js';
 
 /** 播放器的帧推进上限（与 `clock.js:MAX_FPS` 一致）。 */
 const MAX_FPS = 60;
@@ -133,11 +133,11 @@ function snapToDevicePixels(value, dpr) {
  * 背景被它自己的盒子裁住，邻帧物理上不可能漏出来。
  *
  * @param {HTMLElement} box 外框（固定正方形，负责边框与留白）
- * @param {object} grid 网格几何 `{cols, rows}`（见 `animation.js:frameGrid`）。
+ * @param {object} grid 网格几何 `{cols, rows}`（**每页**的形状，见 `animation.js:frameGrid`）。
  *   也接受字符串 `'horizontal'` / `'vertical'`（旧签名），内部折算成网格。
  * @param {number} frames 帧数。网格里**实际**排了几帧；它小于 `cols*rows` 时
  *   网格是**装不满**的（末尾几格透明），帧号仍按行优先落在前 `frames` 格里。
- * @param {number} index 要显示的帧号
+ * @param {number} index 要显示的帧号（**全局帧号**，多页时会被折算成页 + 页内格）
  * @param {object} [size] 单帧原始尺寸 `{w, h}`；缺省时退回「按框的形状铺满」
  *   （老后端不下发尺寸，此时行为与从前一致，不会更差）
  * @param {HTMLElement} [layer] 真正承载背景图的内层元素。**必须传**：
@@ -145,9 +145,12 @@ function snapToDevicePixels(value, dpr) {
  * @param {number} [dpr] 设备像素比。只给测试用——正常调用应当省略，
  *   由函数自己读 `window.devicePixelRatio`（对齐必须按**真实**设备像素算，
  *   写死一个值在 HiDPI 屏上就白对齐了）。
+ * @returns {{page: number, local: number, col: number, row: number}} 本帧的坐标。
+ *   返回它是为了让调用方（播放器）知道**该铺哪一页的图**——几何函数自己
+ *   不碰 `background-image`，那是调用方的事（它才知道 URL 列表）。
  */
 export function applyFrameGeometry(box, grid, frames, index, size, layer, dpr) {
-  if (!box) return;
+  if (!box) return null;
   const target = layer || box;
   const count = Math.max(1, Math.floor(Number(frames) || 1));
   // 网格：`{cols, rows}` 直接用；字符串（旧签名）按 `layout` 折算。
@@ -160,7 +163,7 @@ export function applyFrameGeometry(box, grid, frames, index, size, layer, dpr) {
     : frameGrid(Object.assign({ frames: count }, grid));
   const cols = shape.cols;
   const rows = shape.rows;
-  const at = gridPosition(index, shape, count);
+  const at = framePage(index, shape, count);
   const boxWidth = box.clientWidth || 64;
   const boxHeight = box.clientHeight || 64;
   const ratio = Number(dpr) > 0 ? Number(dpr) : currentDpr();
@@ -211,6 +214,10 @@ export function applyFrameGeometry(box, grid, frames, index, size, layer, dpr) {
   // 于是 `horizontal` / `vertical` 的结果与从前**完全一致**。
   target.style.backgroundPosition =
     `${-at.col * shownWidth}px ${-at.row * shownHeight}px`;
+
+  // 把「本帧在哪一页」交给调用方：几何函数不碰 `background-image`
+  // （只有播放器知道 URL 列表），但它算出的 `page` 是播放器换页的唯一依据。
+  return at;
 }
 
 /**
@@ -229,6 +236,11 @@ export function createAnimationPlayer(options = {}) {
   const layer = box ? document.createElement('div') : null;
   if (layer) {
     layer.className = 'pet-preview-frame-layer';
+    // `background-repeat` 是**静态**样式（与哪一帧、哪一页无关），
+    // 因此在这里设一次就够。早先它跟着 `load()` 每次重设，
+    // 而多页之后背景图由 `draw()` 铺——把静态样式留在初始化处
+    // 才不会有「某条路径忘了设」的漏网。
+    layer.style.backgroundRepeat = 'no-repeat';
     box.appendChild(layer);
   }
   let speed = Number(options.speed) > 0 ? Number(options.speed) : 1;
@@ -281,8 +293,33 @@ export function createAnimationPlayer(options = {}) {
     }, wait);
   }
 
+  /** 已经预热过的页 URL（与桌面宠物同一套做法，见 `petview.warmPage`）。 */
+  const warmedPages = new Set();
+  /** 当前铺在层上的页号；`-1` = 还没铺过。 */
+  let shownPage = -1;
+
+  /** 提前把一页拉进浏览器缓存（走与 `background-image` 同一条资源缓存）。 */
+  function warmPage(url) {
+    if (!url || warmedPages.has(url)) return;
+    warmedPages.add(url);
+    try {
+      const image = new Image();
+      image.decoding = 'async';
+      image.src = url;
+    } catch {
+      // 预热失败不影响功能
+    }
+  }
+
+  /** 本变体的页 URL 列表（单页时长度为 1）。 */
+  function pageUrls() {
+    const list = variant && Array.isArray(variant.pages) ? variant.pages : [];
+    if (list.length) return list;
+    return variant && variant.url ? [variant.url] : [];
+  }
+
   function draw() {
-    applyFrameGeometry(
+    const at = applyFrameGeometry(
       box,
       // 网格几何由变体自己带（后端算好的 cols / rows，缺失时按 layout 推）。
       // 播放器不自己判断排布——那是 `frameGrid` 的唯一职责。
@@ -292,6 +329,17 @@ export function createAnimationPlayer(options = {}) {
       variant ? variant.size : null,
       layer,
     );
+    const urls = pageUrls();
+    if (!urls.length) return;
+    const page = Math.min(Math.max(0, (at && at.page) || 0), urls.length - 1);
+    if (page !== shownPage) {
+      const node = layer || box;
+      if (node) node.style.backgroundImage = `url("${urls[page]}")`;
+      shownPage = page;
+    }
+    // 预热下一页（循环时最后一页的下一页是第 0 页）
+    const next = page + 1 < urls.length ? page + 1 : 0;
+    if (next !== page) warmPage(urls[next]);
   }
 
   return {
@@ -323,14 +371,12 @@ export function createAnimationPlayer(options = {}) {
       durations = frameDurations(source);
       loop = source.loop !== false;
       index = 0;
-      if (layer) {
-        // 背景图挂在**内层**（外框只负责边框与留白）
-        layer.style.backgroundImage = source.url ? `url("${source.url}")` : 'none';
-        layer.style.backgroundRepeat = 'no-repeat';
-      } else if (box) {
-        box.style.backgroundImage = source.url ? `url("${source.url}")` : 'none';
-        box.style.backgroundRepeat = 'no-repeat';
-      }
+      // 背景图由 `draw()` 铺（它要先算出「第 0 帧在哪一页」）。
+      // 早先在这里直接铺 `source.url`，多页时会铺错页——
+      // 而且 `shownPage` 也得跟着重置，否则换动画后第一次 `draw()`
+      // 会因为页号没变而跳过铺图，预览框停在上一个动画的图上。
+      shownPage = -1;
+      warmedPages.clear();
       draw();
       emit();
       if (opts.autoplay !== false) this.play();
@@ -382,10 +428,16 @@ export function createAnimationPlayer(options = {}) {
     dispose() {
       this.stop();
       variant = null;
+      shownPage = -1;
+      warmedPages.clear();
       // 内层是自己造的，得自己摘掉——否则每次重渲染都会在框里堆一层
       // （面板 `render()` 会重建 DOM，但 `dispose()` 也可能被单独调用）
       if (layer && layer.parentNode) layer.parentNode.removeChild(layer);
       return this;
     },
+
+    /** 多页播放状态（验收脚本与排查用）。 */
+    get page() { return Math.max(0, shownPage); },
+    get pageCount() { return framePageCount(variant); },
   };
 }
