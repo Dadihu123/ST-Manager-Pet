@@ -1697,11 +1697,23 @@ export function createSettingsPanel({
       // 解出来是 64 MiB，与 PNG 是 1 MB 还是 9 MB 无关），而用户看不到显存。
       const pages = Array.isArray(spec.pages) ? spec.pages.length : 1;
       const pageNote = pages > 1 ? ` · ${pages} 页` : '';
-      side.appendChild(el(
-        'div',
-        'pet-preview-meta',
-        `${frames} 帧${layoutNote}${pageNote} · ${pace} · ${spec.loop === false ? '播一遍' : '循环'}`,
-      ));
+      // 动图容器：帧数来自**文件元数据**（后端读出来的），节奏由浏览器决定
+      // ——因此不能按 `fps` 说「几 fps」，那会是一句假话。
+      if (spec.animated) {
+        const count = Number(spec.animatedFrames) || 1;
+        side.appendChild(el(
+          'div',
+          'pet-preview-meta',
+          `动图容器 · ${count} 帧 · 由浏览器自行播放`
+          + (spec.loop === false ? '' : '（循环次数写在文件里）'),
+        ));
+      } else {
+        side.appendChild(el(
+          'div',
+          'pet-preview-meta',
+          `${frames} 帧${layoutNote}${pageNote} · ${pace} · ${spec.loop === false ? '播一遍' : '循环'}`,
+        ));
+      }
       // 显存占用：超过预算就**显眼提示**，但不禁用——够不够用取决于用户的机器，
       // 插件无法知道，因此把事实摆出来由用户自己决定。
       const decode = Number(entry && entry.decodeBytes) || 0;
@@ -1712,7 +1724,16 @@ export function createSettingsPanel({
           'div',
           heavy ? 'pet-preview-meta is-warn' : 'pet-preview-meta',
           `解码后约占 ${formatBytes(decode)} 显存`
-          + (heavy ? '（较大，低配机器切页时可能卡顿）' : ''),
+          + (heavy ? '（较大，低配机器可能卡顿）' : ''),
+        ));
+      }
+      // 后端算出的提醒（动图容器的代价、大文件…）。逐条显示而不是拼成一句：
+      // 它们各自是一个独立的事实，合并成一段长文字会让用户跳过去。
+      for (const warning of (entry && entry.warnings) || []) {
+        side.appendChild(el(
+          'div',
+          warning.level === 'warn' ? 'pet-preview-meta is-warn' : 'pet-preview-meta',
+          warning.message,
         ));
       }
       if (entry && entry.kind !== 'animated') {
@@ -1845,7 +1866,13 @@ export function createSettingsPanel({
 
     // 播放器在 DOM 挂上之后才能算帧几何（`clientWidth` 只有挂上才有值），
     // 因此这里只登记意图，真正 `load()` 由 `mountPreviewPlayer()` 在渲染收尾时做。
-    pendingPreview = { box, spec, readout };
+    pendingPreview = {
+      box,
+      spec,
+      readout,
+      animated: Boolean(spec && spec.animated),
+      animatedFrames: Number(spec && spec.animatedFrames) || 1,
+    };
     return section;
   }
 
@@ -1868,7 +1895,15 @@ export function createSettingsPanel({
       speed: previewSpeed,
       onFrame: (index, frames) => {
         const node = pending.readout;
-        if (node) node.textContent = frames > 1 ? `第 ${index + 1} / ${frames} 帧` : '单帧';
+        if (!node) return;
+        // 动图容器：帧不是我们在推，所以**不能说「单帧」**——
+        // 它明明在动，说成单帧会让用户以为图坏了。
+        if (pending.animated) {
+          const count = pending.animatedFrames > 1 ? `${pending.animatedFrames} 帧` : '';
+          node.textContent = `动图${count ? `（${count}）` : ''}· 浏览器自行播放`;
+          return;
+        }
+        node.textContent = frames > 1 ? `第 ${index + 1} / ${frames} 帧` : '单帧';
       },
       onEnd: () => {
         // 一次性动作播完：**只更新按钮文字**，绝不 `render()`。
@@ -2033,6 +2068,12 @@ export function createSettingsPanel({
       tile.appendChild(el('span', 'pet-action-badge', '自定'));
     } else if (isFallback) {
       tile.appendChild(el('span', 'pet-action-badge is-warn', '回退'));
+    }
+    // 动图容器的徽章：它是一条**不同的技术路线**（不切帧、不能分页），
+    // 用户有权一眼看出「这个动作是动图」，而不是从「怎么不按我设的帧率播」
+    // 去反推。
+    if (entry.animated) {
+      tile.appendChild(el('span', 'pet-action-badge is-animated', '动图'));
     }
 
     tile.appendChild(el('div', 'pet-action-name', ACTION_LABELS[entry.action] || entry.action));
@@ -2502,6 +2543,12 @@ export function createSettingsPanel({
     }
     if (isFallback) {
       return `未提供，回退到「${ACTION_LABELS[entry.source] || entry.source}」`;
+    }
+    // 动图容器：说「单帧（静态显示）」是**假话**——它明明在动，
+    // 而用户看到这个标签会以为自己的图坏了。
+    if (entry.animated) {
+      const count = Number(entry.animatedFrames) || 1;
+      return count > 1 ? `动图容器 · ${count} 帧 · 浏览器播放` : '动图容器';
     }
     const frames = Number(entry.frames) || 1;
     if (frames <= 1) return '单帧（静态显示）';

@@ -167,7 +167,32 @@ MAX_FPS = 60
 LAYOUT_HORIZONTAL = 'horizontal'
 LAYOUT_VERTICAL = 'vertical'
 LAYOUT_GRID = 'grid'
-LAYOUTS = (LAYOUT_HORIZONTAL, LAYOUT_VERTICAL, LAYOUT_GRID)
+#: **动图容器**：由浏览器自行播放，插件不切帧。
+#:
+#: 为什么要有它：前三种排布都要求作者先把动画拼成一张（或几张）sheet。
+#: 而用户手上往往已经有一个现成的 GIF / 动图 WebP——从别处下载的、
+#: 用工具导出的。让这种图**直接能用**是这条「第二路线」的全部意义：
+#: 零制作成本。
+#:
+#: 代价是**放弃控制权**（这是它与 sheet 路线的根本区别，不是文件大小）：
+#:
+#: - 逐帧时长（`frameMs`）无法表达——浏览器决定每帧停多久；
+#: - 无法定位到「第 n 帧」——标准图像取帧、面板帧读数都做不到；
+#: - 无法**分页**，因此解码占用不可控。sheet 路线可以把上千帧切成
+#:   8 页、一次只预取一页；动图是**一个不可分割的解码单元**。
+#:
+#: 最后一条是真正「资源消耗较大」的地方。实测：480×480 的 120 帧动图
+#: 解码后是 105 MiB，且没有任何办法把它切开——而同样内容的 sheet 路线
+#: 可以分页把峰值压到一页（约 60 MiB）以内。
+LAYOUT_ANIMATED = 'animated'
+LAYOUTS = (LAYOUT_HORIZONTAL, LAYOUT_VERTICAL, LAYOUT_GRID, LAYOUT_ANIMATED)
+
+#: 动图容器**不允许**出现的字段。
+#:
+#: 这些都是「切帧」相关的声明，而容器路线根本不切帧。写它们**必须报错**
+#: 而不是静默忽略——静默的后果是作者以为 `frameMs` 生效了，
+#: 于是反复调整数字却看不出任何变化（与 §2.5 的教训一致）。
+ANIMATED_FORBIDDEN_FIELDS = ('fps', 'frameMs', 'cols', 'rows', 'loop')
 
 
 def frame_grid(layout: str, frames: int, cols: int = 0, rows: int = 0) -> tuple:
@@ -198,6 +223,13 @@ def frame_grid(layout: str, frames: int, cols: int = 0, rows: int = 0) -> tuple:
     declared_cols = max(0, int(cols or 0))
     declared_rows = max(0, int(rows or 0))
     name = str(layout or '').strip().lower()
+
+    if name == LAYOUT_ANIMATED:
+        # 动图容器**不是**网格：整张图是「一帧」，由浏览器自己播。
+        # 返回 (1, 1) 让下游公式（背景铺法 = 单帧 × 行列数）自然退化成
+        # 「原样铺满」——于是三种切帧排布与容器路线共用同一套渲染代码，
+        # 不需要在 `petview` / `preview` 里各加一条 `if (animated)` 分支。
+        return 1, 1
 
     if name == LAYOUT_GRID:
         # 网格模式：两个方向都要有。缺一个时按「装得下」补另一个——
@@ -294,6 +326,98 @@ def decode_bytes(frames: int, width: int, height: int) -> int:
     而不是文件大小。
     """
     return max(0, int(frames or 0)) * max(0, int(width or 0)) * max(0, int(height or 0)) * 4
+
+
+#: 动图容器的解码占用**提醒**阈值（超过就明确警告）。
+#:
+#: 取 64 MiB：那正好是**一张 4096² sheet** 的解码量，也就是 sheet 路线
+#: 单页的硬上限。动图超过它就意味着「比我们敢让一张 sheet 占的还多」，
+#: 而这个占用还**无法分页**——值得明确告诉用户。
+ANIMATED_WARN_BYTES = 64 * 1024 * 1024
+
+
+def animated_warnings(*, frames: int, file_bytes: int, frame_w: int, frame_h: int) -> list:
+    """给**动图容器**算出一组给用户看的提醒。
+
+    为什么提醒是「资源消耗」而不是「文件太大」——这一点必须说准，
+    因为**实测结论与直觉相反**：
+
+    同一段动画（内置形象 12 个动作，真实素材）分别做成 spritesheet 与动图：
+
+    | 形式 | 字节数 | 相对 sheet |
+    |---|---|---|
+    | spritesheet PNG | 5,617,066 | 1.00x |
+    | 动图 GIF | 1,250,424 | **0.22x** |
+    | 动图 WebP (q90) | 1,360,994 | **0.24x** |
+
+    动图**更小**——因为 GIF / WebP 会做帧间压缩（没变的区域直接跳过），
+    而我们的 spritesheet 是把每一帧完整并排放。
+
+    真正的代价是**解码占用与失控**：帧数 × 宽 × 高 × 4 是一样的
+    （像素总数相同），但 sheet 路线可以**分页**（最多 8 页、一次只预取
+    一页，峰值被一页的 60 MiB 卡住），而动图是**一个不可分割的解码单元**
+    ——浏览器必须把整个动画解出来，插件没有任何办法把它切开。
+
+    实测：480×480 的 120 帧动图 = **105 MiB**，超过我们给单页设的上限。
+
+    Args:
+        frames: 真实帧数（从文件元数据读出来的）。
+        file_bytes: 文件字节数。
+        frame_w: 单帧逻辑宽（逻辑尺寸，不是源图像素）。
+        frame_h: 单帧逻辑高。
+
+    Returns:
+        list: 每条是 `{'code', 'level', 'message'}`；没有提醒时返回 `[]`。
+        `level` ∈ `{'info', 'warn'}`，面板据此决定是否用警告色。
+    """
+    count = max(1, int(frames or 1))
+    width = max(0, int(frame_w or 0))
+    height = max(0, int(frame_h or 0))
+    decoded = decode_bytes(count, width, height)
+    out = []
+
+    if count > 1:
+        out.append({
+            'code': 'animated_no_frame_control',
+            'level': 'info',
+            'message': (
+                f'动图容器（{count} 帧）：由浏览器自行播放，'
+                '因此无法逐帧控制——每帧时长（frameMs）、跳到某一帧、'
+                '以及从某一帧取标准图像都做不到。'
+            ),
+        })
+
+    if decoded >= ANIMATED_WARN_BYTES:
+        out.append({
+            'code': 'animated_heavy',
+            'level': 'warn',
+            'message': (
+                f'解码后约占 {decoded / 1048576:.0f} MB 显存'
+                f'（{count} 帧 × {width}×{height}），'
+                '而且动图无法像帧序列那样分页——浏览器必须一次把整个动画解出来，'
+                '低配机器上可能明显卡顿。'
+            ),
+        })
+    elif count > 1:
+        out.append({
+            'code': 'animated_decoded_size',
+            'level': 'info',
+            'message': (
+                f'解码后约占 {decoded / 1048576:.0f} MB 显存'
+                f'（{count} 帧 × {width}×{height}）；'
+                '帧序列路线可以用分页把峰值压得更低。'
+            ),
+        })
+
+    if file_bytes > 4 * 1024 * 1024:
+        out.append({
+            'code': 'animated_large_file',
+            'level': 'info',
+            'message': f'文件本身 {file_bytes / 1048576:.1f} MB，首次加载会慢一些。',
+        })
+
+    return out
+
 
 #: 帧率下限。允许**小数**（0.5fps = 每帧 2 秒）。
 #:
@@ -518,8 +642,24 @@ class AnimationVariant:
         return self.sheets[0] if self.sheets else ''
 
     @property
+    def animated(self) -> bool:
+        """这套动画是**动图容器**（浏览器自行播放，插件不切帧）吗？
+
+        见 `LAYOUT_ANIMATED` 的说明：容器路线的价值是「零制作成本」，
+        代价是放弃逐帧控制与分页能力。
+        """
+        return self.layout == LAYOUT_ANIMATED
+
+    @property
     def total_ms(self) -> float:
-        """播完一轮的毫秒数（非均匀时长下是逐帧之和）。"""
+        """播完一轮的毫秒数（非均匀时长下是逐帧之和）。
+
+        ⚠️ 动图容器返回 **0**：一轮多久由文件自己的元数据决定，
+        插件读不到也不该猜。调用方（例如「播完回 idle」的定时器）
+        必须自己给兜底值——用一个编出来的数字会让动作被提前打断。
+        """
+        if self.animated:
+            return 0.0
         if self.frame_ms:
             return float(sum(self.frame_ms))
         if self.fps > 0:
@@ -528,7 +668,7 @@ class AnimationVariant:
 
     @property
     def effective_fps(self) -> float:
-        """折算出的平均帧率（供 UI 显示「相当于多少 fps」）。"""
+        """折算出的平均帧率；动图容器返回 0（见 `AnimationVariant.effective_fps`）。"""
         total = self.total_ms
         if total <= 0:
             return float(self.fps)
@@ -586,6 +726,13 @@ class AnimationVariant:
             'frameMs': list(self.frame_ms),
             'weight': self.weight,
         }
+        # ⚠️ 动图容器**不能**写 `frames` / `fps` / `loop` / `frameMs`：
+        # 它们全在 `ANIMATED_FORBIDDEN_FIELDS` 里，写出来就再读不回去
+        # ——`to_dict()` 的输出必须能被 `from_dict()` 原样吃下
+        # （「导出再导入」正是靠它）。这里曾经写出 `loop: true` 与
+        # `fps: 0`，于是**导出再导入直接报错**。
+        if self.animated:
+            payload = {'layout': self.layout, 'weight': self.weight}
         # 单页写 `sheet`（字符串）、多页写 `sheets`（数组）：
         # 单页是绝大多数包的形态，不该因为引擎支持多页就变啰嗦。
         if len(self.sheets) > 1:
@@ -745,6 +892,30 @@ class ResolvedVariant:
         return self.sheets[0] if self.sheets else ''
 
     @property
+    def animated(self) -> bool:
+        """动图容器（见 `AnimationVariant.animated`）。"""
+        return self.layout == LAYOUT_ANIMATED
+
+    @property
+    def total_ms(self) -> float:
+        """播完一轮的毫秒数；动图容器返回 0（见 `AnimationVariant.total_ms`）。"""
+        if self.animated:
+            return 0.0
+        if self.frame_ms:
+            return float(sum(self.frame_ms))
+        if self.fps > 0:
+            return self.frames * 1000.0 / self.fps
+        return 0.0
+
+    @property
+    def effective_fps(self) -> float:
+        """折算出的平均帧率；动图容器返回 0（见 `AnimationVariant.effective_fps`）。"""
+        total = self.total_ms
+        if total <= 0:
+            return float(self.fps)
+        return round(self.frames * 1000.0 / total, 2)
+
+    @property
     def per_page(self) -> int:
         """一页的网格容量（见 `page_capacity`）。"""
         return page_capacity(self.frames, len(self.sheets), self.cols, self.rows)
@@ -760,16 +931,28 @@ class ResolvedVariant:
 
     def to_dict(self) -> dict:
         cols, rows = self.grid
-        payload = {
-            'frames': self.frames,
-            'fps': self.fps,
-            'loop': self.loop,
-            'layout': self.layout,
-            'cols': cols,
-            'rows': rows,
-            'frameMs': list(self.frame_ms),
-            'weight': self.weight,
-        }
+        # ⚠️ 动图容器不能写 `frames` / `fps` / `loop` / `frameMs` / `cols` / `rows`：
+        # 它们全在 `ANIMATED_FORBIDDEN_FIELDS` 里。运行期定义虽然不会被
+        # 解析回领域对象，但**面板与前端会读这些字段**——写一堆假值
+        # （`fps: 0`、`frames: 1`）只会让界面说出与事实不符的话。
+        # 真正要表达的是 `animated`，由 store 层补进运行期定义。
+        if self.animated:
+            payload = {
+                'layout': self.layout,
+                'animated': True,
+                'weight': self.weight,
+            }
+        else:
+            payload = {
+                'frames': self.frames,
+                'fps': self.fps,
+                'loop': self.loop,
+                'layout': self.layout,
+                'cols': cols,
+                'rows': rows,
+                'frameMs': list(self.frame_ms),
+                'weight': self.weight,
+            }
         # 单页写 `sheet` / 多页写 `sheets`：与 `AnimationVariant.to_dict()`
         # 同一取舍（单页不该变啰嗦）。
         if len(self.sheets) > 1:
@@ -1623,12 +1806,9 @@ def _parse_variant(
     )
 
     variant.frames = _read_positive_int(raw_value, 'frames', 1, low=1, high=MAX_FRAMES)
-    variant.fps = _read_fps(raw_value, 'fps', 8)
-    variant.loop = _read_bool(raw_value, 'loop', action not in ONE_SHOT_ACTIONS)
-    variant.frame_ms = _read_frame_ms(raw_value, 'frameMs', variant.frames)
 
-    # 排布：`horizontal` / `vertical` / `grid`，统一折算成 `(cols, rows)`
-    # （见 `frame_grid` 与 `_parse_layout`）。
+    # 排布：`horizontal` / `vertical` / `grid` / `animated`，统一折算成
+    # `(cols, rows)`（见 `frame_grid` 与 `_parse_layout`）。
     #
     # ⚠️ 传给 `_parse_layout` 的是**一页的网格容量**，不是整个动画的帧数：
     # 多页时用总帧数去推 `cols` 会得到「一行 200 列」，每页的几何全错。
@@ -1650,6 +1830,24 @@ def _parse_variant(
     variant.layout, variant.cols, variant.rows = _parse_layout(
         raw_value, where=where, frames=per_page,
     )
+
+    # ⚠️ **动图容器到这就结束了**：它不切帧，因此 `fps` / `loop` / `frameMs`
+    # 三个字段对它没有意义——`_parse_animated_layout` 已经确保作者没写它们。
+    # 这里若继续往下读，`_read_frame_ms(raw_value, 'frameMs', 1)` 会拿默认值
+    # 造出一个空的帧时长数组，而 `fps` 会变成默认的 8——两个都是**假数据**，
+    # 会让下游（面板显示「8 fps」、时钟按 8fps 推进）说出与事实不符的话。
+    if variant.layout == LAYOUT_ANIMATED:
+        variant.fps = 0
+        variant.loop = True
+        variant.frame_ms = []
+        variant.size = _parse_variant_size(raw_value.get('size'), where)
+        if with_weight:
+            variant.weight = _read_weight(raw_value, 'weight')
+        return variant
+
+    variant.fps = _read_fps(raw_value, 'fps', 8)
+    variant.loop = _read_bool(raw_value, 'loop', action not in ONE_SHOT_ACTIONS)
+    variant.frame_ms = _read_frame_ms(raw_value, 'frameMs', variant.frames)
 
     # 容量校验：网格必须真的装得下**全部**帧，否则末尾那些帧无处可放。
     #
@@ -1808,6 +2006,9 @@ def _parse_layout(raw_value: dict, *, where: str, frames: int) -> tuple:
                      '多行网格用 "grid"（或直接写 cols / rows）。',
             )
 
+    if name == LAYOUT_ANIMATED:
+        return _parse_animated_layout(raw_value, where=where, frames=frames)
+
     if name in (LAYOUT_HORIZONTAL, LAYOUT_VERTICAL) and has_grid_fields:
         # `layout` 与 `cols` / `rows` 同时出现时**先看是否一致**：
         # 一致就是合法的冗余写法（`to_dict()` 的输出、工具生成的包都会长这样），
@@ -1869,6 +2070,41 @@ def _parse_layout(raw_value: dict, *, where: str, frames: int) -> tuple:
                  f'或把 frames 改成 {capacity} 以内的值。',
         )
     return LAYOUT_GRID, grid_cols, grid_rows
+
+
+def _parse_animated_layout(raw_value: dict, *, where: str, frames: int) -> tuple:
+    """校验**动图容器**的声明，返回 `(LAYOUT_ANIMATED, 1, 1)`。
+
+    容器路线不切帧，因此所有「切帧」相关的字段都**没有意义**。
+    写它们必须报错，而不是静默忽略——静默的后果是作者以为 `frameMs`
+    生效了，于是反复调数字却看不出任何变化（最难查的一类问题）。
+
+    规则：
+
+    - `frames` 必须是 1（默认就是 1，所以正常写法里根本不会出现它）；
+    - `fps` / `frameMs` / `cols` / `rows` / `loop` 一律不许出现。
+
+    为什么 `loop` 也不许：动图的循环次数**写在文件自己的元数据里**
+    （GIF 的 Netscape 扩展、WebP 的 ANIM 块），插件改不了它。
+    接受一个做不到的声明比拒绝它更糟。
+    """
+    if frames != 1:
+        raise _field_error(
+            f'{where}.frames', f'动图容器不需要 frames（实际写了 {frames}）',
+            hint='动图由浏览器自行播放，插件不切帧。把 frames 删掉即可；'
+                 '想逐帧控制（每帧时长、定位某一帧、分页省显存）'
+                 '请改用帧序列：把动画拼成 spritesheet，用 '
+                 '"layout": "horizontal" / "vertical" / "grid"。',
+        )
+    written = [key for key in ANIMATED_FORBIDDEN_FIELDS if key in raw_value]
+    if written:
+        raise _field_error(
+            f'{where}.{written[0]}', '动图容器不支持这个字段',
+            hint=f'动图由浏览器自行播放，插件不切帧，因此 '
+                 f'{"、".join(written)} 都没有意义。把它们删掉即可。'
+                 '想逐帧控制请改用帧序列（spritesheet）。',
+        )
+    return LAYOUT_ANIMATED, 1, 1
 
 
 def _parse_variant_size(raw, where: str) -> dict:

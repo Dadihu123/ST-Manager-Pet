@@ -60,7 +60,9 @@ from .errors import (
     PetError,
 )
 from .imports import (
+    MAX_IMAGE_BYTES,
     MAX_PACK_BYTES,
+    animated_frame_count,
     check_size,
     load_image,
     prepare_sheet,
@@ -75,6 +77,7 @@ from .pack import (
     DEFAULT_SCALE,
     IMPORT_SOURCE_EXTENSIONS,
     KIND_ANIMATED,
+    LAYOUT_ANIMATED,
     MAX_IDLE_PLAYS,
     MAX_FRAMES,
     MAX_SCHEDULE_MS,
@@ -86,6 +89,7 @@ from .pack import (
     PetPack,
     SCALE_RANGE,
     Trigger,
+    animated_warnings,
     decode_bytes,
     loads as loads_pack,
     parse_schedule,
@@ -226,6 +230,14 @@ def clamp_schedule_ms(value) -> int:
     return int(min(max(number, MIN_SCHEDULE_MS), MAX_SCHEDULE_MS))
 
 
+#: 运行期条目里的**内部**字段：主变体解析到的真实文件路径。
+#:
+#: 只用于 `runtime_pack` 做「同一张图被多个动作共享」的显存去重，
+#: 在返回给前端之前一定会被 `pop` 掉。用 `__` 前缀标明它是内部的——
+#: 服务器文件路径不该出现在接口响应里。
+_RESOLVED_PATH_KEY = '__resolvedPath'
+
+
 def _variant_has_image(item: dict) -> bool:
     """这个变体条目**至少有一页**真的有图吗？
 
@@ -318,6 +330,9 @@ class PetStore:
     def __init__(self, data_dir: str, builtin_dir: str):
         self.data_dir = os.path.realpath(str(data_dir))
         self.builtin_dir = os.path.realpath(str(builtin_dir))
+        # 开发期导入：动图帧数缓存（见 `_animated_info`）。
+        # 必须放在 `_lock` **之前**：`_animated_info` 会拿这把锁。
+        self._animated_cache = {}
         # 导入/删除是「读-改-写」，并发请求会互相踩；一把进程内锁足够
         # （宿主是单进程 Flask，且 data_dir 有跨进程独占锁保护）。
         self._lock = threading.RLock()
@@ -1151,6 +1166,29 @@ class PetStore:
         if self._is_builtin_only(pet_id):
             stale_overrides = self._overridden_actions(pet_id)
 
+        # 形象级显存估算：按**解析到的真实文件**去重。
+        #
+        # 为什么不能按 URL 去重：`runtime_pack` 会输出**整个动作词表**
+        # （缺失的动作沿回退链落到 `idle`），而每个动作的 URL 里都带着
+        # 自己的动作名（`/frame/gifpet/angry`、`/frame/gifpet/idle`），
+        # 因此十几个动作回退到**同一张图**时 URL 各不相同、文件却是同一个。
+        # 实测：12 个动作都落到同一个 12 帧动图时，按 URL 去重仍报出 108 MB，
+        # 而真实占用只有 10.6 MB（差 10 倍）。浏览器按**资源**缓存解码结果，
+        # 因此「按文件去重」才是它的真实语义。
+        distinct_decode = {}
+        for name, action in actions.items():
+            if action.get('kind') != KIND_ANIMATED:
+                continue
+            key = action.pop(_RESOLVED_PATH_KEY, '')
+            if not key:
+                continue
+            # 同一张图被多个动作共享时取**最大**的那份（多套动画里可能
+            # 各自算出不同的 decodeBytes，而它们指向同一个文件时
+            # 实际只解一份，取大者是保守估计）。
+            size = int(action.get('decodeBytes') or 0)
+            if size > distinct_decode.get(key, 0):
+                distinct_decode[key] = size
+
         return {
             'id': pet_id,
             'source': source,
@@ -1203,16 +1241,26 @@ class PetStore:
             # 只算**主变体**：多套动画按权重随机播，同一时刻只有一套在播，
             # 但前端会预取下一页，因此实际占用介于「最大那一套」与「全部之和」
             # 之间。给一个偏保守的上界比给一个乐观的下界有用。
-            'decodeBytes': sum(
-                decode_bytes(
-                    action.get('frames') or 0,
-                    (action.get('size') or pack.size).get('w', 0),
-                    (action.get('size') or pack.size).get('h', 0),
-                )
-                for action in actions.values()
-                if action.get('kind') == KIND_ANIMATED
-            ),
+            #
+            # ⚠️ 但必须**按 URL 去重**。`runtime_pack` 会输出**整个动作词表**
+            # （缺失的动作沿回退链落到 `idle`），因此十几个动作常常指向
+            # **同一张图**。逐动作求和会把同一份解码内存数十几遍——
+            # 实测：12 个动作都回退到同一个 12 帧动图时报出 108 MB，
+            # 而真实占用只有 10.6 MB（差 10 倍）。浏览器按资源缓存解码结果，
+            # 同一个 URL 只解一次，所以「按 URL 去重」才是它的真实语义。
+            #
+            # 动图容器也用 `decodeBytes`（它已经在 `_runtime_action` 里
+            # 按**真实帧数**算好了）——不重算，否则会退化成「按 1 帧算」，
+            # 把 105 MiB 的动图报成 0.9 MiB。
+            'decodeBytes': sum(distinct_decode.values()),
+            'distinctImages': len(distinct_decode),
             'decodeBudgetBytes': DECODE_BUDGET_BYTES,
+            # 形象级的动图提醒：面板在形象详情顶部显示一次，
+            # 而不是每个动作各说一遍（同一个动图会被十几个动作共享）。
+            'animatedActions': sorted(
+                name for name, action in actions.items()
+                if action.get('animated')
+            ),
         }
 
     def _runtime_still(self, pet_id: str, pack: PetPack) -> dict:
@@ -1242,6 +1290,48 @@ class PetStore:
         )
         payload['frameSource'] = frame_source
         return payload
+
+    def _animated_info(self, path: str) -> dict:
+        """读一个动图文件的**真实帧数**，算出解码占用（带缓存）。
+
+        为什么要缓存：`runtime_pack()` 每次打开面板/刷新页面都会跑一遍，
+        而读帧数要遍历 GIF 的全部帧头（实测 120 帧约 10 ms）。不缓存的话
+        一个有若干动图动作的形象会让每次页面加载都多花几十毫秒。
+
+        缓存键包含 `mtime` 与文件大小：用户换了图（内容变了）必须重算，
+        否则面板会一直显示旧帧数——而「我换了图它却还说 120 帧」
+        正是最难查的那类不一致。
+
+        代价与取舍：这是**唯一**为了「告诉用户实话」而做的运行期文件读取。
+        读失败时返回 `frames=1`（当作静态图，宁可少报也不虚报——
+        虚报一个很大的数字会让用户不敢用本来没问题的形象）。
+        """
+        if not path or not os.path.isfile(path):
+            return {'frames': 1, 'bytes': 0}
+        try:
+            stat = os.stat(path)
+            key = (path, int(stat.st_mtime), int(stat.st_size))
+        except OSError:
+            return {'frames': 1, 'bytes': 0}
+        with self._lock:
+            cached = self._animated_cache.get(key)
+            if cached is not None:
+                return cached
+        frames = 1
+        try:
+            with open(path, 'rb') as handle:
+                # 只读前 16 MiB：动图通常远小于它，而一个异常大的文件
+                # 不该让「打开面板」这件事卡住。
+                frames = animated_frame_count(handle.read(16 * 1024 * 1024))
+        except OSError:
+            frames = 1
+        info = {'frames': frames, 'bytes': int(stat.st_size)}
+        with self._lock:
+            # 缓存上限：形象不多，但用户可能反复导入导出，做个上限兜底
+            if len(self._animated_cache) > 256:
+                self._animated_cache.clear()
+            self._animated_cache[key] = info
+        return info
 
     def _runtime_action(self, pet_id: str, pack: PetPack, action: str) -> dict:
         """把一个动作解析成前端直接可播的运行期条目。
@@ -1274,6 +1364,8 @@ class PetStore:
             return entry
 
         variants = []
+        #: 每个变体（按下标）解析到的真实文件路径；`runtime_pack` 用它去重显存。
+        resolved_paths_by_variant = {}
         for index, variant in enumerate(resolved.variants):
             item = variant.to_dict()
             # 每一页各算一个 URL。`variant=index` **必须传**：不传的话每套动画
@@ -1283,15 +1375,18 @@ class PetStore:
             # 撞在一起，前端按 `vi` 区分变体的逻辑随即失效）。
             urls = []
             sources = []
+            resolved_paths = []
             for page_index in range(len(variant.sheets)):
                 path, frame_source = self.resolve_frame_path(
                     pet_id, action, variant=index, page=page_index,
                 )
+                resolved_paths.append(path)
                 urls.append(
                     self.frame_url(pet_id, action, path, variant=index, page=page_index)
                     if path else ''
                 )
                 sources.append(frame_source)
+            resolved_paths_by_variant[index] = resolved_paths[0] if resolved_paths else ''
             item['urls'] = urls
             # **两种形状都写**，让 `url` 成为一个**永远可用**的判据。
             #
@@ -1311,10 +1406,31 @@ class PetStore:
             # 用户看不到显存，因此后端算出来、面板显示出来——他有权知道
             # 「这个动作要占多少」，然后自己决定要不要用这个形象。
             frame_size = variant.size or pack.size
-            item['decodeBytes'] = decode_bytes(
-                variant.frames, frame_size.get('w', 0), frame_size.get('h', 0),
-            )
             item['pageCount'] = len(variant.sheets)
+            if variant.animated:
+                # 动图容器：帧数**读不到**（写在文件元数据里，不在 pet.json），
+                # 因此去问一次文件本身（带缓存，见 `_animated_info`）。
+                # 没有这个数字，插件就只能说一句含糊的「资源消耗较大」，
+                # 而用户真正想知道的是「它到底占多少」。
+                info = self._animated_info(resolved_paths[0] if resolved_paths else '')
+                item['animated'] = True
+                item['animatedFrames'] = info['frames']
+                item['fileBytes'] = info['bytes']
+                item['decodeBytes'] = decode_bytes(
+                    info['frames'], frame_size.get('w', 0), frame_size.get('h', 0),
+                )
+                item['warnings'] = animated_warnings(
+                    frames=info['frames'],
+                    file_bytes=info['bytes'],
+                    frame_w=frame_size.get('w', 0),
+                    frame_h=frame_size.get('h', 0),
+                )
+            else:
+                item['animated'] = False
+                item['decodeBytes'] = decode_bytes(
+                    variant.frames, frame_size.get('w', 0), frame_size.get('h', 0),
+                )
+                item['warnings'] = []
             variants.append(item)
 
         # 只保留**真的有图**的变体：声明了 sheet 但文件缺失的那套留着，
@@ -1335,16 +1451,37 @@ class PetStore:
             # 真正决定铺哪张图的是 `pages`。
             entry['url'] = primary.get('url') or (primary.get('pages') or [''])[0]
             entry['frameSource'] = primary['frameSource']
-            # 主变体透传：老前端只读这些字段，因此它们必须与 `variants[0]` 一致
-            entry['frames'] = primary['frames']
-            entry['fps'] = primary['fps']
-            entry['loop'] = primary['loop']
+            # 主变体透传：老前端只读这些字段，因此它们必须与 `variants[0]` 一致。
+            #
+            # ⚠️ 一律用 `.get` 并给**语义正确的默认值**：动图容器的变体里
+            # 根本没有 `frames` / `fps` / `loop` / `frameMs` / `cols` / `rows`
+            # （见 `ResolvedVariant.to_dict`），用 `primary['frames']` 会
+            # **KeyError → 后端 500**，表现是「这个形象完全打不开」。
+            # 这与多页那次是同一类错误：新形状进来时，下游的硬取值就是地雷。
+            entry['frames'] = primary.get('frames', 1)
+            entry['fps'] = primary.get('fps', 0)
+            entry['loop'] = primary.get('loop', True)
             entry['layout'] = primary['layout']
-            entry['cols'] = primary['cols']
-            entry['rows'] = primary['rows']
-            entry['frameMs'] = list(primary['frameMs'])
+            entry['cols'] = primary.get('cols', 1)
+            entry['rows'] = primary.get('rows', 1)
+            entry['frameMs'] = list(primary.get('frameMs') or [])
             entry['decodeBytes'] = primary.get('decodeBytes', 0)
             entry['pageCount'] = primary.get('pageCount', 1)
+            # 动图容器：动作层也要带上标记与提醒，前端不必先钻进 `variants`
+            # 才知道「这个动作是动图」（面板的动作格要显示徽章）。
+            entry['animated'] = bool(primary.get('animated'))
+            entry['animatedFrames'] = primary.get('animatedFrames', 1)
+            entry['warnings'] = list(primary.get('warnings') or [])
+            # **内部**字段：主变体解析到的真实文件路径。仅供 `runtime_pack`
+            # 做「同一张图被多个动作共享」的显存去重（见那里的说明），
+            # 在返回给前端之前会被 `pop` 掉——服务器文件路径不该出现在响应里。
+            #
+            # ⚠️ 必须挂在**动作条目**上（而不是变体上）：`runtime_pack`
+            # 遍历的是动作条目，挂在变体上会让 `pop` 拿不到它，
+            # 于是去重失效、显存被重复计数（实测差 10 倍）。
+            entry[_RESOLVED_PATH_KEY] = (
+                resolved_paths_by_variant.get(0, '') if resolved_paths_by_variant else ''
+            )
             # 多页：把主变体的页数组也透传到动作层，前端不必先钻进 `variants`
             # 才知道「这个动作有几页」。
             if primary.get('pages'):
@@ -1574,6 +1711,25 @@ class PetStore:
                 count = int(spec.get('frames') or 1)
             except (TypeError, ValueError):
                 count = 1
+            # ★ 「新建形象」是**帧序列**通路：它要把上传的图按帧数切开再拼成
+            # 规整的 sheet。动图在这里会被 `prepare_sheet` 按宽度切分——
+            # 而一张 GIF 的宽度与「几帧」无关，结果是切出一堆错位的小条。
+            # 因此**明确拒绝**并指出该走哪条路，而不是产出一个坏掉的形象。
+            #
+            # 动图路线不需要「新建」：作者把 GIF 放进 zip、在 pet.json 里写
+            # `"layout": "animated"` 即可（或对已有形象用「换图」）。
+            uploaded_frames = animated_frame_count(spec['data'])
+            if uploaded_frames > 1:
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'新建形象不接受动图（{action} 上传的是 {uploaded_frames} 帧动图）',
+                    user_msg=f'「{action}」上传的是一个 {uploaded_frames} 帧的动图，'
+                             '而「新建形象」是按帧序列切图的。',
+                    hint='动图请改用「导入形象包」：把 GIF / 动图 WebP 与 pet.json '
+                         '（其中写 "layout": "animated"）一起打成 zip 导入。'
+                         '想让动图被逐帧控制（每帧时长、分页省显存）的话，'
+                         '请把它拼成 spritesheet 再用这个表单。',
+                )
             outcome = prepare_sheet(
                 spec['data'],
                 frames=count,
@@ -2160,6 +2316,14 @@ class PetStore:
 
     # -------------------------------------------------- 单动作 / 形象图覆盖
 
+    @staticmethod
+    def _frame_size_of(pack: PetPack) -> tuple:
+        """包级单帧逻辑尺寸；取不到时返回 `None`（让 `process_upload` 不缩放）。"""
+        try:
+            return (int(pack.size['w']), int(pack.size['h']))
+        except (KeyError, TypeError, ValueError):
+            return None
+
     def save_action_image(
         self,
         pet_id: str,
@@ -2173,6 +2337,10 @@ class PetStore:
 
         只对**用户自建形象**开放：内置形象严格只读（`assert_writable`）。
         覆盖文件放在 `pets/<id>/overrides/<action>.png`，解析期优先级最高。
+
+        **动图**（`layout: "animated"` 的动作）走一条独立通路：原样落盘、
+        不归一化。理由见下面的注释——归一化会把动图**静默压成第一帧**，
+        而用户上传动图的意图显然不是「只要第一帧」。
         """
         pet_id = self.assert_writable(pet_id)
         action = str(action or '').strip()
@@ -2184,18 +2352,75 @@ class PetStore:
                 hint='动作名只能是字母、数字、下划线或连字符。',
             )
         # 确认形象存在（否则会凭空建出一个只有覆盖的目录）
-        self.load_pack(pet_id)
+        pack = self.load_pack(pet_id)
 
-        if frame_size is None:
-            try:
-                frame_size = (int(self.load_pack(pet_id).size['w']), int(self.load_pack(pet_id).size['h']))
-            except (KeyError, TypeError, ValueError):
-                frame_size = None
+        # 这个动作声明的是不是**动图容器**？决定后面走哪条通路。
+        action_is_animated = False
+        try:
+            resolved = pack.resolve(action)
+            if resolved.kind == KIND_ANIMATED and resolved.variants:
+                action_is_animated = bool(resolved.variants[0].animated)
+        except Exception:  # noqa: BLE001 - 判定失败就按普通动作处理
+            action_is_animated = False
 
-        processed = process_upload(
-            data, what=f'「{action}」动作的图', output_format=output_format,
-            frame_size=frame_size,
-        )
+        uploaded_frames = animated_frame_count(data)
+        uploaded_animated = uploaded_frames > 1
+
+        if action_is_animated and uploaded_animated:
+            # ---- 动图覆盖：**原样落盘**
+            #
+            # 不能走 `process_upload`：它会 `load_image`（只取第一帧）
+            # 再编码成 PNG —— 动图被**静默压成一帧**，而用户上传的意图
+            # 显然是「换成我这个动图」。这与「导入 zip 时原样保留 GIF」
+            # 是同一条原则：用户给的动图，我们没有理由重编码它。
+            #
+            # 扩展名跟随真实格式（`sniff_format` 按 magic bytes 判定，
+            # 不信扩展名），这样 `resolve_frame_path` 能按扩展名找到它。
+            real = (sniff_format(data) or '').upper()
+            extension = {
+                'GIF': '.gif', 'WEBP': '.webp', 'PNG': '.png', 'AVIF': '.avif',
+            }.get(real)
+            if extension is None:
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'动图覆盖的格式不受支持: {real or "未知"}',
+                    user_msg='这个动图的格式不支持。',
+                    hint='动图请用 GIF、WebP（动图）或 AVIF。',
+                )
+            if len(data) > MAX_IMAGE_BYTES:
+                check_size(len(data), MAX_IMAGE_BYTES, what='动图')
+            processed = {
+                'data': data, 'extension': extension, 'format': extension.lstrip('.'),
+                'source_format': real, 'size': None, 'animatedFrames': uploaded_frames,
+            }
+        elif action_is_animated and not uploaded_animated:
+            # 动图动作上传了一张静态图：**允许**（作者可能想临时换一张静图），
+            # 但要走普通通路归一化，否则尺寸对不上。
+            processed = process_upload(
+                data, what=f'「{action}」动作的图', output_format=output_format,
+                frame_size=frame_size or self._frame_size_of(pack),
+            )
+        elif uploaded_animated:
+            # ★ 普通动作上传了动图：**报错**而不是静默压成第一帧。
+            #
+            # 静默的后果是最难查的一类：用户上传了一个动图，看到的却是一张
+            # 不动的图，而界面没有任何提示——他会以为插件坏了。
+            # 这里给出可执行的出路（改用动图容器 / 或提供帧序列）。
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'动作 {action} 不是动图容器，但上传的是动图（{uploaded_frames} 帧）',
+                user_msg=f'「{action}」这个动作是按帧序列播的，'
+                         f'而你上传的是一个 {uploaded_frames} 帧的动图。',
+                hint='两条出路：① 把这张动图当动图用——在 pet.json 里给这个动作写 '
+                     '"layout": "animated"；② 或者改用帧序列：把动画拼成 '
+                     'spritesheet（横向 / 竖向 / 网格）再上传。'
+                     '直接上传动图只会保留第一帧，因此这里没有替你决定。',
+            )
+        else:
+            processed = process_upload(
+                data, what=f'「{action}」动作的图', output_format=output_format,
+                frame_size=frame_size or self._frame_size_of(pack),
+            )
 
         with self._lock:
             override_dir = safe_join(self.data_dir, PETS_DIRNAME, pet_id, OVERRIDES_DIRNAME)
@@ -2211,12 +2436,18 @@ class PetStore:
             target = os.path.join(override_dir, f'{action}{processed["extension"]}')
             write_bytes_atomic(target, processed['data'])
 
-        logger.info('形象 %s 的动作 %s 已更新覆盖图（%s）', pet_id, action, processed['source_format'])
+        logger.info(
+            '形象 %s 的动作 %s 已更新覆盖图（%s%s）',
+            pet_id, action, processed['source_format'],
+            f'，{processed["animatedFrames"]} 帧动图' if processed.get('animatedFrames', 1) > 1 else '',
+        )
         return {
             'petId': pet_id,
             'action': action,
             'sourceFormat': processed['source_format'],
-            'size': list(processed['size']),
+            'size': list(processed['size']) if processed.get('size') else None,
+            'animated': bool(processed.get('animatedFrames', 1) > 1),
+            'animatedFrames': int(processed.get('animatedFrames', 1) or 1),
             'url': self.frame_url(pet_id, action, target),
         }
 

@@ -386,7 +386,12 @@ export function createAnimationPlayer(options = {}) {
     /** 从头播。 */
     play() {
       if (!variant || frames <= 1) {
-        // 单帧：没有可播的，直接算「播完」
+        // 单帧 / 动图容器：没有**我们**可播的帧。
+        //
+        // 动图不是「播完了」——它是浏览器在播。这里仍然调 `onEnd()`，
+        // 因为面板用它来同步「播放/暂停」按钮的文字；但**不能**把它
+        // 当成「动画结束」去推进任何状态机（面板的 `onEnd` 只改按钮文字）。
+        // 真正的区别由调用方按 `animated` 判断（见 `panel.js` 的帧读数）。
         draw();
         emit();
         if (onEnd) onEnd();

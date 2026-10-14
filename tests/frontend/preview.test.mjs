@@ -12,6 +12,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { frameGrid, framePage, framePageCount } from '../../frontend/animation.js';
+import { animationDuration } from '../../frontend/animation.js';
 import { frameDurations, totalDuration, applyFrameGeometry } from '../../frontend/preview.js';
 
 /**
@@ -522,6 +523,74 @@ test('frameGrid：horizontal / vertical 是网格的特例', () => {
   // 缺省（老后端不下发 layout）等价于 horizontal
   assert.deepEqual(frameGrid({ frames: 3 }), { cols: 3, rows: 1 });
   assert.deepEqual(frameGrid(null), { cols: 1, rows: 1 });
+});
+
+// ============================================================ 动图容器
+//
+// `layout: "animated"`：由浏览器自行播放，插件不切帧。
+// 它的网格是 `(1, 1)`，于是「背景铺法 = 单帧 × 行列数」这条公式自然退化成
+// 「原样铺满一帧」——**三条切帧排布与容器路线共用同一套渲染代码**，
+// 不必在 petview / preview / panel 里各加一条 `if (animated)` 分支。
+//
+// 这是「第二路线」：作者手上已有现成的 GIF / 动图 WebP 时零成本可用，
+// 代价是放弃逐帧控制与分页能力（见 README §3.11）。
+
+
+test('★ frameGrid：动图容器是 (1,1)，不是网格', () => {
+  assert.deepEqual(frameGrid({ frames: 1, layout: 'animated' }), { cols: 1, rows: 1 });
+  // 即使带了（本不该有的）cols/rows 也不该被当成网格
+  assert.deepEqual(
+    frameGrid({ frames: 1, layout: 'animated', cols: 8, rows: 8 }),
+    { cols: 1, rows: 1 },
+    '动图不切帧，声明网格没有意义',
+  );
+});
+
+test('★ 预览几何：动图容器原样铺满一帧（不切帧）', () => {
+  // 网格是 (1,1) → 整条 sheet = 单帧 × 1，位移恒为 (0,0)。
+  // 因此「动图」与「单帧静态图」在**几何上**是同一条路径——
+  // 区别只在浏览器会不会让那张图自己动起来。
+  const box = fakeBox(168, 168);
+  const layer = fakeLayer();
+  const at = applyFrameGeometry(box, { cols: 1, rows: 1 }, 1, 0,
+                                { w: 96, h: 96 }, layer);
+  assert.equal(at.page, 0);
+  assert.equal(at.col, 0);
+  assert.equal(at.row, 0);
+  const sheet = layer.size;
+  // 整条就是那一帧：按框等比 contain
+  assert.ok(Math.abs(sheet.w - sheet.h) < 1e-6, '正方形帧在正方框里应等比');
+  assert.ok(Math.abs(sheet.w - 168) < 1e-6, '应铺满框宽');
+  assert.deepEqual({ x: layer.offset.x, y: layer.offset.y }, { x: 0, y: 0 });
+});
+
+test('预览几何：动图容器的帧号被忽略（只有一帧可定位）', () => {
+  const box = fakeBox(168, 168);
+  const layer = fakeLayer();
+  // 即使传了一个越界的帧号，也不该算出非零位移
+  const at = applyFrameGeometry(box, { cols: 1, rows: 1 }, 1, 99,
+                                { w: 100, h: 100 }, layer);
+  assert.equal(at.col, 0);
+  assert.equal(at.row, 0);
+});
+
+test('★ 动图容器的时长算不出来，因此返回 0（让调用方走兜底）', () => {
+  // 一轮多久写在**文件自己的元数据**里（GIF 的 Netscape 扩展、
+  // WebP 的 ANIM 块），插件读不到。编一个数字出来会让
+  // 「播完回 idle」的定时器按假时长把动作提前打断。
+  assert.equal(animationDuration({ animated: true, frames: 1 }), 0);
+  assert.equal(animationDuration({ layout: 'animated', frames: 1 }), 0);
+  // 普通单帧仍然返回 0（没有可播的帧），而多帧照常算
+  assert.equal(animationDuration({ frames: 4, fps: 8 }), 500);
+});
+
+test('预览帧时长：动图容器只有一项（调用方不必判空）', () => {
+  assert.equal(frameDurations({ animated: true, frames: 1 }).length, 1);
+});
+
+test('framePageCount：动图容器恒为 1 页（不能分页）', () => {
+  assert.equal(framePageCount({ animated: true, pages: undefined }), 1);
+  assert.equal(framePageCount({ animated: true, url: 'a.gif' }), 1);
 });
 
 test('frameGrid：只给一个方向时另一个按「装得下」补', () => {

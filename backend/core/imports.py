@@ -144,6 +144,48 @@ def check_payload_size(size: int) -> None:
         )
 
 
+def animated_frame_count(data: bytes) -> int:
+    """这张图有几帧？**静态图返回 1**，动图返回真实帧数。
+
+    为什么要它：动图容器（`layout: "animated"`）的解码占用是
+    「帧数 × 宽 × 高 × 4」——而帧数**读不到**（它写在文件自己的元数据里，
+    不在 `pet.json` 里）。没有这个数字，插件就只能对用户说一句含糊的
+    「资源消耗较大」，而那对「我该不该用这个形象」这个决定毫无帮助。
+
+    实测开销：120 帧的 GIF 约 10 ms（Pillow 要遍历帧头）。这个代价只在
+    **导入期**与**带缓存的运行期**各付一次，可以接受。
+
+    不做解码炸弹防护的例外：调用方通常已经用 `load_image` 解过一次，
+    这里只是再问一句「几帧」。但**独立调用时**仍需自己防——因此这里
+    也走 `Image.MAX_IMAGE_PIXELS`。
+
+    Args:
+        data: 图片字节。
+
+    Returns:
+        int: 帧数（>= 1）；读不出来时返回 1（当作静态图，宁可少报不虚报）。
+    """
+    if not data:
+        return 1
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            count = int(getattr(image, 'n_frames', 1) or 1)
+            return max(1, count)
+    except Exception:  # noqa: BLE001 - 读不出来就是「不知道」，不该让调用方崩
+        return 1
+
+
+def is_animated_image(data: bytes) -> bool:
+    """这张图是不是**动图**（多帧容器）？
+
+    用于两个方向：
+    - 声明了 `layout: "animated"` 时校验「它真的是动图吗」——
+      在静态图上写这个声明，用户会看到一张不动的图而不知道为什么；
+    - 没声明却上传了动图时给出提示——静默压成第一帧是最难查的一类问题。
+    """
+    return animated_frame_count(data) > 1
+
+
 def load_image(data: bytes, *, what: str = '图片') -> Image.Image:
     """从字节解码图片，含**解码炸弹**防护（§3.4 第 2 条）。
 

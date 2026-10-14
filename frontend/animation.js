@@ -58,6 +58,10 @@ export function normalizeWeight(raw) {
  */
 export function animationDuration(spec) {
   const source = spec || {};
+  // 动图容器：一轮多久由**文件自己的元数据**决定，插件读不到也不该猜。
+  // 返回 0 让调用方走它自己的兜底值——编一个数字出来会让动作被提前打断
+  // （「播完回 idle」的定时器按一个假时长来掐）。
+  if (source.animated === true || source.layout === 'animated') return 0;
   const frames = Math.max(1, Math.floor(Number(source.frames) || 1));
   const durations = Array.isArray(source.frameMs) ? source.frameMs : null;
   if (durations && durations.length === frames) {
@@ -147,6 +151,11 @@ export const DEFAULT_FRAME_SIZE = { w: 64, h: 64 };
 export function frameGrid(source) {
   const spec = source || {};
   const frames = Math.max(1, Math.floor(Number(spec.frames) || 1));
+  // 动图容器：**不是**网格。整张图是「一帧」，由浏览器自己播。
+  // 返回 (1, 1) 让下游公式（背景铺法 = 单帧 × 行列数）自然退化成「原样铺满」
+  // ——于是三条切帧排布与容器路线共用同一套渲染代码，不必在
+  // `petview` / `preview` / `panel` 里各加一条 `if (animated)` 分支。
+  if (spec.layout === 'animated') return { cols: 1, rows: 1 };
   const declaredCols = Math.max(0, Math.floor(Number(spec.cols) || 0));
   const declaredRows = Math.max(0, Math.floor(Number(spec.rows) || 0));
 
@@ -294,6 +303,12 @@ function normalizeVariant(item) {
     fps: Number(source.fps) || 0,
     loop: source.loop !== false,
     layout: source.layout === 'vertical' ? 'vertical' : 'horizontal',
+    // **动图容器**：由浏览器自行播放，插件不切帧。
+    // 下游（petview / preview / panel）据此避开「单帧」这个说法——
+    // 它明明在动，说成「单帧（静态显示）」会让用户以为图坏了。
+    animated: source.layout === 'animated' || source.animated === true,
+    // 动图的**真实帧数**（后端从文件元数据读出来的）；静态图是 1。
+    animatedFrames: Math.max(1, Math.floor(Number(source.animatedFrames) || 1)),
     // 网格几何：**原样带上**后端算好的值（缺失时 `frameGrid` 会按 layout 推）。
     cols: Math.max(0, Math.floor(Number(source.cols) || 0)),
     rows: Math.max(0, Math.floor(Number(source.rows) || 0)),
@@ -324,6 +339,12 @@ export function stillFrame(pack) {
     frames,
     frame,
     layout: still.layout === 'vertical' ? 'vertical' : 'horizontal',
+    // 标准图像**不该**是动图容器：它的语义是「不播动画时显示的那一帧」，
+    // 而一个会自己动的图与「静止画面」是矛盾的。
+    // 但作者可能只提供了一个动图（例如 idle 就是 GIF），此时回落出来的
+    // 标准图像只能是它——这时 `animated` 为真，前端据此知道
+    // 「静止状态下它也会动」，而不是以为自己漏画了什么。
+    animated: still.layout === 'animated' || still.animated === true,
     // 网格几何（标准图像可以从任意一条 sheet 取一帧，包括网格排布的）。
     // 没有它就算不出「第 7 帧在哪一格」——那会显示成第 0 帧，
     // 而包本身看起来完全正常。

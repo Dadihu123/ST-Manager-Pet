@@ -404,6 +404,9 @@ export function createPetView(options = {}) {
       // ⚠️ 这里用**网格容量**（cols × rows）而不是帧数：装不满的网格
       // （例如 4×4 只放 13 帧）末行是空的，但背景图仍是完整的 4×4 张图。
       // 多页时这个公式不变——**每页的形状相同**，只是换一张图。
+      //
+      // 动图容器（`layout: "animated"`）的网格是 `(1, 1)`，于是这条公式
+      // 自然退化成「原样铺满一帧」——**不需要**为它写一条分支。
       const grid = frameGrid(variant);
       sprite.style.backgroundSize = `${width * grid.cols}px ${height * grid.rows}px`;
       sprite.style.backgroundRepeat = 'no-repeat';
@@ -1142,6 +1145,10 @@ export function createPetView(options = {}) {
     reducedMotion = hostState.reducedMotion === true
       ? true
       : (hostState.reducedMotion === false ? false : reducedMotion);
+    if (!reducedMotion) {
+      // 恢复动效时清掉「停不下来」的标记（它只是排查用的线索）
+      delete root.dataset.petAnimatedUnstoppable;
+    }
     root.classList.toggle('is-throttled', throttle.rate < 1 && !throttle.paused);
     root.classList.toggle('is-static-motion', reducedMotion);
     root.dataset.petThrottle = throttle.reason || 'none';
@@ -1159,6 +1166,18 @@ export function createPetView(options = {}) {
         clock.reset();
         drawFrame();
         root.classList.remove('is-moving');
+        // ⚠️ **动图容器停不下来**：`clock.reset()` 只能把我们自己的帧推进
+        // 归零，而 GIF / 动图 WebP 是浏览器在播——没有 CSS 能暂停它。
+        // 因此这里换成**标准图像**（一张静态图）来兑现 reducedMotion 的承诺。
+        // 作者没提供静态标准图像时只能保留动图，此时把原因挂到 dataset 上
+        // 供排查（而不是假装已经停住了）。
+        if (currentVariant && currentVariant.animated) {
+          if (still && !still.animated) {
+            drawStill();
+          } else {
+            root.dataset.petAnimatedUnstoppable = 'true';
+          }
+        }
       }
       return;
     }

@@ -743,6 +743,11 @@ def register_routes(api, store: PetStore) -> None:
                     # 因此「这个形象重不重」只能由插件告诉他）。
                     'decodeBytes': variant.get('decodeBytes') or 0,
                     'pageCount': variant.get('pageCount') or 1,
+                    # 动图容器：面板要显示徽章、改帧读数、列提醒，
+                    # 全都靠这三个字段（缺了就会把它当成「单帧静态」）。
+                    'animated': bool(variant.get('animated')),
+                    'animatedFrames': variant.get('animatedFrames') or 1,
+                    'warnings': list(variant.get('warnings') or []),
                     # 单帧尺寸（可能缺省 = 沿用包级）。
                     #
                     # 必须透传：面板的预览框要按**真实宽高比**把这一帧装进去，
@@ -766,6 +771,10 @@ def register_routes(api, store: PetStore) -> None:
                 'pages': entry.get('pages') or [],
                 'decodeBytes': entry.get('decodeBytes') or 0,
                 'pageCount': entry.get('pageCount') or 1,
+                # 动图容器（见变体层的说明）
+                'animated': bool(entry.get('animated')),
+                'animatedFrames': entry.get('animatedFrames') or 1,
+                'warnings': list(entry.get('warnings') or []),
                 'frameMs': entry.get('frameMs') or [],
                 'url': entry.get('url'),
                 'note': entry.get('note'),
