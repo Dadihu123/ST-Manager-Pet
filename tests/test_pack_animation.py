@@ -401,15 +401,21 @@ def test_schedule_rejects_event_driven_actions():
 
     `click` 要有人点、`fall` 要松手——这些事做不到「每 5 秒自己发生一次」。
     静默忽略的后果是作者以为设好了，却永远不生效（最难查的一类问题）。
+
+    ⚠️ `sleep` **不在**这个列表里：它是时间驱动的（「静了多久之后睡着」），
+    是合法的 `schedule` 键。早先它是事件驱动的（要有人点才睡），
+    后来改成时间驱动之后就必须从这里移出去——否则这条测试会
+    把「新增一个合法行为」当成回归。
     """
-    for action in ('click', 'fall', 'happy', 'land', 'sleep', 'walk-left'):
+    for action in ('click', 'fall', 'happy', 'land', 'walk-left', 'walk-right'):
         with pytest.raises(Exception) as info:
             _scheduled({action: {'intervalMs': [1000, 2000]}})
         message = str(info.value)
         assert action in message, f'错误信息要点出是哪个键有问题: {message}'
-        assert 'idle' in message and 'roam' in message, (
-            '错误信息要告诉用户**哪些**行为能设'
-        )
+        for allowed in SCHEDULE_BEHAVIORS:
+            assert allowed in message, (
+                f'错误信息要告诉用户**哪些**行为能设（缺 {allowed}）: {message}'
+            )
 
 
 def test_schedule_rejects_fields_a_behavior_does_not_support():

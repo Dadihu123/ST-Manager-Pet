@@ -17,6 +17,8 @@ import {
   motionBlinks,
   motionBreathes,
   normalizeMotion,
+  SLEEP_AFTER_MAX_MS,
+  SLEEP_AFTER_MIN_MS,
 } from './animation.js';
 import { createAnimationPlayer, totalDuration } from './preview.js';
 
@@ -51,13 +53,19 @@ const REQUIRED_ACTIONS = ['idle', 'walk', 'drag', 'fall'];
 /**
  * **可设置触发时间**的行为（与后端 `pack.SCHEDULE_BEHAVIORS` 必须一致）。
  *
- * 用户要求「支持调整不同动作的触发时间」，而真正**由时间驱动**的只有这两个：
+ * 用户要求「支持调整不同动作的触发时间」，而真正**由时间驱动**的只有这三个：
  *
  * - `idle`：闲着的时候偶尔动一下；
- * - `roam`：闲着的时候自己在屏幕底部走一走。
+ * - `roam`：闲着的时候自己在屏幕底部走一走；
+ * - `sleep`：**多久没人理就睡着**（用户要求把「睡觉」也加进来）。
  *
  * 其余动作由**事件**触发（`click` 要有人点、`fall` 要松手、`happy` 要有播报），
  * 给它们设「多久一次」没有意义——后端会明确拒绝，因此面板也不渲染它们的滑块。
+ *
+ * ⚠️ `sleep` 的形状与另外两个**不同**：它是**阈值**（「静了多久之后发生」），
+ * 不是「每隔一段随机时间发生一次」。因此 `isThreshold: true`，
+ * 面板只渲染一个「多久」而不是「最短 / 最长」两个滑块——
+ * 「多久不管就睡觉」显然不该是随机的。
  */
 const SCHEDULE_BEHAVIORS = [
   {
@@ -69,6 +77,13 @@ const SCHEDULE_BEHAVIORS = [
     key: 'roam',
     label: '自动漫游',
     hint: '闲着的时候自己在屏幕底部走一走。关掉「自动漫游」开关后这项不生效。',
+  },
+  {
+    key: 'sleep',
+    label: '打盹',
+    isThreshold: true,
+    hint: '多久没人理它就睡着（睡着后任何操作都会把它唤醒）。'
+      + '比宿主设置里的全局值优先。',
   },
 ];
 
@@ -1589,6 +1604,94 @@ export function createSettingsPanel({
    * 这两项**对内置形象同样开放**：它们落在 `data/settings.json`（用户偏好），
    * 不是随包资源。内置形象恰恰是大多数用户唯一会用的形象。
    */
+  /**
+   * 渲染一个**阈值型**行为（目前只有 `sleep`）：一个「多久」而不是区间。
+   *
+   * 为什么单独一条路：`sleep` 的语义是「静了多久之后睡着」，是一个**阈值**，
+   * 不是「每隔一段随机时间发生一次」。套用「最短 / 最长」两个滑块会把
+   * 「随机」这个语义强加上去——而「多久不管就睡觉」显然不该是随机的。
+   *
+   * 提交时用 `afterMs`（毫秒），区间与 manifest 的 `sleep_after` 一致
+   * （10 秒 ~ 1 小时），免得同一个概念在两处设置里有不同的边界。
+   */
+  function renderThresholdField(behavior, current, suggested) {
+    const fallback = (DEFAULT_SCHEDULE_MS[behavior.key] || {}).min || 120000;
+    const low = SLEEP_AFTER_MIN_MS;
+    const high = SLEEP_AFTER_MAX_MS;
+    const clamp = (raw) => {
+      const number = Number(raw);
+      const base = Number.isFinite(number) && number > 0 ? number : fallback;
+      return Math.round(Math.min(Math.max(base, low), high) / 1000) * 1000;
+    };
+    // ★ 没有按形象的值时，显示**宿主全局**的那个（秒 → 毫秒）。
+    // 不能拿一个写死的默认值顶上：宿主表单里那个全局值正是给这种情况用的，
+    // 顶掉它会让用户看到「我在宿主设置里改了却没反应」。
+    const hostMs = clamp((Number(detail.hostSleepAfter) || 120) * 1000);
+    const declared = Number(current.afterMs);
+    const followsHost = !(Number.isFinite(declared) && declared > 0);
+    const afterMs = followsHost ? hostMs : clamp(declared);
+
+    const field = el('div', 'pet-field');
+    const head = el('div', 'pet-slider-head');
+    head.appendChild(el('span', 'pet-field-label', behavior.label));
+    const readout = el('span', 'pet-slider-value', formatMs(afterMs));
+    head.appendChild(readout);
+    field.appendChild(head);
+
+    const row = el('div', 'pet-schedule-row');
+    const slider = el('input', 'pet-slider');
+    slider.type = 'range';
+    slider.min = String(low);
+    slider.max = String(high);
+    // 按秒做步长：设置面板上没人会去调 1 毫秒
+    slider.step = '1000';
+    slider.value = String(afterMs);
+    slider.dataset.scheduleBehavior = behavior.key;
+    // 面板上「阈值」型行为的提交字段与区间型不同，用一个显式的标记，
+    // 免得提交处再去判断一次「这个行为是哪种形状」。
+    slider.dataset.scheduleBound = 'after';
+    slider.setAttribute('aria-label', `${behavior.label}的等待时间`);
+
+    const commit = () => {
+      const value = Number(row.querySelector('[data-schedule-bound="after"]').value);
+      updateSchedule(behavior.key, { afterMs: value });
+    };
+    const live = () => {
+      readout.textContent = formatMs(clamp(
+        Number(row.querySelector('[data-schedule-bound="after"]').value),
+      ));
+    };
+    slider.addEventListener('input', live);
+    slider.addEventListener('change', commit);
+
+    const box = attachNumberBox(slider, {
+      label: `${behavior.label}的等待时间（毫秒）`,
+      clamp,
+      onInput: live,
+      onCommit: commit,
+    });
+    const boundRow = el('div', 'pet-slider-row');
+    boundRow.appendChild(slider);
+    boundRow.appendChild(box.input);
+    row.appendChild(boundRow);
+    field.appendChild(row);
+
+    const rangeRow = el('div', 'pet-slider-range');
+    rangeRow.appendChild(el('span', null, formatMs(low)));
+    rangeRow.appendChild(el('span', null, formatMs(high)));
+    field.appendChild(rangeRow);
+    field.appendChild(el(
+      'div',
+      'pet-field-hint',
+      behavior.hint
+      + (followsHost ? `当前跟随宿主设置（${formatMs(hostMs)}）。` : '')
+      + (Number(suggested.afterMs) > 0
+        ? `形象包建议 ${formatMs(suggested.afterMs)}。`
+        : ''),
+    ));
+    return field;
+  }
+
   function renderSchedule() {
     const section = el('div', 'pet-section');
     const title = el('div', 'pet-section-title');
@@ -1613,6 +1716,16 @@ export function createSettingsPanel({
       const preset = DEFAULT_SCHEDULE_MS[behavior.key] || { min: 6000, max: 18000 };
       const current = effective[behavior.key] || preset;
       const suggested = declared[behavior.key] || preset;
+
+      // ---- 阈值型行为（`sleep`）：只有一个「多久」，不是区间
+      //
+      // 「多久没人理就睡着」显然不该是随机的，所以这里**不**渲染两个滑块。
+      // 用 `afterMs`（毫秒），区间与 manifest 的 `sleep_after` 一致。
+      if (behavior.isThreshold) {
+        section.appendChild(renderThresholdField(behavior, current, suggested));
+        continue;
+      }
+
       const minMs = clampScheduleMs(current.minIntervalMs, preset.min);
       const maxMs = clampScheduleMs(current.maxIntervalMs, preset.max);
 

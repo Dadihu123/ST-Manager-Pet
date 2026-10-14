@@ -232,6 +232,13 @@ async function main() {
       )];
       const behaviors = [...new Set(sliders.map((s) => s.dataset.scheduleBehavior))];
       const bounds = [...new Set(sliders.map((s) => s.dataset.scheduleBound))];
+      // 每个行为的滑块个数：区间型 2 个（min/max），阈值型 1 个（after）。
+      // 单看去重后的 bounds 分不出「sleep 只有一个滑块」这件事。
+      const sliderCount = {};
+      for (const s of sliders) {
+        const key = s.dataset.scheduleBehavior;
+        sliderCount[key] = (sliderCount[key] || 0) + 1;
+      }
       const titles = [...document.querySelectorAll('.plugin-stm-pet .pet-section-title')]
         .map((n) => n.textContent);
       const detail = await (await fetch(
@@ -242,13 +249,26 @@ async function main() {
       const expected = {};
       for (const s of sliders) {
         const behavior = s.dataset.scheduleBehavior;
-        const bound = s.dataset.scheduleBound === 'min' ? 'minIntervalMs' : 'maxIntervalMs';
+        // ★ sleep 是**阈值**（字段是 afterMs），与区间型的 min/max 不同名。
+        // 写死「min → minIntervalMs、其它 → maxIntervalMs」的话，
+        // sleep 那一项会拿一个不存在的字段去比对，永远不相等。
+        const bound = s.dataset.scheduleBound === 'after'
+          ? 'afterMs'
+          : (s.dataset.scheduleBound === 'min' ? 'minIntervalMs' : 'maxIntervalMs');
+        // ★ 阈值为 null 时，滑块显示的是**宿主的全局值**（120 秒），
+        // 而不是 null——那是设计如此：null 表示「跟随宿主」，
+        // 而面板要把它换算成一个能拖动的位置。因此这里比对的是
+        // 「面板显示的宿主值」，不是后端那个 null。
+        const raw = detail.schedule[behavior][bound];
         expected[behavior + '.' + s.dataset.scheduleBound] =
-          detail.schedule[behavior][bound];
+          (raw === null && s.dataset.scheduleBound === 'after')
+            ? (Number(detail.hostSleepAfter) || 120) * 1000
+            : raw;
       }
       return {
         activeId,
         petId: card.dataset.petId,
+        sliderCount,
         behaviors, bounds, titles, count: sliders.length,
         actual: Object.fromEntries(sliders.map(
           (s) => [s.dataset.scheduleBehavior + '.' + s.dataset.scheduleBound, Number(s.value)]
@@ -260,15 +280,22 @@ async function main() {
     })()`);
 
     record(
-      '② 面板有「触发时间」区，且列出 idle / roam 两个行为',
-      schedulePanel.behaviors.sort().join(',') === 'idle,roam'
-        && schedulePanel.bounds.sort().join(',') === 'max,min'
+      '② 面板有「触发时间」区，且列出 idle / roam / sleep 三个行为',
+      // `sleep` 是后加的（用户要求「多长时间不管就睡觉」）。它与另外两个
+      // **形状不同**：是**阈值**，因此只有**一个**滑块（bound 是 `after`），
+      // 而区间型的两个各有 `min` / `max`。
+      schedulePanel.behaviors.sort().join(',') === 'idle,roam,sleep'
+        && schedulePanel.bounds.sort().join(',') === 'after,max,min'
+        && schedulePanel.sliderCount.idle === 2
+        && schedulePanel.sliderCount.roam === 2
+        && schedulePanel.sliderCount.sleep === 1
         && schedulePanel.petId === schedulePanel.activeId,
       JSON.stringify({
         petId: schedulePanel.petId,
         activeId: schedulePanel.activeId,
         behaviors: schedulePanel.behaviors,
         bounds: schedulePanel.bounds,
+        sliderCount: schedulePanel.sliderCount,
         titles: schedulePanel.titles,
       }),
     );

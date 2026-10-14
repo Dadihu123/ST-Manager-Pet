@@ -525,16 +525,22 @@ DEFAULT_IDLE_PLAYS = 1
 
 #: **时间驱动行为**的默认节奏（毫秒区间）与上限。
 #:
-#: 「时间驱动」指的是**没有外部事件**、靠时间自己发生的动作。只有两个：
+#: 「时间驱动」指的是**没有外部事件**、靠时间自己发生的动作。有三个：
 #:
 #: - `idle`：闲着的时候偶尔动一下（默认 6~18 秒一次）；
-#: - `roam`：闲着的时候自己在屏幕底部走一走（默认 3~9 秒一次）。
+#: - `roam`：闲着的时候自己在屏幕底部走一走（默认 3~9 秒一次）；
+#: - `sleep`：**多久没人理就睡着**（默认 120 秒）。
 #:
 #: 其余动作都是**事件驱动**的（`click` 要有人点、`fall` 要松手、
 #: `happy` 要有播报…），给它们设「多久触发一次」没有意义，
-#: 因此 `schedule` 里**只认这两个键**——多写的键会被明确拒绝，
+#: 因此 `schedule` 里**只认这三个键**——多写的键会被明确拒绝，
 #: 而不是静默忽略（作者会以为设了却没生效）。
-SCHEDULE_BEHAVIORS = ('idle', 'roam')
+#:
+#: `sleep` 与另外两个形状不同：它是一个**阈值**（「静了多久之后发生」），
+#: 不是「每隔一段随机时间发生一次」。因此它只有一个字段 `afterMs`，
+#: 没有 `intervalMs` / `mode` / `plays`（写了会报错，见 `BEHAVIOR_FIELDS`）。
+#: 用户要求把「睡觉」加进触发时间设置里（「多长时间不管就睡觉」）。
+SCHEDULE_BEHAVIORS = ('idle', 'roam', 'sleep')
 
 #: 每个时间驱动行为**支持哪些字段**。
 #:
@@ -543,6 +549,8 @@ SCHEDULE_BEHAVIORS = ('idle', 'roam')
 #:
 #: `roam` 没有 `plays` / `mode`：它的持续时长由物理决定（走到目标点就停），
 #: 不是「播几轮动画」。
+#:
+#: `sleep` 只有 `afterMs`：它是阈值而不是区间（见 `SCHEDULE_BEHAVIORS`）。
 #:
 #: 间隔有两种写法，**两种都收**：
 #: - `intervalMs: [最小, 最大]` —— 手写 `pet.json` 时最省事；
@@ -553,12 +561,14 @@ SCHEDULE_BEHAVIORS = ('idle', 'roam')
 BEHAVIOR_FIELDS = {
     'idle': ('mode', 'intervalMs', 'minIntervalMs', 'maxIntervalMs', 'plays'),
     'roam': ('intervalMs', 'minIntervalMs', 'maxIntervalMs'),
+    'sleep': ('afterMs',),
 }
 
 #: 行为的**人类可读名**（报错信息与面板共用一份，避免两边叫法不一致）。
 BEHAVIOR_LABELS = {
     'idle': '待机小动作',
     'roam': '自动漫游',
+    'sleep': '打盹',
 }
 
 #: 每个时间驱动行为的默认间隔区间（毫秒）。
@@ -566,9 +576,13 @@ BEHAVIOR_LABELS = {
 #: `roam` 的默认值就是历史行为（`3000 + random * 6000`）——
 #: 把它变成可配置项时**不改动默认观感**，否则用户会莫名其妙地觉得
 #: 「宠物怎么突然走得频繁了」。
+#:
+#: `sleep` 的默认值与 manifest 的 `sleep_after`（120 秒）一致：
+#: 那是宿主配置里的全局兜底，而按形象设置优先于它。
 DEFAULT_SCHEDULE_MS = {
     'idle': (6000, 18000),
     'roam': (3000, 9000),
+    'sleep': (120000, 120000),
 }
 
 #: 间隔的合法区间（毫秒）。下限 200ms 拦住「每帧都在动」，
@@ -577,6 +591,14 @@ MIN_SCHEDULE_MS = 200
 MAX_SCHEDULE_MS = 3600 * 1000
 #: 轮数上限（拦「填错了」的极端值）。
 MAX_IDLE_PLAYS = 20
+
+#: 打盹阈值（`sleep.afterMs`）的合法区间（毫秒）。
+#:
+#: 与 manifest 的 `sleep_after` 保持一致（10 秒 ~ 1 小时）：
+#: 同一个概念在两处设置里不该有不同的边界，否则「面板上能填、
+#: 宿主表单里填不了」会让人困惑。下限 10 秒是因为更短的话宠物
+#: 会一直在睡醒之间闪；上限 1 小时是拦「填错了位数」。
+SLEEP_AFTER_RANGE = (10 * 1000, 3600 * 1000)
 
 #: 单帧的默认逻辑尺寸。**只是默认值**——`size.w` 与 `size.h` 完全独立，
 #: 形象可以是任意长宽比（真人立绘常见 2:3、3:4），不必是正方形。
@@ -881,13 +903,15 @@ class AnimationVariant:
 
 @dataclass
 class Trigger:
-    """一个**时间驱动行为**的节奏配置（`idle` 的小动作、`roam` 的漫游）。
+    """一个**时间驱动行为**的节奏配置（`idle` 的小动作、`roam` 的漫游、
+    `sleep` 的打盹阈值）。
 
     为什么它不再是「idle 的触发方式」：用户要求「支持调整不同动作的触发时间」，
-    而真正**由时间驱动**的行为只有两个——闲着时偶尔动一下（`idle`）、
-    闲着时自己走一走（`roam`）。其余动作都是**事件驱动**的
-    （`click` 要有人点、`fall` 要松手、`happy` 要有播报…），
-    给它们设「多久触发一次」没有意义，因此解析器对它们明确报错而不是静默忽略。
+    而真正**由时间驱动**的行为只有三个——闲着时偶尔动一下（`idle`）、
+    闲着时自己走一走（`roam`）、多久没人理就睡着（`sleep`）。
+    其余动作都是**事件驱动**的（`click` 要有人点、`fall` 要松手、
+    `happy` 要有播报…），给它们设「多久触发一次」没有意义，
+    因此解析器对它们明确报错而不是静默忽略。
 
     `mode` 与 `plays` 只对 `idle` 有意义：
 
@@ -896,6 +920,11 @@ class Trigger:
 
     `roam` 的持续时长由物理决定（走到目标点就停），不是「播几轮」，
     所以它**没有** `mode` / `plays`（写了会报错，见 `BEHAVIOR_FIELDS`）。
+
+    `sleep` 形状又不一样：它是一个**阈值**（「静了多久之后睡着」），
+    不是「每隔一段随机时间发生一次」，因此只有一个 `after_ms`。
+    用 `min_ms` / `max_ms` 表达它会把「随机」这个语义强加上去——
+    而「多久不管就睡觉」显然不该是随机的。
     """
 
     mode: str = IDLE_TRIGGER_RANDOM
@@ -903,22 +932,39 @@ class Trigger:
     max_ms: int = DEFAULT_SCHEDULE_MS['idle'][1]
     #: 一次触发连续播几轮（只有 idle 用得上）。
     plays: int = DEFAULT_IDLE_PLAYS
-    #: 这个节奏属于哪个行为（`idle` / `roam`）。
+    #: 打盹阈值（毫秒）——只有 `sleep` 用得上。
+    #:
+    #: 「静了多久之后睡着」。`None` 表示**没设**——此时应当回落到宿主的
+    #: 全局 `sleep_after`，而**不是**回落成一个写死的默认值：
+    #: 宿主表单里那个全局值本来就是给「形象没声明」时用的，
+    #: 如果这里悄悄填上一个默认值，全局设置就永远不生效了
+    #: （用户会看到「我在宿主设置里改了却没反应」）。
+    after_ms: int = None
+    #: 这个节奏属于哪个行为（`idle` / `roam` / `sleep`）。
     #:
     #: 序列化时按它决定**写哪些字段**：`roam` 没有 `mode` / `plays`，
-    #: 而 `to_dict()` 的输出必须能被 `from_dict()` 原样读回来
-    #: （否则 round-trip 断裂，而「导出再导入」正是靠它）。
+    #: `sleep` 只有 `afterMs`，而 `to_dict()` 的输出必须能被
+    #: `from_dict()` 原样读回来（否则 round-trip 断裂，
+    #: 而「导出再导入」正是靠它）。
     behavior: str = 'idle'
 
     def to_dict(self) -> dict:
+        fields = BEHAVIOR_FIELDS.get(self.behavior, ())
+        # `sleep` 是阈值：只写 `afterMs`，不写区间（见类文档）。
+        #
+        # ⚠️ `afterMs` 为 `None` 时也**要写出来**（值是 null），不能省略这个键。
+        # 省略的话前端分不清「这个形象没设打盹阈值」与「后端没实现这个字段」，
+        # 而前者要回落到宿主全局、后者只能用一个写死的默认值。
+        if self.behavior == 'sleep':
+            return {'afterMs': self.after_ms}
         payload = {
             'minIntervalMs': self.min_ms,
             'maxIntervalMs': self.max_ms,
         }
         # 只写这个行为**支持**的字段（见 `BEHAVIOR_FIELDS`）。
-        if 'mode' in BEHAVIOR_FIELDS.get(self.behavior, ()):
+        if 'mode' in fields:
             payload['mode'] = self.mode
-        if 'plays' in BEHAVIOR_FIELDS.get(self.behavior, ()):
+        if 'plays' in fields:
             payload['plays'] = self.plays
         return payload
 
@@ -1778,6 +1824,19 @@ def _parse_trigger(raw_spec: dict, behavior: str, *, where: str) -> Trigger:
         mode=IDLE_TRIGGER_RANDOM, min_ms=low_default, max_ms=high_default,
         behavior=behavior,
     )
+
+    # `sleep` 是**阈值**，不是区间：它只有 `afterMs`，走单独一条路
+    # （见 `Trigger` 的类文档）。
+    if behavior == 'sleep':
+        if 'afterMs' not in raw_spec or raw_spec['afterMs'] is None:
+            # 没写就是「没设」——回落到宿主的全局 `sleep_after`。
+            return trigger
+        trigger.after_ms = _read_positive_int(
+            raw_spec, 'afterMs', low_default,
+            low=SLEEP_AFTER_RANGE[0], high=SLEEP_AFTER_RANGE[1],
+            where=f'{where}.afterMs',
+        )
+        return trigger
 
     if 'mode' in raw_spec:
         raw_mode = raw_spec.get('mode')

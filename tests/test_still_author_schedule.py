@@ -24,8 +24,10 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 from backend.core.pack import (  # noqa: E402
+    BEHAVIOR_FIELDS,
     DEFAULT_SCHEDULE_MS,
     SCHEDULE_BEHAVIORS,
+    SLEEP_AFTER_RANGE,
     STILL_ACTION,
 )
 from backend.core.errors import PetError  # noqa: E402
@@ -764,8 +766,17 @@ def test_builtin_author_is_read_only(tmp_path):
 
 
 def test_schedule_covers_only_time_driven_behaviors():
-    """可设置触发时间的行为只有两个（与 pack 的名单一致）。"""
-    assert list(SCHEDULE_BEHAVIORS) == ['idle', 'roam']
+    """可设置触发时间的行为只有三个（与 pack 的名单一致）。
+
+    `sleep` 是后加的：用户要求把「睡觉」也加进触发时间设置里
+    （「多长时间不管就睡觉」）。它的形状与另外两个**不同**——
+    是**阈值**而不是区间（见 `BEHAVIOR_FIELDS`）。
+    """
+    assert list(SCHEDULE_BEHAVIORS) == ['idle', 'roam', 'sleep']
+    # `sleep` 只有 `afterMs`：没有 intervalMs / mode / plays。
+    assert BEHAVIOR_FIELDS['sleep'] == ('afterMs',), (
+        'sleep 是阈值，不该有区间/模式/轮数字段'
+    )
 
 
 def test_effective_schedule_defaults_match_pack(tmp_path):
@@ -781,8 +792,94 @@ def test_effective_schedule_defaults_match_pack(tmp_path):
 
     schedule = store.effective_schedule('mine')
     for behavior, (low, high) in DEFAULT_SCHEDULE_MS.items():
+        if behavior == 'sleep':
+            # ★ 阈值型的**没设**就是 `None`（= 跟随宿主全局），
+            # 不能填一个写死的默认值：宿主表单里那个全局 `sleep_after`
+            # 正是给这种情况用的，填掉它会让全局设置永远不生效。
+            assert schedule[behavior]['afterMs'] is None, (
+                '没设打盹阈值时该是 None（跟随宿主全局），而不是一个默认值'
+            )
+            assert 'minIntervalMs' not in schedule[behavior], (
+                'sleep 不该带区间字段——那会让前端以为它是区间型'
+            )
+            continue
         assert schedule[behavior]['minIntervalMs'] == low, behavior
         assert schedule[behavior]['maxIntervalMs'] == high, behavior
+
+
+def test_sleep_threshold_override_and_round_trip(tmp_path):
+    """★ `sleep` 的覆盖能存能读，且**不**回落到区间形状。
+
+    用户要求「触发时间的选项中，睡觉是否也可以加进来，就是多长时间不管
+    就睡觉这种」。它是一个阈值，因此提交的是 `afterMs`。
+    """
+    builtin = tmp_path / 'resources' / 'pets'
+    data = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    data.mkdir(parents=True)
+    store = PetStore(str(data), str(builtin))
+    write_pack(store.user_pets_dir(), 'mine', payload={
+        'id': 'mine', 'animations': {'idle': 'idle.png'},
+    }, sheets={'idle.png': 1})
+
+    # ★ 没设时是 None（= 跟随宿主的全局 `sleep_after`，默认 120 秒）
+    assert store.effective_schedule('mine')['sleep']['afterMs'] is None
+
+    store.set_pet_schedule('mine', {'sleep': {'afterMs': 45000}})
+    assert store.effective_schedule('mine')['sleep']['afterMs'] == 45000
+
+    # 越界会被**夹住**而不是抛错（与其它节奏设置同一套取舍）
+    store.set_pet_schedule('mine', {'sleep': {'afterMs': 1}})
+    assert store.effective_schedule('mine')['sleep']['afterMs'] == SLEEP_AFTER_RANGE[0]
+    store.set_pet_schedule('mine', {'sleep': {'afterMs': 99_000_000}})
+    assert store.effective_schedule('mine')['sleep']['afterMs'] == SLEEP_AFTER_RANGE[1]
+
+    # 清掉覆盖 → 回到「没设」（跟随宿主全局）
+    store.set_pet_schedule('mine', {'sleep': None})
+    assert store.effective_schedule('mine')['sleep']['afterMs'] is None
+
+
+def test_sleep_accepts_after_ms_from_pet_json(tmp_path):
+    """`pet.json` 里也能写 `schedule.sleep.afterMs`（作者可以建议一个值）。"""
+    builtin = tmp_path / 'resources' / 'pets'
+    data = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    data.mkdir(parents=True)
+    store = PetStore(str(data), str(builtin))
+    write_pack(store.user_pets_dir(), 'mine', payload={
+        'id': 'mine',
+        'schedule': {'sleep': {'afterMs': 20000}},
+        'animations': {'idle': 'idle.png'},
+    }, sheets={'idle.png': 1})
+    assert store.effective_schedule('mine')['sleep']['afterMs'] == 20000
+
+
+def test_sleep_rejects_interval_fields(tmp_path):
+    """★ 给 `sleep` 写区间字段要**报错**（它是阈值，不是区间）。
+
+    静默忽略会让作者以为设好了——而「我明明设了 30 秒却没生效」
+    是最难查的一类问题。
+
+    ⚠️ `write_pack` 只是**写文件**，校验发生在 `load_pack`（读盘）时，
+    因此这里必须真的去读一次——只写不读的话这条测试永远不会失败。
+    """
+    for field in ('intervalMs', 'minIntervalMs', 'maxIntervalMs', 'plays', 'mode'):
+        root = tmp_path / f'bad-{field}'
+        write_pack(root, 'bad', payload={
+            'id': 'bad',
+            'schedule': {'sleep': {field: [1000, 2000] if field == 'intervalMs' else 1}},
+            'animations': {'idle': 'idle.png'},
+        }, sheets={'idle.png': 1})
+        store = PetStore(str(tmp_path / 'data'), str(root))
+        with pytest.raises(PetError) as info:
+            store.load_pack('bad')
+        # 字段名在 `msg` 里，而「只能设什么」在 `hint` 里——
+        # `str(PetError)` 只含 msg，因此这里要分别查（第一版只查 str，
+        # 于是「提示里没告诉作者该写什么」这件事测不出来）。
+        assert field in str(info.value), f'错误信息要点出是哪个字段: {info.value}'
+        assert 'afterMs' in (info.value.hint or ''), (
+            f'提示要告诉作者 sleep 只能设什么: {info.value.hint!r}'
+        )
 
 
 def test_schedule_user_override_beats_pack_declaration(tmp_path):

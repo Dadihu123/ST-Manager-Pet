@@ -41,9 +41,6 @@ import { createStateMachine, STATES } from './statemachine.js';
 /** 指针采样窗口（毫秒），用于估算甩出速度。 */
 const POINTER_SAMPLE_WINDOW = 120;
 
-/** 打盹判定轮询间隔（毫秒）——低频，不需要每帧查。 */
-const SLEEP_CHECK_INTERVAL = 1000;
-
 /**
  * 漫游目标两侧留出的余量（像素）。
  *
@@ -268,7 +265,7 @@ export function createPetView(options = {}) {
   let rafId = 0;
   let running = false;
   let lastFrameAt = 0;
-  let lastSleepCheck = 0;
+  /** 最近一次用户交互的时刻（`performance.now()`）。打盹阈值从这里起算。 */
   let lastInteractionAt = 0;
   // **程序化运动**（呼吸 / 眨眼）的状态。
   //
@@ -345,6 +342,25 @@ export function createPetView(options = {}) {
    * 另一条的排期清掉。
    */
   let roamWakeTimer = 0;
+  /**
+   * 打盹判定的定时器（「静了多久之后睡着」到点了）。
+   *
+   * ★ 与漫游同理，它**必须**是 `setTimeout`，不能只靠 rAF 里的低频轮询。
+   *
+   * 早先的实现只在 `updateStateFromPhysics()` 里查一次
+   * （`if (idleFor > sleepAfterMs()) machine.sleep()`），而那个函数只在
+   * rAF 循环运行时才跑；默认 idle 模式（`random`）下 rAF 在 idle 静止时
+   * **是停的**。于是「到点睡着」这件事实际上靠**别的原因把 rAF 唤醒**
+   * 才碰巧发生——通常是 idle 小动作（每 6~18 秒一次）。
+   *
+   * 后果：把 idle 间隔调大（例如 1 小时）而打盹阈值很小（10 秒）时，
+   * **宠物永远不睡**。实测：idle 间隔 1 小时 + 阈值 10 秒，22 秒后
+   * 状态仍是 `idle`。这与漫游那个 bug 是**同一类**——
+   * 「时间驱动的行为，唯一的驱动源却是 rAF」。
+   *
+   * 走定时器之后，「到点」不再依赖任何其它行为是否恰好发生。
+   */
+  let sleepWakeTimer = 0;
 
   // ---------------------------------------------------------------- 绘制
 
@@ -424,10 +440,16 @@ export function createPetView(options = {}) {
       // 漏掉任何一条的表现都是「走了一趟之后就再也不走了」。
       // 走完一趟回到 idle 也走这条路径，于是每趟重新抽间隔。
       scheduleRoamWake();
+      // 打盹判定同理：醒着回到 idle 时重新按当前阈值排一次。
+      // 睡醒之后也要排——否则它再也不会睡第二次。
+      scheduleSleepWake();
     } else {
       cancelIdleWake();
       // 离开 idle 就撤掉待执行的漫游：睡着 / 被拖走 / 正在走时都不该再排。
       cancelRoamWake();
+      // 睡着之后撤掉打盹判定：留着它会在睡眠期间反复触发。
+      // （`sleepTriggerEnabled()` 也挡得住，但撤掉更干净。）
+      cancelSleepWake();
     }
   }
 
@@ -988,8 +1010,12 @@ export function createPetView(options = {}) {
     // 从源头掐掉比逐个迁移去拒绝更稳：这些行为在物理上就要求「站在地上」。
     const airborne = !physics.grounded && !physics.dragging;
     if (airborne) {
-      // 已经排好的 idle 触发也要撤掉（它可能在起跳之前就排好了）
+      // 已经排好的触发都要撤掉（它们可能在起跳之前就排好了）。
+      // 漫游与打盹现在走各自的定时器，不撤的话到点了照样会串动作
+      // （`*TriggerEnabled()` 里也挡了一道，但撤掉更干净）。
       cancelIdleWake();
+      cancelRoamWake();
+      cancelSleepWake();
       wasAirborne = true;
       return;
     }
@@ -1006,6 +1032,7 @@ export function createPetView(options = {}) {
       // 漫游同理：空中撤掉的那次排期也要补回来，否则弹跳一次之后
       // 宠物就再也不自己走动了（与上面 idle 那个 bug 是同一条路径）。
       scheduleRoamWake();
+      scheduleSleepWake();
     }
 
     if (state === STATES.WALK) {
@@ -1040,18 +1067,98 @@ export function createPetView(options = {}) {
     // 于是漫游**从不触发**。现在排期走 `setTimeout`（`scheduleRoamWake`），
     // 由状态迁移驱动重排。
 
-    // 打盹判定（低频轮询，不必每帧算）
-    if (!reducedMotion && now - lastSleepCheck > SLEEP_CHECK_INTERVAL) {
-      lastSleepCheck = now;
-      const idleFor = now - lastInteractionAt;
-      if (idleFor > Math.max(10, Number(config.sleepAfter) || 120) * 1000
-        && (state === STATES.IDLE || state === STATES.WALK)) {
-        physics.stopWalking();
-        // `machine.sleep()` 会触发 `onStateEnter`，排期在那里被清掉——
-        // 睡着之后不该再有任何 idle 触发等着执行。
-        machine.sleep({ now });
-      }
+    // 打盹判定**不在这里**做。
+    //
+    // 早先这里有一段低频轮询（`if (idleFor > sleepAfterMs()) machine.sleep()`），
+    // 而这段代码只在 rAF 运行时才跑到，rAF 又在 idle 静止时停着——
+    // 于是「到点睡着」实际靠**别的原因把 rAF 唤醒**才碰巧发生
+    // （通常是 idle 小动作）。把 idle 间隔调大就会露出来：
+    // 实测 idle 间隔 1 小时 + 阈值 10 秒 → 22 秒后仍然没睡。
+    //
+    // 现在走 `scheduleSleepWake()` 的定时器（见 `sleepWakeTimer`），
+    // 「到点」不再依赖任何其它行为是否恰好发生。
+  }
+
+  /**
+   * 「静了多久之后睡着」的阈值（毫秒）。
+   *
+   * 优先级与其它时间参数一致：**按形象的设置 > 宿主全局配置 > 默认值**。
+   * 按形象的那一份来自后端的 `schedule.sleep.afterMs`（用户要求把
+   * 「睡觉」加进触发时间设置里——「多长时间不管就睡觉」）。
+   *
+   * 宿主全局的 `sleep_after` 是**秒**（manifest 里声明的单位），
+   * 而 `schedule` 里一律是**毫秒**——两处单位不同是历史原因
+   * （全局配置先有，而它按秒更易读）。这里显式换算，免得差 1000 倍。
+   */
+  function sleepAfterMs() {
+    const fromSchedule = Number(scheduler.get('sleep').afterMs);
+    if (Number.isFinite(fromSchedule) && fromSchedule > 0) return fromSchedule;
+    return Math.max(10, Number(config.sleepAfter) || 120) * 1000;
+  }
+
+  /**
+   * 现在能让它睡吗？
+   *
+   * 与 `roamTriggerEnabled()` 同源（闲着、没被占用），但**允许 WALK**：
+   * 走到一半到点了也该睡（与早先那条 rAF 轮询的判定保持一致，
+   * 它接受 IDLE 或 WALK）。
+   */
+  function sleepTriggerEnabled() {
+    return !reducedMotion
+      && !disposed
+      && !throttle.paused
+      && (machine.state === STATES.IDLE || machine.state === STATES.WALK)
+      && !idleBurst
+      && gesture.phase === 'done'
+      && !physics.dragging
+      && physics.grounded;
+  }
+
+  /** 清掉待执行的打盹判定（任何交互 / 状态变化都要调）。 */
+  function cancelSleepWake() {
+    if (sleepWakeTimer) {
+      clearTimeout(sleepWakeTimer);
+      sleepWakeTimer = 0;
     }
+  }
+
+  /**
+   * 排一次「到点就睡」的定时器。
+   *
+   * 每次都是按**当前**的 `lastInteractionAt` 重新算剩余时间，因此
+   * 任何交互（`noteInteraction()`）之后调它都会正确地重新计时。
+   */
+  function scheduleSleepWake() {
+    cancelSleepWake();
+    if (!sleepTriggerEnabled()) return;
+    const remaining = sleepAfterMs() - (performance.now() - lastInteractionAt);
+    sleepWakeTimer = setTimeout(() => {
+      sleepWakeTimer = 0;
+      // 到点时再确认一次：等待期间用户可能把它拖走了 / 让它做了别的动作
+      if (!sleepTriggerEnabled()) return;
+      // 期间有过交互（阈值被重置了）→ 重新计时，而不是照着旧的时间睡
+      if (performance.now() - lastInteractionAt < sleepAfterMs()) {
+        scheduleSleepWake();
+        return;
+      }
+      physics.stopWalking();
+      // `machine.sleep()` 会触发 `onStateEnter`，排期在那里被清掉——
+      // 睡着之后不该再有任何触发等着执行。
+      machine.sleep({ now: performance.now() });
+      wake();
+    }, Math.max(250, Math.round(remaining)));
+  }
+
+  /**
+   * 记一次「用户碰过它」并重新排打盹判定。
+   *
+   * 所有更新 `lastInteractionAt` 的地方都要走这里：漏掉任何一处，
+   * 那条路径上的交互就不会把打盹计时推后——表现为「刚点完它，
+   * 过一会儿它还是按原来的时间睡着了」。
+   */
+  function noteInteraction() {
+    lastInteractionAt = performance.now();
+    scheduleSleepWake();
   }
 
   // -------------------------------------------------------- idle 随机触发
@@ -1241,6 +1348,8 @@ export function createPetView(options = {}) {
     // 小动作期间 `roamTriggerEnabled()` 为假（`!idleBurst`），
     // 因此那段时间不会有漫游排期，这里不补的话就断了。
     scheduleRoamWake();
+    // 打盹判定同理：小动作期间 `sleepTriggerEnabled()` 也为假。
+    scheduleSleepWake();
     wake();
   }
 
@@ -1344,7 +1453,7 @@ export function createPetView(options = {}) {
     pointerId = event.pointerId;
     lastPointer = point;
     dragSamples = [{ x: point.x, y: point.y, t: now }];
-    lastInteractionAt = performance.now();
+    noteInteraction();
     // **不立刻进拖拽态**：先挂起，等「按住 0.5 秒」或「明显移动」再升级。
     // 这是「点击动画能单独触发」的关键（见 `gesture.js`）。
     gesture.begin(point.x, point.y, now);
@@ -1379,7 +1488,7 @@ export function createPetView(options = {}) {
     lastPointer = point;
     dragSamples.push({ x: point.x, y: point.y, t: now });
     if (dragSamples.length > 24) dragSamples.shift();
-    lastInteractionAt = performance.now();
+    noteInteraction();
 
     if (gesture.move(point.x, point.y, now)) beginDrag(point);
     if (gesture.dragging) {
@@ -1402,7 +1511,7 @@ export function createPetView(options = {}) {
     }
     pointerId = null;
     dragSamples = [];
-    lastInteractionAt = performance.now();
+    noteInteraction();
 
     const outcome = gesture.end(point.x, point.y, now);
     lastPointer = null;
@@ -1539,6 +1648,7 @@ export function createPetView(options = {}) {
       scheduleIdleWake();
       // 漫游同理：暂停期间 `roamTriggerEnabled()` 为假，排期也已被清掉
       scheduleRoamWake();
+      scheduleSleepWake();
     }
   }
 
@@ -1561,6 +1671,8 @@ export function createPetView(options = {}) {
         scheduleIdleWake();
         // 漫游同样要重排（播报期间状态不是 idle，排期已被清掉）
         scheduleRoamWake();
+        // 打盹判定同理
+        scheduleSleepWake();
       }
       wake();
     }, Math.max(300, duration));
@@ -1568,7 +1680,7 @@ export function createPetView(options = {}) {
 
   /** 收到核心事件 → 播报（限流由调用方负责）。 */
   function react(action) {
-    lastInteractionAt = performance.now();
+    noteInteraction();
     cancelIdleWake();
     if (machine.state === STATES.SLEEP) {
       // sleep 期间收到事件要唤醒（§4.3 硬要求）
@@ -1583,7 +1695,7 @@ export function createPetView(options = {}) {
 
   /** 任意用户输入都算「互动」，重置打盹计时。 */
   function touch() {
-    lastInteractionAt = performance.now();
+    noteInteraction();
     cancelIdleWake();
     if (machine.state === STATES.SLEEP) {
       machine.wake({ now: lastInteractionAt });
@@ -1594,7 +1706,7 @@ export function createPetView(options = {}) {
 
   // ---------------------------------------------------------------- 启动
 
-  lastInteractionAt = performance.now();
+  noteInteraction();
   machine.setNow(lastInteractionAt);
   applyFacing();
   // 时间驱动的节奏来自后端的 `schedule` 块（用户设置 > 包内声明 > 默认，
@@ -1613,6 +1725,9 @@ export function createPetView(options = {}) {
   // ——那个倒计时挂在 rAF 上，而 rAF 在 idle 静止时是停的（见 `roamWakeTimer`）。
   scheduleIdleWake();
   scheduleRoamWake();
+  // 打盹判定同样起手排一次：否则「宠物出现后一直没人碰它」这条最常见的
+  // 路径上它永远不会睡（早先的判定只挂在 rAF 上，见 `sleepWakeTimer`）。
+  scheduleSleepWake();
 
   /**
    * 触发一次随机 idle 小动作。
@@ -1686,11 +1801,15 @@ export function createPetView(options = {}) {
         showing: sprite.style.backgroundImage.includes(still.url),
       };
     },
-    /** 当前生效的**触发节奏**（idle 小动作 / 自动漫游）。 */
+    /** 当前生效的**触发节奏**（idle 小动作 / 自动漫游 / 打盹阈值）。 */
     get schedule() {
       return {
         idle: scheduler.get('idle'),
         roam: scheduler.get('roam'),
+        // 打盹是**阈值**（`afterMs`），形状与上面两个不同。
+        // 漏掉它的后果是排查时看不到「打盹阈值到底是多少」——
+        // 而这正是「它怎么不睡 / 怎么睡了」唯一的观测量。
+        sleep: scheduler.get('sleep'),
       };
     },
     /**
@@ -1731,6 +1850,8 @@ export function createPetView(options = {}) {
       // 而 rAF 在 idle 静止时是停的。
       if (machine.state === STATES.IDLE) {
         scheduleRoamWake();
+        // 打盹阈值也可能刚被改（面板上就是同一个接口），要按新值重排。
+        scheduleSleepWake();
       }
       return this;
     },
@@ -1790,6 +1911,8 @@ export function createPetView(options = {}) {
       // 而漫游照排），漏掉的话视图销毁后它还会触发一次 `scheduleWalk()`
       // ——去操作一个已经摘掉的节点。
       cancelRoamWake();
+      // 打盹定时器同理：它也会在视图销毁后触发 `machine.sleep()`。
+      cancelSleepWake();
       if (resizeRaf) window.cancelAnimationFrame(resizeRaf);
       window.removeEventListener('resize', onResize);
       root.removeEventListener('pointerdown', onPointerDown);

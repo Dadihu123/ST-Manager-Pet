@@ -270,6 +270,65 @@ def test_walk_state_has_a_stall_safety_net(petview):
     assert 'stopWalk' in body, '走不动时要真的退出 WALK 态'
 
 
+def test_sleep_is_not_driven_by_raf(petview):
+    """★★ 打盹判定**必须**走 `setTimeout`，不能只靠 rAF 里的低频轮询。
+
+    与漫游那个 bug 是**同一类**：「时间驱动的行为，唯一的驱动源却是 rAF」。
+
+    早先的实现只在 `updateStateFromPhysics()` 里查一次
+    （`if (idleFor > sleepAfterMs()) machine.sleep()`），而那段代码只在
+    rAF 循环运行时才跑、rAF 在 idle 静止时是停的。于是「到点睡着」实际靠
+    **别的原因把 rAF 唤醒**才碰巧发生——通常是 idle 小动作（每 6~18 秒）。
+
+    把 idle 间隔调大就会露出来。实测：idle 间隔 1 小时 + 打盹阈值 10 秒，
+    22 秒后状态仍然是 `idle`（**永远不睡**）。而这条路径很常见：
+    用户想让宠物安静就把 idle 调长，结果它连睡都不睡了。
+
+    注释要剥掉：解释这个 bug 的注释里必然会出现旧写法本身。
+    """
+    code = strip_js_comments(petview)
+    assert 'lastSleepCheck' not in code, (
+        '那个低频轮询变量必须去掉——它只在 rAF 跑的时候才被检查'
+    )
+    assert 'sleepWakeTimer' in code, '打盹要有自己的 setTimeout 定时器'
+    body = code[code.index('function scheduleSleepWake()'):]
+    body = body[:body.index('\n  }')]
+    assert 'setTimeout(' in body, '打盹的排期必须走 setTimeout'
+    # 与另外两个定时器**分开**：三条路子互不排斥，共用会互相清掉排期
+    assert 'idleWakeTimer' not in body and 'roamWakeTimer' not in body, (
+        '打盹不能用 idle / 漫游的定时器变量'
+    )
+    # 到点时要**再查一次**阈值：等待期间可能有过交互（计时该被推后）
+    assert 'lastInteractionAt' in body, (
+        '到点时要复核「距上次交互多久」，否则交互过的宠物还是会按旧时间睡'
+    )
+    assert 'cancelSleepWake' in code[code.index('dispose() {'):], (
+        '销毁时必须回收打盹定时器（它独立于 rAF，不回收会在视图销毁后触发）'
+    )
+
+
+def test_every_interaction_reschedules_sleep(petview):
+    """★ 每一处「用户碰过它」都要把打盹计时推后。
+
+    漏掉任何一条路径的表现都是「刚点完它，过一会儿它还是按原来的时间
+    睡着了」——看起来像没理会用户的交互。
+    """
+    code = strip_js_comments(petview)
+    body = code[code.index('function noteInteraction()'):]
+    body = body[:body.index('\n  }')]
+    assert 'lastInteractionAt = performance.now();' in body
+    assert 'scheduleSleepWake()' in body
+    # 除了 `noteInteraction()` **自己**那一次，别处不许直接赋值
+    #（直接赋值不会重排打盹判定，表现为「刚点完它却还是按旧时间睡」）。
+    assert code.count('lastInteractionAt = performance.now();') == 1, (
+        '只能有一处直接赋值（noteInteraction 内部），其余都要走 noteInteraction()'
+    )
+    # 确实有多条交互路径（拖拽、点击、react、touch…）
+    assert code.count('noteInteraction()') >= 5, (
+        '交互路径有好几条（按下 / 拖拽 / 点击 / 播报 / touch），都要接上'
+    )
+
+
 def test_petview_uses_the_scheduler_for_idle(petview):
     body = petview[petview.index('function scheduleIdleWake()'):]
     body = body[:body.index('\n  }')]
@@ -918,6 +977,11 @@ def test_petview_blocks_ground_behaviors_while_airborne(petview):
     根因：这些计时器都在 rAF 里按 dt 推进，而 `fall` 期间 rAF **正好在跑**
     （它是「必须继续跑」的状态）。于是坠落途中漫游到点就去 `startWalk()`、
     打盹到点就去 `sleep()`、idle 触发到点就直接改动作名。
+
+    ⚠️ 现在漫游与打盹都改走**各自的 `setTimeout`**（rAF 在 idle 静止时
+    是停的，挂在它上面的倒计时永远不前进）。因此护栏不能只留在 rAF 那段
+    代码里——**必须**同时写进各自的 `*TriggerEnabled()`，否则定时器到点时
+    宠物可能正在空中（坠落中），照样会串动作。
     """
     body = petview[petview.index('function updateStateFromPhysics'):]
     body = body[:body.index('\n  }')]
@@ -925,13 +989,18 @@ def test_petview_blocks_ground_behaviors_while_airborne(petview):
         '必须有明确的「空中」判定'
     )
     assert 'cancelIdleWake()' in body, '空中要撤掉已排好的 idle 触发'
-    # 护栏必须**早于**漫游 / 打盹的推进（否则拦不住）
-    assert body.index('if (airborne)') < body.index('walkTimer -= dt * 1000'), (
-        '空中护栏必须挡在漫游倒计时之前'
-    )
-    assert body.index('if (airborne)') < body.index('lastSleepCheck = now'), (
-        '空中护栏必须挡在打盹计时之前'
-    )
+    # 空中还要撤掉漫游与打盹的排期（它们现在走定时器，不撤就照样会到点）
+    assert 'cancelRoamWake()' in body, '空中要撤掉已排好的漫游'
+    assert 'cancelSleepWake()' in body, '空中要撤掉已排好的打盹判定'
+
+    # ★ 关键：三个触发门都必须要求「站在地上」——定时器到点时再查一次，
+    # 这才是真正的护栏（rAF 那段只是顺手撤排期）。
+    for name in ('idleTriggerEnabled', 'roamTriggerEnabled', 'sleepTriggerEnabled'):
+        guard = petview[petview.index(f'function {name}()'):]
+        guard = guard[:guard.index('\n  }')]
+        assert 'physics.grounded' in guard, (
+            f'{name}() 必须要求站在地上，否则坠落途中定时器到点会串动作'
+        )
 
 
 def test_petview_idle_trigger_requires_being_grounded(petview):

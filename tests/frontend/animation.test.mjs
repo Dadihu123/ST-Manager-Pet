@@ -429,11 +429,35 @@ test('节奏调度：mode 只认 loop，其余一律 random', () => {
   assert.equal(scheduler.get('idle').mode, 'random', '非法值必须回落到 random');
 });
 
-test('节奏调度：可设置的行为名单与后端一致（只有 idle / roam）', () => {
+test('节奏调度：可设置的行为名单与后端一致（idle / roam / sleep）', () => {
   // 事件驱动的动作（click / fall / happy…）没有「多久触发一次」可言，
   // 因此名单里**不能**出现它们——前端多认一个就会让面板渲染出一个
   // 后端会拒绝的滑块。
-  assert.deepEqual([...SCHEDULE_BEHAVIORS].sort(), ['idle', 'roam']);
+  //
+  // `sleep` 是后加的（用户要求「多长时间不管就睡觉」），它是**阈值**
+  // 而不是区间——形状不同，见下面的测试。
+  assert.deepEqual([...SCHEDULE_BEHAVIORS].sort(), ['idle', 'roam', 'sleep']);
+});
+
+test('节奏调度：sleep 是阈值（afterMs），不套用区间的随机语义', () => {
+  const scheduler = createIdleScheduler();
+  // 没设时是 null：表示「跟随宿主的全局 sleep_after」，
+  // **不能**填一个默认值——那会让全局设置永远不生效。
+  scheduler.setSchedule({});
+  assert.equal(scheduler.get('sleep').afterMs, null, '没设时必须是 null');
+
+  scheduler.setSchedule({ sleep: { afterMs: 45000 } });
+  assert.equal(scheduler.get('sleep').afterMs, 45000);
+
+  // 区间型的字段对 sleep 没有意义：给了也不该被当成区间读
+  scheduler.setSchedule({ sleep: { minIntervalMs: 1000, maxIntervalMs: 2000 } });
+  assert.equal(scheduler.get('sleep').afterMs, null, 'sleep 不认区间字段');
+
+  // 非法值回落到 null（而不是 0 或 NaN——那会让阈值判定失效）
+  scheduler.setSchedule({ sleep: { afterMs: 'abc' } });
+  assert.equal(scheduler.get('sleep').afterMs, null);
+  scheduler.setSchedule({ sleep: { afterMs: -5 } });
+  assert.equal(scheduler.get('sleep').afterMs, null);
 });
 
 test('节奏调度：旧名 createIdleScheduler 仍可用（别名，避免验收脚本失效）', () => {

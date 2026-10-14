@@ -26,13 +26,24 @@ export const MAX_WEIGHT = 1000;
 export const DEFAULT_WEIGHT = 1;
 
 /** 可设置触发时间的**行为**（与后端 `SCHEDULE_BEHAVIORS` 必须一致）。 */
-export const SCHEDULE_BEHAVIORS = ['idle', 'roam'];
+export const SCHEDULE_BEHAVIORS = ['idle', 'roam', 'sleep'];
 
-/** 各行为的默认间隔（毫秒），与后端 `DEFAULT_SCHEDULE_MS` 一致。 */
+/** 各行为的默认间隔（毫秒），与后端 `DEFAULT_SCHEDULE_MS` 一致。
+ *
+ * `sleep` 是**阈值**（静了多久之后睡着）而不是区间，因此 min 与 max 相同
+ * ——它只用到 `min`。 */
 export const DEFAULT_SCHEDULE_MS = {
   idle: { min: 6000, max: 18000 },
   roam: { min: 3000, max: 9000 },
+  sleep: { min: 120000, max: 120000 },
 };
+
+/** 打盹阈值的合法区间（毫秒），与后端 `SLEEP_AFTER_RANGE` 一致。
+ *
+ * 与 manifest 的 `sleep_after`（10 秒 ~ 1 小时）保持一致：
+ * 同一个概念在两处设置里不该有不同的边界。 */
+export const SLEEP_AFTER_MIN_MS = 10 * 1000;
+export const SLEEP_AFTER_MAX_MS = 3600 * 1000;
 
 /** 默认的连续播几轮（与后端 `DEFAULT_IDLE_PLAYS` 一致）。 */
 export const DEFAULT_IDLE_PLAYS = 1;
@@ -480,6 +491,26 @@ export function createBehaviorScheduler(options = {}) {
   function normalize(name, raw) {
     const base = defaultsFor(name);
     const source = raw || {};
+    // `sleep` 是**阈值**（静了多久之后睡着），不是区间：它只有一个值。
+    // 走单独一条路，免得把「随机」这个语义强加上去——
+    // 「多久不管就睡觉」显然不该是随机的。
+    //
+    // ⚠️ `afterMs` 为 `null` / 缺失时要**保留 null**，不能填一个默认值。
+    // 那表示「这个形象没设打盹阈值」，此时应当回落到**宿主的全局
+    // `sleep_after`**——而宿主表单里那个值正是给这种情况用的。
+    // 在这里填 120 秒的话，全局设置就永远不生效了
+    //（用户会看到「我在宿主设置里改了却没反应」）。
+    if (name === 'sleep') {
+      const after = Number(source.afterMs);
+      const value = Number.isFinite(after) && after > 0 ? after : null;
+      return {
+        minMs: value === null ? base.minMs : value,
+        maxMs: value === null ? base.maxMs : value,
+        plays: 1,
+        mode: 'random',
+        afterMs: value,
+      };
+    }
     const nextMin = Number(source.minIntervalMs);
     const nextMax = Number(source.maxIntervalMs);
     let minMs = Number.isFinite(nextMin) && nextMin > 0 ? nextMin : base.minMs;

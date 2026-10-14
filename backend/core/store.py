@@ -83,7 +83,9 @@ from .pack import (
     MAX_SCHEDULE_MS,
     MIN_SCHEDULE_MS,
     ONE_SHOT_ACTIONS,
+    BEHAVIOR_FIELDS,
     SCHEDULE_BEHAVIORS,
+    SLEEP_AFTER_RANGE,
     STILL_ACTION,
     DEFAULT_PIXELATED,
     PetPack,
@@ -238,6 +240,20 @@ def clamp_schedule_ms(value) -> int:
     except (TypeError, ValueError):
         return MIN_SCHEDULE_MS
     return int(min(max(number, MIN_SCHEDULE_MS), MAX_SCHEDULE_MS))
+
+
+def clamp_sleep_after_ms(value) -> int:
+    """把打盹阈值（毫秒）夹到合法区间内。
+
+    与 `clamp_schedule_ms` 分开是因为区间**不同**：打盹阈值的下限是 10 秒
+    （更短的话宠物会在睡醒之间闪），而通用间隔的下限是 200ms。
+    与 manifest 的 `sleep_after`（10 秒 ~ 1 小时）保持一致。
+    """
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return SLEEP_AFTER_RANGE[0]
+    return int(min(max(number, SLEEP_AFTER_RANGE[0]), SLEEP_AFTER_RANGE[1]))
 
 
 #: 运行期条目里的**内部**字段：主变体解析到的真实文件路径。
@@ -502,14 +518,29 @@ class PetStore:
                 if name not in SCHEDULE_BEHAVIORS or not isinstance(spec, dict):
                     continue
                 entry = {}
-                for field_name in ('minIntervalMs', 'maxIntervalMs'):
-                    raw_number = spec.get(field_name)
-                    if isinstance(raw_number, bool) or not isinstance(raw_number, (int, float)):
-                        continue
-                    entry[field_name] = clamp_schedule_ms(raw_number)
-                plays = spec.get('plays')
-                if isinstance(plays, int) and not isinstance(plays, bool) and plays >= 1:
-                    entry['plays'] = min(plays, MAX_IDLE_PLAYS)
+                # ★ 按**行为支持的字段**逐个清洗，不能写死
+                # `('minIntervalMs', 'maxIntervalMs')`：
+                # `sleep` 只有 `afterMs`，写死的话它会被整条丢掉——
+                # 而表现是「设置保存了但读不回来」（最难查的一类）。
+                for field_name in BEHAVIOR_FIELDS.get(name, ()):
+                    raw_value = spec.get(field_name)
+                    if field_name == 'afterMs':
+                        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                            continue
+                        entry['afterMs'] = clamp_sleep_after_ms(raw_value)
+                    elif field_name in ('minIntervalMs', 'maxIntervalMs'):
+                        if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                            continue
+                        entry[field_name] = clamp_schedule_ms(raw_value)
+                    elif field_name == 'plays':
+                        if (isinstance(raw_value, int) and not isinstance(raw_value, bool)
+                                and raw_value >= 1):
+                            entry['plays'] = min(raw_value, MAX_IDLE_PLAYS)
+                    elif field_name == 'mode':
+                        if isinstance(raw_value, str) and raw_value.strip().lower() in (
+                            'random', 'loop',
+                        ):
+                            entry['mode'] = raw_value.strip().lower()
                 # 区间写反了就调正（与包解析同一套宽容策略）
                 if (entry.get('minIntervalMs') is not None
                         and entry.get('maxIntervalMs') is not None
@@ -663,17 +694,23 @@ class PetStore:
         for behavior in SCHEDULE_BEHAVIORS:
             base = pack.schedule_for(behavior) if pack is not None else None
             if base is None:
-                base = Trigger()
+                base = Trigger(behavior=behavior)
             payload = base.to_dict()
             override = stored.get(behavior) or {}
-            for field_name in ('minIntervalMs', 'maxIntervalMs', 'plays'):
+            # 只合并这个行为**支持**的字段（见 `pack.BEHAVIOR_FIELDS`）。
+            # 不能一律合并 min/max/plays：`sleep` 是阈值（只有 `afterMs`），
+            # 合并一个它没有的字段会在下面调正区间时 `KeyError`
+            # （而那不是「配置错了」，是我们自己的形状假设错了）。
+            for field_name in BEHAVIOR_FIELDS.get(behavior, ()):
                 if field_name in override:
                     payload[field_name] = override[field_name]
-            # 调正写反的区间：用户可能把「最小」拖到比「最大」还大
-            if payload['maxIntervalMs'] < payload['minIntervalMs']:
-                payload['minIntervalMs'], payload['maxIntervalMs'] = (
-                    payload['maxIntervalMs'], payload['minIntervalMs'],
-                )
+            # 调正写反的区间：用户可能把「最小」拖到比「最大」还大。
+            # 只有真的有这两个字段的行为才谈得上「写反」。
+            if 'maxIntervalMs' in payload and 'minIntervalMs' in payload:
+                if payload['maxIntervalMs'] < payload['minIntervalMs']:
+                    payload['minIntervalMs'], payload['maxIntervalMs'] = (
+                        payload['maxIntervalMs'], payload['minIntervalMs'],
+                    )
             result[behavior] = payload
         return result
 
@@ -698,9 +735,10 @@ class PetStore:
                         CODE_WRITE_FAILED,
                         f'不是可设置触发时间的行为: {name}',
                         user_msg=f'「{name}」不能设触发时间。',
-                        hint='只有「待机小动作」（idle）与「自动漫游」（roam）'
-                             '能设触发时间——它们由时间驱动。点击、下落、播报'
-                             '这类动作由事件触发，没有「多久一次」可言。',
+                        hint='只有「待机小动作」（idle）、「自动漫游」（roam）'
+                             '与「打盹」（sleep）能设触发时间——它们由时间驱动。'
+                             '点击、下落、播报这类动作由事件触发，'
+                             '没有「多久一次」可言。',
                     )
                 if spec is None or spec == '':
                     per_pet.pop(name, None)
@@ -711,15 +749,26 @@ class PetStore:
                         user_msg='设置格式不对。',
                     )
                 entry = dict(per_pet.get(name) or {})
-                for field_name in ('minIntervalMs', 'maxIntervalMs'):
-                    if field_name in spec and spec[field_name] not in (None, ''):
+                # 只处理这个行为**支持**的字段（见 `pack.BEHAVIOR_FIELDS`）。
+                # `sleep` 只有 `afterMs`（阈值），没有区间也没有 plays。
+                for field_name in BEHAVIOR_FIELDS.get(name, ()):
+                    if field_name not in spec or spec[field_name] in (None, ''):
+                        continue
+                    if field_name == 'afterMs':
+                        entry['afterMs'] = clamp_sleep_after_ms(spec[field_name])
+                    elif field_name in ('minIntervalMs', 'maxIntervalMs'):
                         entry[field_name] = clamp_schedule_ms(spec[field_name])
-                if 'plays' in spec and spec['plays'] not in (None, ''):
-                    try:
-                        plays = int(spec['plays'])
-                    except (TypeError, ValueError):
-                        plays = 1
-                    entry['plays'] = int(min(max(plays, 1), MAX_IDLE_PLAYS))
+                    elif field_name == 'plays':
+                        try:
+                            plays = int(spec['plays'])
+                        except (TypeError, ValueError):
+                            plays = 1
+                        entry['plays'] = int(min(max(plays, 1), MAX_IDLE_PLAYS))
+                    elif field_name == 'mode':
+                        entry['mode'] = (
+                            'loop' if str(spec[field_name]).strip().lower() == 'loop'
+                            else 'random'
+                        )
                 if (entry.get('minIntervalMs') is not None
                         and entry.get('maxIntervalMs') is not None
                         and entry['maxIntervalMs'] < entry['minIntervalMs']):

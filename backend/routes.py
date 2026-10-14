@@ -180,6 +180,29 @@ def _host_default_scale(api) -> float:
     return clamp_scale(value)
 
 
+def _host_sleep_after(api):
+    """读宿主 `config_schema` 里的全局 `sleep_after`（**秒**）。
+
+    它是「多久没交互就睡觉」的全局兜底：`schedule.sleep.afterMs` 为 `null`
+    时生效的就是它。面板要把它显示出来（而不是拿一个写死的默认值顶上——
+    那会让用户看到「我在宿主设置里改了却没反应」）。
+
+    读不到时返回 `None`，由前端用自己的默认值（120 秒）。
+    """
+    try:
+        config = api.get_config() or {}
+    except Exception:  # noqa: BLE001 - 配置读取失败不该阻断形象列表
+        logger.warning('读取宿主配置失败，打盹阈值回落到默认值', exc_info=True)
+        return None
+    value = config.get('sleep_after')
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def register_routes(api, store: PetStore) -> None:
     """注册全部路由。"""
 
@@ -854,5 +877,13 @@ def register_routes(api, store: PetStore) -> None:
             'schedule': pack.get('schedule'),
             'declaredSchedule': pack.get('declaredSchedule'),
             'scheduleOverridden': pack.get('scheduleOverridden', False),
+            # 宿主全局的「多久没交互就睡觉」（**秒**，来自 manifest 的
+            # `sleep_after`）。
+            #
+            # 为什么要下发：`schedule.sleep.afterMs` 为 `null` 时表示
+            # 「这个形象没设打盹阈值」，此时生效的是**宿主全局**那个值。
+            # 面板要把那个值显示出来（而不是拿一个写死的默认值顶上——
+            # 那会让用户看到「我在宿主设置里改了却没反应」）。
+            'hostSleepAfter': _host_sleep_after(api),
             'actions': summary,
         })
