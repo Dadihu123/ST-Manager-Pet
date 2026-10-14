@@ -44,6 +44,22 @@ const POINTER_SAMPLE_WINDOW = 120;
 /** 打盹判定轮询间隔（毫秒）——低频，不需要每帧查。 */
 const SLEEP_CHECK_INTERVAL = 1000;
 
+/**
+ * 漫游目标两侧留出的余量（像素）。
+ *
+ * 目标压在墙上时宠物会走到夹取边界就停住，而 `|x - walkTargetX| < 6`
+ * 这个退出条件可能因浮点误差永远差一点点。
+ */
+const WALK_TARGET_MARGIN = 8;
+
+/**
+ * 判定「走不动了」的水平速度阈值（像素/秒）。
+ *
+ * 正常走路时 `vx` 是 `physics.walkSpeed`（默认 60），
+ * 只有被侧壁拦住时物理层才会把它清零，因此这个阈值取得很小。
+ */
+const WALK_STALL_SPEED = 0.5;
+
 /** 大小倍率的合法区间（与 `backend/core/pack.py:SCALE_RANGE` 必须一致）。 */
 const SCALE_MIN = 0.25;
 const SCALE_MAX = 4;
@@ -198,8 +214,12 @@ export function createPetView(options = {}) {
   /**
    * **时间驱动行为**的随机间隔调度器（见 `animation.js`）。
    *
-   * 管两件事：idle 的小动作（`idleWakeTimer`）与自动漫游（`walkTimer`）。
+   * 管两件事：idle 的小动作（`idleWakeTimer`）与自动漫游（`roamWakeTimer`）。
    * 两者都是「平时不发生，隔一段随机时间发生一次」，只是触发后做的事不同。
+   *
+   * ⚠️ 两者都走 `setTimeout`，**不能**在 rAF 里倒数——rAF 在 idle 静止时
+   * 是停的（省电契约），挂在它上面的倒计时永远不前进。漫游早先就栽在这里，
+   * 详见 `roamWakeTimer` 的注释。
    *
    * 只在**真的处于 idle 且无其它占用**时推进，因此不会影响 sleep：
    * 睡着之后状态不是 idle，`enabled` 为假，排期被清掉；
@@ -277,7 +297,16 @@ export function createPetView(options = {}) {
   let pointerId = null;
   /** 最近一次指针位置（长按升级成拖拽时要用它作为拖拽起点）。 */
   let lastPointer = null;
-  let walkTimer = 0;
+  /**
+   * 距离下一次漫游的**剩余毫秒**——**仅用于诊断/测试**，不参与调度。
+   *
+   * 调度本身走 `roamWakeTimer`（`setTimeout`）。留这个字段是因为
+   * 「下一次还有多久」是排查这类问题时唯一有用的观测量，而
+   * `setTimeout` 的句柄读不出来。它由 `scheduleRoamWake()` 写入、
+   * 由 `roamCountdown()` 按当前时间折算。
+   */
+  let roamDeadline = 0;
+  let roamIntervalMs = 0;
   let walkTargetX = 0;
   /** 累积的「这段时间该走多少像素」——按帧率无关的方式推进漫游。 */
   let frameAccumulator = 0;
@@ -292,6 +321,30 @@ export function createPetView(options = {}) {
    * 表现是 idle 动画播一遍之后再也不会触发。
    */
   let idleWakeTimer = 0;
+  /**
+   * 自动漫游的定时器（下一次什么时候自己走一趟）。
+   *
+   * ★ 它**必须**是 `setTimeout`，不能像早先那样在 rAF 里倒数。
+   *
+   * 早先的实现是在 `updateStateFromPhysics()` 里 `walkTimer -= dt * 1000`，
+   * 而那个函数只在 rAF 循环运行时才跑；默认 idle 模式（`random`）下
+   * `shouldKeepRunning()` 在「idle + 物理静止」时返回 false，**rAF 真的停掉**
+   * （这是省电契约，见 README §4.5）。
+   *
+   * 两者合起来的后果是：**漫游倒计时永远不前进，自动漫游从不触发**。
+   * 实测（把漫游间隔设成 200~300ms，12 秒每 100ms 采样一次）：
+   * 状态全程停在 `idle`、水平位移 0.0px、一次都没走动。
+   *
+   * 为什么这个 bug 能藏那么久：idle 的小动作走 `setTimeout`
+   * （`scheduleIdleWake`），所以它一切正常——「闲置的看起来正常」正好
+   * 把同一条路径上的漫游问题掩盖了。用户报的「漫游调到 200-300ms
+   * 结果半天触发不了」就是它。
+   *
+   * 与 `idleWakeTimer` 分开是必须的：两者是**两条独立的路子**
+   * （`autoRoam` 与 idle 触发互不排斥），共用一个的话其中一条会把
+   * 另一条的排期清掉。
+   */
+  let roamWakeTimer = 0;
 
   // ---------------------------------------------------------------- 绘制
 
@@ -366,8 +419,15 @@ export function createPetView(options = {}) {
       // 刚回到 idle：等一段新的随机时间再自己动一下。
       // `idleBurst` 正在播时不重排——那会在播的过程中插一个定时器进来。
       if (!idleBurst) scheduleIdleWake();
+      // 漫游同理：**必须**在这里重排，不能只在初始化时排一次。
+      // 状态迁移有十几条路径（落地、播报完、漫游停下、拖拽结束、睡醒…），
+      // 漏掉任何一条的表现都是「走了一趟之后就再也不走了」。
+      // 走完一趟回到 idle 也走这条路径，于是每趟重新抽间隔。
+      scheduleRoamWake();
     } else {
       cancelIdleWake();
+      // 离开 idle 就撤掉待执行的漫游：睡着 / 被拖走 / 正在走时都不该再排。
+      cancelRoamWake();
     }
   }
 
@@ -943,20 +1003,42 @@ export function createPetView(options = {}) {
     if (wasAirborne) {
       wasAirborne = false;
       if (machine.state === STATES.IDLE && !idleBurst) scheduleIdleWake();
+      // 漫游同理：空中撤掉的那次排期也要补回来，否则弹跳一次之后
+      // 宠物就再也不自己走动了（与上面 idle 那个 bug 是同一条路径）。
+      scheduleRoamWake();
     }
 
     if (state === STATES.WALK) {
       if (Math.abs(physics.x - walkTargetX) < 6) {
         physics.stopWalking();
         machine.stopWalk({ now });
+      } else if (Math.abs(physics.vx) < WALK_STALL_SPEED) {
+        // ★ 安全网：**走不动了就结束这一趟**。
+        //
+        // 正常路径是「走到目标附近就停」，但宠物可能**永远走不到**：
+        // 撞上侧壁时物理层把水平速度清零（`physics.js`），而目标若在
+        // 夹取范围之外就再也够不着。`pickWalkTarget()` 已经按半宽收窄了
+        // 目标（那是根因的修复），这里是**兜底**——屏幕尺寸变化、
+        // 用户中途改大小、浮点边界等等都可能让宠物再次停住。
+        //
+        // 卡在 WALK 的代价很大，不只是「看起来不动了」：
+        //   - `shouldKeepRunning()` 对 WALK 恒返回 true → rAF 永远跑着，
+        //     省电契约被破坏（这是最要紧的一条）；
+        //   - `roamTriggerEnabled()` 要求 `state === IDLE` → 漫游再也不触发。
+        //
+        // 速度阈值取得很小：正常走路时 `vx` 是 walkSpeed（默认 60px/s），
+        // 只有真的被墙拦住才会掉到接近 0。
+        physics.stopWalking();
+        machine.stopWalk({ now });
       }
     }
 
-    // 漫游调度
-    if (state === STATES.IDLE && config.autoRoam && !reducedMotion && !idleBurst) {
-      walkTimer -= dt * 1000;
-      if (walkTimer <= 0) scheduleWalk();
-    }
+    // 漫游调度：**不在这里倒数**（见 `roamWakeTimer` 的注释）。
+    //
+    // 早先这里写的是 `walkTimer -= dt * 1000; if (walkTimer <= 0) scheduleWalk();`，
+    // 而这段代码只在 rAF 运行时才跑到，rAF 又在 idle 静止时停着——
+    // 于是漫游**从不触发**。现在排期走 `setTimeout`（`scheduleRoamWake`），
+    // 由状态迁移驱动重排。
 
     // 打盹判定（低频轮询，不必每帧算）
     if (!reducedMotion && now - lastSleepCheck > SLEEP_CHECK_INTERVAL) {
@@ -1035,6 +1117,80 @@ export function createPetView(options = {}) {
     }, Math.max(250, Math.round(seconds * 1000)));
   }
 
+  /**
+   * 现在能安排一次自动漫游吗？
+   *
+   * 条件与 `idleTriggerEnabled()` 同源（都是「闲着、站在地上、没被占用」），
+   * 但多一条 `config.autoRoam`——漫游是**用户可选**的，idle 小动作不是。
+   *
+   * 两条互不排斥：idle 触发正在播时**不**排漫游（`!idleBurst`），
+   * 否则会出现「小动作播到一半突然开始走路」。
+   */
+  function roamTriggerEnabled() {
+    return config.autoRoam
+      && !reducedMotion
+      && !disposed
+      && !throttle.paused
+      && machine.state === STATES.IDLE
+      && !idleBurst
+      && gesture.phase === 'done'
+      && !physics.dragging
+      && physics.grounded;
+  }
+
+  /** 清掉待执行的漫游（任何交互 / 状态变化都要调）。 */
+  function cancelRoamWake() {
+    if (roamWakeTimer) {
+      clearTimeout(roamWakeTimer);
+      roamWakeTimer = 0;
+    }
+    roamDeadline = 0;
+  }
+
+  /**
+   * 排下一次自动漫游。
+   *
+   * ★ 走 `setTimeout` 而**不是**在 rAF 里倒数——理由见 `roamWakeTimer` 的注释：
+   * rAF 在 idle 静止时是停的，挂在它上面的倒计时永远不前进。
+   *
+   * 每次重新抽一个随机间隔（与 idle 同理）：固定周期看起来像节拍器，
+   * 而「它自己想走一趟」才像活着。
+   */
+  function scheduleRoamWake() {
+    cancelRoamWake();
+    if (!roamTriggerEnabled()) return;
+    const seconds = scheduler.reschedule('roam');
+    roamIntervalMs = Math.max(250, Math.round(seconds * 1000));
+    roamDeadline = Date.now() + roamIntervalMs;
+    roamWakeTimer = setTimeout(() => {
+      roamWakeTimer = 0;
+      roamDeadline = 0;
+      // 到点时再确认一次：等待期间用户可能已经把它拖走了 / 让它睡了 /
+      // 关掉了自动漫游
+      if (roamTriggerEnabled()) {
+        scheduleWalk();
+        return;
+      }
+      // 没触发时**分两种情况**——这个区分很重要：
+      //
+      // - 还在 idle：说明只是被**瞬时**原因挡住（手势没结束、小动作正在播）。
+      //   这种阻塞没有状态迁移，因此没有人会来重排——不补的话这一趟就
+      //   永远丢了（早先 idle 那条路径踩过同样的坑，见 `wasAirborne`）。
+      // - 已经不在 idle（睡着 / 被拖走 / 正在走）：**不排**。
+      //   那些路径回到 idle 时都会走 `onStateEnter`，由它重排；
+      //   在这里也排一份会让「睡着时还挂着一个定时器」白耗。
+      if (machine.state === STATES.IDLE && config.autoRoam
+          && !reducedMotion && !throttle.paused && !disposed) {
+        scheduleRoamWake();
+      }
+    }, roamIntervalMs);
+  }
+
+  /** 距离下一次漫游还有多少毫秒（诊断/测试用；没排期时返回 `null`）。 */
+  function roamCountdown() {
+    return roamDeadline ? Math.max(0, roamDeadline - Date.now()) : null;
+  }
+
   /** 播一次 idle 小动作（随机抽一套变体）。 */
   function startIdleBurst() {
     const spec = actionSpec('idle');
@@ -1081,6 +1237,10 @@ export function createPetView(options = {}) {
     clock.setSpec({ frames: 1, fps: 1, loop: true });
     drawStill();
     scheduleIdleWake();
+    // 一次 idle 小动作播完 → 回到「平时」。漫游的排期也要跟着重新开始：
+    // 小动作期间 `roamTriggerEnabled()` 为假（`!idleBurst`），
+    // 因此那段时间不会有漫游排期，这里不补的话就断了。
+    scheduleRoamWake();
     wake();
   }
 
@@ -1111,9 +1271,11 @@ export function createPetView(options = {}) {
     // 间隔从**后端下发的节奏**里抽（默认 3~9 秒），不再是写死的
     // `3000 + random * 6000`——用户要求「支持调整触发时间」，
     // 而漫游正是除 idle 之外唯一由时间驱动的行为。
-    walkTimer = scheduler.reschedule('roam') * 1000;
+    //
+    // 注意这里**只**负责「走这一趟」；下一趟的排期在 `stopWalk` 回到 idle
+    // 时由 `onStateEnter` → `scheduleRoamWake()` 安排（那时才重新抽间隔）。
     const world = physics.bounds;
-    walkTargetX = 40 + Math.random() * Math.max(1, world.width - 80);
+    walkTargetX = pickWalkTarget(world.width);
     const direction = walkTargetX > physics.x ? 1 : -1;
     // 先写方向，再进 WALK 态：`startWalk` 会触发 `applyActionForState`，
     // 那里要按方向选 `walk-left` / `walk-right`，顺序反了会播错一侧。
@@ -1122,6 +1284,50 @@ export function createPetView(options = {}) {
     physics.walk(direction);
     machine.startWalk({ now: performance.now() });
     wake();
+  }
+
+  /**
+   * 抽一个**够得着**的漫游目标 x。
+   *
+   * ★ 必须按宠物的**半宽**收窄，不能直接用世界宽度。
+   *
+   * 早先的写法是 `40 + random * (width - 80)`，它假定宠物很窄。
+   * 而物理层把 x 夹在 `[半宽, 世界宽 - 半宽]` 里（撞到侧壁时把水平速度清零），
+   * 于是**目标落在夹取范围之外时宠物永远走不到**：
+   *
+   *   - 状态机退出 WALK 的条件是 `|x - walkTargetX| < 6`，走不到就永不退出；
+   *   - `shouldKeepRunning()` 对 WALK 恒返回 true → **rAF 永远跑着**
+   *     （省电契约被破坏）；
+   *   - `roamTriggerEnabled()` 要求 `state === IDLE` → **漫游再也不触发**。
+   *
+   * 实测够不着的比例（世界宽 900，目标区间 [40, 860]）：
+   *
+   *   | 宠物宽度 | 半宽 | 够不着的目标 |
+   *   |---|---|---|
+   *   | 64px（像素猫） | 32 | 0% |
+   *   | 173px（内置形象 0.45 倍） | 86.5 | **11.3%** |
+   *   | 384px（1 倍） | 192 | **37.1%** |
+   *   | 768px（2 倍） | 384 | **83.9%** |
+   *
+   * 也就是说**宠物越大越容易卡死**——而「放大宠物」正是用户最常调的一项。
+   *
+   * 这个 bug 一直被漫游本身的故障掩盖着：默认 idle 模式（`random`）下
+   * 漫游倒计时挂在 rAF 上、永远不前进，所以漫游几乎不触发，也就很少卡。
+   * 修好漫游之后它立刻暴露出来（验收里当场抓到 `state=walk` 且 `vx=0`）。
+   *
+   * 两侧各留一点余量（`WALK_TARGET_MARGIN`），免得目标正好压在墙上、
+   * 因浮点误差在边界反复抖动。
+   */
+  function pickWalkTarget(worldWidth) {
+    const half = Math.max(0, Number(physics.size && physics.size.width) || 0) / 2;
+    const low = half + WALK_TARGET_MARGIN;
+    const high = worldWidth - half - WALK_TARGET_MARGIN;
+    if (!(high > low)) {
+      // 宠物比屏幕还宽（或几乎一样宽）：走不动，就停在中间。
+      // 不能返回一个够不着的目标——那正是上面那个卡死。
+      return worldWidth / 2;
+    }
+    return low + Math.random() * (high - low);
   }
 
   // ------------------------------------------------------------ 指针交互
@@ -1331,6 +1537,8 @@ export function createPetView(options = {}) {
       wake();
       // 从暂停里恢复时重排 idle（暂停期间排期已被清掉）
       scheduleIdleWake();
+      // 漫游同理：暂停期间 `roamTriggerEnabled()` 为假，排期也已被清掉
+      scheduleRoamWake();
     }
   }
 
@@ -1351,6 +1559,8 @@ export function createPetView(options = {}) {
         machine.settle({ now: performance.now() });
         // 播报结束、回到 idle：重新排一次随机小动作
         scheduleIdleWake();
+        // 漫游同样要重排（播报期间状态不是 idle，排期已被清掉）
+        scheduleRoamWake();
       }
       wake();
     }, Math.max(300, duration));
@@ -1396,10 +1606,13 @@ export function createPetView(options = {}) {
   // 起始位置：站在地面
   physics.setPosition(initialBounds.width * 0.5, initialBounds.height);
   drawPosition();
-  walkTimer = 2000;
   // 起手就排一次：宠物出现后过一段随机时间自己动一下，而不是永远僵着。
   // 自动漫游（`autoRoam`）与它是两条独立的路子，因此这里不互斥。
+  //
+  // 漫游同样要起手排一次。注意**不能**像早先那样给一个写死的 `walkTimer = 2000`
+  // ——那个倒计时挂在 rAF 上，而 rAF 在 idle 静止时是停的（见 `roamWakeTimer`）。
   scheduleIdleWake();
+  scheduleRoamWake();
 
   /**
    * 触发一次随机 idle 小动作。
@@ -1513,9 +1726,11 @@ export function createPetView(options = {}) {
           wake();
         }
       }
-      // 漫游的下一次间隔同样按新值重抽（见上面「为什么不是清零」）
+      // 漫游的下一次间隔同样按新值重抽（见上面「为什么不是清零」）。
+      // 必须**重排定时器**而不是只改一个倒计时变量——后者挂在 rAF 上，
+      // 而 rAF 在 idle 静止时是停的。
       if (machine.state === STATES.IDLE) {
-        walkTimer = scheduler.reschedule('roam') * 1000;
+        scheduleRoamWake();
       }
       return this;
     },
@@ -1537,6 +1752,17 @@ export function createPetView(options = {}) {
       }
       // `scale` **不**在这里处理：它会改包围盒尺寸，进而影响物理与切帧几何，
       // 必须重建视图（由 `plugin.js` 的 `applyPack` 负责，并保留当前位置）。
+      //
+      // `autoRoam` 要就地生效：关掉时**立刻**撤掉待执行的那一趟
+      // （否则用户关掉「自动漫游」之后它还会走一趟，看起来像没生效）；
+      // 打开时补排一次。
+      if ('autoRoam' in next) {
+        if (config.autoRoam) {
+          scheduleRoamWake();
+        } else {
+          cancelRoamWake();
+        }
+      }
       return this;
     },
     applyThrottle,
@@ -1544,6 +1770,12 @@ export function createPetView(options = {}) {
     touch,
     wake,
     pokeIdle,
+    /** 立刻触发一次自动漫游（测试/排查用，等价于「这一趟到点了」）。 */
+    pokeRoam: scheduleWalk,
+    /** 距离下一次自动漫游还有多少毫秒（没排期时为 `null`）。 */
+    roamCountdown,
+    /** 当前漫游节奏（`{minMs, maxMs}`，来自后端下发的 `schedule`）。 */
+    roamSchedule: () => scheduler.get('roam'),
     dispose() {
       disposed = true;
       stopLoop();
@@ -1554,6 +1786,10 @@ export function createPetView(options = {}) {
       clearTimeout(blinkTimer);
       blinkTimer = 0;
       cancelIdleWake();
+      // 漫游定时器同样要回收：它**独立于 rAF**（静止时 rAF 是停着的，
+      // 而漫游照排），漏掉的话视图销毁后它还会触发一次 `scheduleWalk()`
+      // ——去操作一个已经摘掉的节点。
+      cancelRoamWake();
       if (resizeRaf) window.cancelAnimationFrame(resizeRaf);
       window.removeEventListener('resize', onResize);
       root.removeEventListener('pointerdown', onPointerDown);

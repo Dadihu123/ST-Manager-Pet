@@ -114,18 +114,160 @@ def test_petview_exposes_still_for_verification(petview):
 # ==================================================== 2. 触发时间接线
 
 
+def strip_js_comments(source):
+    """剥掉 JS 的块注释与行注释（**字符串里的 `//` 不处理**，够用即可）。
+
+    为什么要它：本文件里好几条断言查的是「代码里**不能**出现某个写法」，
+    而解释「为什么不能这么写」的注释里**必然**会出现那个写法本身。
+    不剥离的话这些断言会把文档当成违规——与 `test_css_contracts.py`
+    里 `strip_comments` 记的是同一个坑。
+    """
+    code = re.sub(r'/\*.*?\*/', '', source, flags=re.DOTALL)
+    code = re.sub(r'^\s*//.*$', '', code, flags=re.MULTILINE)
+    return code
+
+
 def test_petview_uses_the_scheduler_for_roam(petview):
     """★ 自动漫游的间隔必须来自后端下发的节奏，而不是写死的随机数。
 
     旧实现是 `walkTimer = 3000 + Math.random() * 6000`——写死的话
     「调整漫游触发时间」这个诉求就落不了地。
     """
-    body = petview[petview.index('function scheduleWalk()'):]
+    body = petview[petview.index('function scheduleRoamWake()'):]
     body = body[:body.index('\n  }')]
     assert "scheduler.reschedule('roam')" in body, (
         '漫游间隔要抽自调度器（可按形象配置）'
     )
-    assert '3000 + Math.random() * 6000' not in body, '写死的间隔必须去掉'
+    assert '3000 + Math.random() * 6000' not in petview, '写死的间隔必须去掉'
+
+
+def test_roam_countdown_is_not_driven_by_raf(petview):
+    """★★ 漫游的倒计时**必须**走 `setTimeout`，不能挂在 rAF 上。
+
+    这是用户报的「漫游调到 200-300ms 结果半天触发不了」的根因：
+
+    - 早先的实现在 `updateStateFromPhysics()` 里 `walkTimer -= dt * 1000`，
+      而那个函数只在 rAF 循环运行时才跑；
+    - 默认 idle 模式（`random`）下 `shouldKeepRunning()` 在「idle + 物理静止」
+      时返回 false，**rAF 真的停掉**（省电契约，README §4.5）。
+
+    两者合起来 → 倒计时永远不前进 → **漫游从不触发**。
+    实测：漫游间隔设成 200~300ms，12 秒每 100ms 采样一次，状态全程停在
+    `idle`、水平位移 0.0px。
+
+    而 idle 的小动作走 `setTimeout`，所以它一切正常——「闲置看起来正常」
+    正好掩盖了同一条路径上的漫游问题。
+
+    这条测试因此要钉死两件事：倒计时**不在** rAF 里，且漫游有独立的定时器。
+
+    注释要剥掉：解释这个 bug 的注释里**必然**会出现 `walkTimer -= dt` 本身。
+    """
+    code = strip_js_comments(petview)
+    assert 'walkTimer -= dt' not in code, (
+        '漫游倒计时不能放在 rAF 的 tick 里——rAF 在 idle 静止时是停的'
+    )
+    assert 'walkTimer = 2000' not in code, '那个写死的初始倒计时同样是 rAF 驱动的'
+    assert 'roamWakeTimer' in code, '漫游要有自己的 setTimeout 定时器'
+    body = code[code.index('function scheduleRoamWake()'):]
+    body = body[:body.index('\n  }')]
+    assert 'setTimeout(' in body, '漫游的排期必须走 setTimeout'
+    # 与 idle 的定时器**分开**：两条路子互不排斥，共用会互相清掉排期
+    assert 'idleWakeTimer' not in body, '漫游不能用 idle 的定时器变量'
+
+
+def test_roam_wake_is_rescheduled_on_every_path_back_to_idle(petview):
+    """★ 每一条「回到 idle」的路径都要重排漫游。
+
+    漏掉任何一条的表现都是「走了一趟之后就再也不走了」——
+    而它不会报错、也不会让任何功能测试失败，只会让宠物变呆。
+    """
+    # 状态迁移的集中钩子
+    body = petview[petview.index('function onStateEnter(next)'):]
+    body = body[:body.index('\n  }')]
+    assert 'scheduleRoamWake()' in body, '进入 idle 要排漫游'
+    assert 'cancelRoamWake()' in body, '离开 idle 要撤掉漫游'
+    # 三条「不产生状态迁移 / 状态已被清掉」的补充路径
+    assert 'scheduleRoamWake();' in petview
+    assert petview.count('scheduleRoamWake()') >= 5, (
+        '进入 idle / 小动作播完 / 落地补排 / 降频恢复 / 播报结束 都要重排'
+    )
+    assert 'cancelRoamWake();' in petview[petview.index('dispose() {'):], (
+        '销毁时必须回收漫游定时器（它独立于 rAF，不回收会在视图销毁后触发）'
+    )
+
+
+def test_roam_wake_rearms_when_blocked_by_a_transient_reason(petview):
+    """★ 到点但被**瞬时**原因挡住时要补排，否则那一趟永远丢了。
+
+    与 `wasAirborne` 那条注释记的是同一个坑：手势没结束 / 小动作正在播
+    都不会产生状态迁移，因此没有人会来重排。而「已经不在 idle」时**不**补排
+    （那些路径回到 idle 时会由 `onStateEnter` 重排），免得睡着时还挂着定时器。
+    """
+    body = petview[petview.index('function scheduleRoamWake()'):]
+    body = body[:body.index('\n  }\n')]
+    assert 'machine.state === STATES.IDLE' in body, (
+        '只在「还在 idle」时补排——已经离开 idle 的交给状态迁移'
+    )
+
+
+def test_roam_target_must_be_reachable(petview):
+    """★★ 漫游目标必须落在宠物**够得着**的范围里。
+
+    这是修好漫游之后立刻暴露出来的第二个 bug（比第一个更严重）。
+
+    `physics.js` 把 x 夹在 `[半宽, 世界宽 - 半宽]` 里，撞到侧壁时把水平速度
+    清零；而状态机退出 WALK 的条件是 `|x - walkTargetX| < 6`。
+    早先的目标是 `40 + random * (宽 - 80)`——它假定宠物很窄，
+    于是目标落在夹取范围之外时宠物**永远走不到**：
+
+    - 卡在 WALK 态（看起来停在墙边不动）；
+    - `shouldKeepRunning()` 对 WALK 恒返回 true → **rAF 永远跑着**，
+      省电契约被破坏（最要紧的一条）；
+    - `roamTriggerEnabled()` 要求 `state === IDLE` → **漫游再也不触发**。
+
+    实测够不着的比例（世界宽 900，目标区间 [40, 860]）：
+
+    | 宠物宽度 | 半宽 | 够不着的目标 |
+    |---|---|---|
+    | 64px | 32 | 0% |
+    | 173px（内置形象 0.45 倍） | 86.5 | **11.3%** |
+    | 384px（1 倍） | 192 | **37.1%** |
+    | 768px（2 倍） | 384 | **83.9%** |
+
+    **宠物越大越容易卡死**，而「放大宠物」正是用户最常调的一项。
+    """
+    code = strip_js_comments(petview)
+    assert '40 + Math.random() * Math.max(1, world.width - 80)' not in code, (
+        '不能再用写死的 40 / 80——它假定宠物很窄'
+    )
+    body = code[code.index('function pickWalkTarget('):]
+    body = body[:body.index('\n  }')]
+    assert 'physics.size' in body or 'size.width' in body, (
+        '目标必须按宠物的**半宽**收窄'
+    )
+    assert 'WALK_TARGET_MARGIN' in body, '两侧要留余量，免得目标压在墙上抖动'
+    # 宠物比屏幕还宽时不能返回一个够不着的目标（那正是卡死）
+    assert 'worldWidth / 2' in body, '走不动时该停在中间'
+
+
+def test_walk_state_has_a_stall_safety_net(petview):
+    """★ 走不动时要能**自己结束**这一趟（兜底，保护省电契约）。
+
+    正常路径是「走到目标附近就停」，但宠物可能永远走不到：撞墙时物理层
+    把速度清零，而目标若够不着就再也不会满足 `|x - walkTargetX| < 6`。
+    `pickWalkTarget()` 修的是根因，这里是兜底——屏幕尺寸变化、
+    用户中途改大小、浮点边界都可能让它再次停住。
+
+    卡在 WALK 的代价不只是「看起来不动了」：`shouldKeepRunning()` 对 WALK
+    恒返回 true，于是 **rAF 永远跑着**（省电契约被破坏），而且漫游再也不触发。
+    """
+    code = strip_js_comments(petview)
+    body = code[code.index('if (state === STATES.WALK) {'):]
+    body = body[:body.index('\n    }')]
+    assert 'WALK_STALL_SPEED' in body, (
+        '要按「速度掉到接近 0」判定走不动，而不是只看「到没到目标」'
+    )
+    assert 'stopWalk' in body, '走不动时要真的退出 WALK 态'
 
 
 def test_petview_uses_the_scheduler_for_idle(petview):
@@ -151,7 +293,9 @@ def test_petview_can_update_the_schedule_in_place(petview):
     body = petview[petview.index('    setSchedule(schedule) {'):]
     body = body[:body.index('\n    },')]
     assert 'cancelIdleWake()' in body, '改完要重排 idle 定时器'
-    assert 'walkTimer' in body, '改完要重排漫游定时器'
+    assert 'scheduleRoamWake()' in body, (
+        '改完要重排漫游定时器（只改一个倒计时变量没用——那个变量挂在 rAF 上）'
+    )
 
 
 def test_still_frame_carries_its_own_size(animation):
