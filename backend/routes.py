@@ -472,6 +472,30 @@ def register_routes(api, store: PetStore) -> None:
             'activePetId': created['id'],
         })
 
+    @api.route('/pets/<pet_id>/copy', ['POST'])
+    @_handle
+    def copy_pet(pet_id):
+        """把一个形象（**含内置**）复制成可编辑的用户形象。
+
+        为什么需要这个入口：内置形象严格只读（用户明确要求），而「在它基础上
+        改速度 / 间隔 / 换几张图」是很自然的需求。此前唯一的路是手工复制
+        `resources/pets/<id>/`，而那条路有两个坑（实测都绊到过用户）：
+
+        1. **目录名就是形象 id**，只能用 `[a-z0-9._-]` 且以字母/数字开头。
+           命名成 `xiaoka-自定义` 这类会被**整目录跳过**；
+        2. **判定内置/自定义只看目录位置**，与 `pet.json` 写什么无关——
+           复制到 `resources/pets/` 下仍然只读，改 id、改 author 都没用。
+
+        这个入口由后端生成合法 id 并落到 `data/pets/`（= 可写）。
+        """
+        payload = request.get_json(silent=True) or {}
+        pack = store.copy_pet(
+            pet_id,
+            name=str(payload.get('name') or '').strip(),
+            author=str(payload.get('author') or '').strip(),
+        )
+        return jsonify({'success': True, 'pet': pack})
+
     @api.route('/pets/<pet_id>/meta', ['POST'])
     @_handle
     def update_pet_meta(pet_id):

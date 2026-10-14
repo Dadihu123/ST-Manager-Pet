@@ -828,6 +828,36 @@ export function createSettingsPanel({
     }
   }
 
+  /**
+   * 把内置形象**复制成用户形象**（复制出来的可改：帧率、图片、触发节奏…）。
+   *
+   * 为什么不引导用户自己复制目录：那条路有两个坑（实测都绊到过用户）——
+   * 目录名就是 id（只能用 `[a-z0-9._-]`，中文会被整目录跳过），
+   * 以及「内置 / 自定义」只看目录位置（放到 `resources/pets/` 下仍是只读，
+   * 改 id、改 author 都没用）。这里由后端一次做对。
+   *
+   * 复制完**自动切过去**：用户的意图就是「我要改这个」，切过去才谈得上改。
+   */
+  async function copyPet(petId) {
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(petId)}/copy`,
+        { method: 'POST', body: {} },
+      );
+      if (!data) return;
+      const newId = data.pet && data.pet.id;
+      setNotice('ok', `已复制为「${newId}」，现在可以改帧率 / 换图 / 调触发时间了`);
+      if (newId) {
+        // 切到新形象并选中它，省得用户再去列表里找
+        const activated = await call('/pets/active', { method: 'POST', body: { petId: newId } });
+        if (activated) activeId = activated.activePetId || newId;
+        selectedId = newId;
+      }
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+    });
+  }
+
   /** 调整大小倍率 / 渲染方式（按形象保存，立即生效）。 */
   async function updateAppearance(patch, { silent = false } = {}) {
     await withBusy(async () => {
@@ -1315,6 +1345,17 @@ export function createSettingsPanel({
       actions.appendChild(button('导出形象包', '', () => exportPet(selectedId)));
       actions.appendChild(button('删除', 'is-danger', () => deletePet(selectedId)));
     } else {
+      // ★ 内置形象：给出「复制成我自己的」这条路。
+      //
+      // 内置形象严格只读（用户明确要求），但「在它基础上改帧率 / 换几张图」
+      // 是很自然的需求。此前唯一的路是**手工**把 `resources/pets/<id>/`
+      // 复制到 `data/pets/<新 id>/`，而那条路有两个坑（实测都绊到过用户）：
+      //   1. 目录名**就是形象 id**，只能用 `[a-z0-9._-]`——命名成
+      //      `xiaoka-自定义` 这类会被**整目录跳过**；
+      //   2. 判定「内置 / 自定义」**只看目录位置**，与 pet.json 写什么无关
+      //      ——复制到 `resources/pets/` 下仍然只读，改 id、改 author 都没用。
+      // 这个按钮由后端生成合法 id 并落到 `data/pets/`，一次做对。
+      actions.appendChild(button('复制为我的形象', 'is-primary', () => copyPet(selectedId)));
       actions.appendChild(el('span', 'pet-card-meta', '插件自带，形象内容不可修改'));
     }
     header.appendChild(actions);

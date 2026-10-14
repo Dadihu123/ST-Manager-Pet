@@ -99,6 +99,15 @@ from .paths import is_action_name, is_safe_relative_name, safe_join, to_posix
 
 logger = logging.getLogger(__name__)
 
+#: 内置形象的作者署名（用户明确要求内置形象署「官方」）。
+#:
+#: 复制内置形象时会检查它：**不沿用「官方」**——复制出来的包是用户自己的，
+#: 继续署「官方」会让人以为它是随插件发布的（见 `copy_pet`）。
+BUILTIN_AUTHOR = '官方'
+
+#: 复制内置形象时给新包的默认署名（用户没指定作者时用）。
+DEFAULT_COPY_AUTHOR = '自定义'
+
 #: 首次安装（设置里还没有 `activePetId`）时默认启用的形象 id。
 #:
 #: 为什么是「小满」：随包内置的两个真人形象里，小满是**半写实插画**、
@@ -2618,6 +2627,93 @@ class PetStore:
 
     # ------------------------------------------------------------ 导出
 
+    def copy_pet(self, pet_id: str, *, name: str = '', author: str = '') -> dict:
+        """把任意形象（含**内置**）复制成一个**用户形象**，返回新的运行期定义。
+
+        为什么需要它：内置形象是严格只读的（用户明确要求），而「我想在这个
+        基础上改速度 / 间隔 / 换几张图」是非常自然的需求。在此之前唯一的路
+        是**手工**把 `resources/pets/<id>/` 复制到 `data/pets/<新 id>/`——
+        而那条路有两个坑，实测都绊到过用户：
+
+        1. **目录名就是形象 id**，只能用小写字母/数字/`.`/`_`/`-`。
+           命名成 `xiaoka-自定义` 这类（很自然的中文命名）会被整目录跳过；
+        2. **判定「内置 / 自定义」只看目录位置**，与 `pet.json` 里写什么无关。
+           复制到 `resources/pets/` 下仍然是内置（只读），改 id、改 author 都没用。
+
+        这个入口把两件事一次做对：目录名由后端按合法 id 生成、落点固定在
+        `data/pets/`（= 用户形象 = 可写）。
+
+        Args:
+            pet_id: 源形象 id（内置或用户形象都可以）。
+            name: 新形象显示名；空则沿用源形象的 name。
+            author: 新形象作者署名；空则沿用源形象的 author。
+
+        Returns:
+            dict: 新形象的 `runtime_pack()` 结果（前端可直接切过去）。
+        """
+        source_id = sanitize_pet_id(pet_id)
+        directory, _source = self._locate(source_id)
+        pack = self.load_pack(source_id)
+
+        with self._lock:
+            # 复制出来的 id：`<源 id>-copy`，冲突就 `<源 id>-copy-2`…
+            new_id = self._allocate_pet_id(f'{source_id}-copy')
+            target_dir = self.user_pet_dir(new_id)
+            # 与 `import_zip` 同一个套路：先写临时目录再原子替换，
+            # 中途失败不会留下半成品包（那种包在列表里会显示成坏包）。
+            staging = safe_join(self.data_dir, PETS_DIRNAME, f'.staging-{new_id}')
+            shutil.rmtree(staging, ignore_errors=True)
+            try:
+                files = self._collect_export_files(directory, pack, source_id)
+                os.makedirs(staging, exist_ok=True)
+                for relative, payload in files.items():
+                    parts = [part for part in to_posix(relative).split('/')
+                             if part not in ('', '.')]
+                    if not parts or any(part == '..' for part in parts):
+                        continue
+                    target = safe_join(staging, *parts)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    write_bytes_atomic(target, payload)
+
+                # ★ `pet.json` 的 `id` 必须改成新的——它与目录名不一致时
+                # 会触发 `idMismatch` 提示（见 `_describe`），而复制出来的包
+                # 不该一出生就带着一个警告。
+                manifest_path = os.path.join(staging, MANIFEST_FILENAME)
+                with open(manifest_path, 'rb') as handle:
+                    raw = json.loads(handle.read().decode('utf-8') or '{}')
+                if not isinstance(raw, dict):
+                    raw = {}
+                raw['id'] = new_id
+                raw['name'] = (name or '').strip() or pack.name or new_id
+                # 作者：用户没指定时**不沿用**「官方」——那会让复制出来的包
+                # 看起来仍是官方发布的，而它其实是用户自己的。
+                if (author or '').strip():
+                    raw['author'] = author.strip()
+                elif pack.author == BUILTIN_AUTHOR:
+                    raw['author'] = DEFAULT_COPY_AUTHOR
+                else:
+                    raw['author'] = pack.author
+                write_bytes_atomic(
+                    manifest_path,
+                    json.dumps(raw, ensure_ascii=False, indent=2).encode('utf-8'),
+                )
+
+                os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+                if os.path.isdir(target_dir):
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                os.replace(staging, target_dir)
+            except OSError as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise PetError(
+                    CODE_WRITE_FAILED,
+                    f'复制形象失败: {exc}',
+                    user_msg='复制这个形象失败，请检查磁盘空间或权限。',
+                    http_status=500,
+                ) from exc
+
+        logger.info('形象 %s 已复制为用户形象 %s', source_id, new_id)
+        return self.runtime_pack(new_id)
+
     def export_pet(self, pet_id: str) -> bytes:
         """把一个**用户自建**形象打包成 zip（便于用户在设备间搬运自己的形象）。
 
@@ -2663,6 +2759,9 @@ class PetStore:
                 result[MANIFEST_FILENAME] = handle.read()
 
         names = set()
+        #: 相对名 → **真实绝对路径**。覆盖图不在包目录下（见下面那段），
+        #: 因此不能一律用 `os.path.join(directory, ...)` 去找。
+        located = {}
         for action in pack.animations:
             # **每一套动画的每一页**都要带上：只导出主变体的话，
             # 「导出再导入」会静默丢掉其余几套；只导出第一页的话，
@@ -2684,7 +2783,15 @@ class PetStore:
             # 导出包内只有 `pet.json` 与 `idle.png`，`overrides/idle.png` 消失。
             path, source = self.resolve_frame_path(pet_id, action)
             if path and source == 'override':
-                names.add(f'{OVERRIDES_DIRNAME}/{action}{os.path.splitext(path)[1]}')
+                relative = f'{OVERRIDES_DIRNAME}/{action}{os.path.splitext(path)[1]}'
+                names.add(relative)
+                # ★ 覆盖图的真实位置**不在包目录下**：内置形象的覆盖放在
+                # `data/pets/<id>/overrides/`，而包目录是 `resources/pets/<id>/`。
+                # 过去统一用 `os.path.join(directory, relative)` 去找，于是
+                # 「导出内置形象」会**静默漏掉**这些覆盖图。
+                # （对用户形象两者恰好同一个根，所以这个 bug 只在复制/导出
+                #   内置形象时才露出来。）
+                located[relative] = path
 
         for relative in sorted(names):
             if not is_safe_relative_name(relative.split('/')[-1]):
@@ -2692,7 +2799,7 @@ class PetStore:
             parts = [part for part in relative.split('/') if part not in ('', '.')]
             if any(part == '..' for part in parts):
                 continue
-            candidate = os.path.join(directory, *parts)
+            candidate = located.get(relative) or os.path.join(directory, *parts)
             if os.path.isfile(candidate):
                 with open(candidate, 'rb') as handle:
                     result[relative] = handle.read()
