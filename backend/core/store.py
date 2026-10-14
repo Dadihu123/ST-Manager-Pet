@@ -334,6 +334,10 @@ class PetStore:
         # 开发期导入：动图帧数缓存（见 `_animated_info`）。
         # 必须放在 `_lock` **之前**：`_animated_info` 会拿这把锁。
         self._animated_cache = {}
+        #: 扫描时因**目录名不合法**被跳过的目录（见 `_scan_dir`）。
+        #: 每次 `list_pets()` 重新填，随列表一起回给面板——
+        #: 不然「我放进去了却没出现」只能靠猜。
+        self._invalid_dirs = []
         # 导入/删除是「读-改-写」，并发请求会互相踩；一把进程内锁足够
         # （宿主是单进程 Flask，且 data_dir 有跨进程独占锁保护）。
         self._lock = threading.RLock()
@@ -792,6 +796,8 @@ class PetStore:
         """
         result = []
         seen = set()
+        # 每次重新收集「被跳过的目录」——否则用户改名之后告警会一直挂着。
+        self._invalid_dirs = []
 
         for pet_id in self._scan_dir(self.user_pets_dir()):
             if pet_id in seen:
@@ -815,6 +821,8 @@ class PetStore:
         `data/pets/<内置 id>/overrides/`，那会让 `data/pets/<内置 id>/` 存在但
         没有任何 pet.json。把它当成一个包会导致内置形象被「用户包」遮蔽
         （`_locate` 用户优先），等于把一个能用的内置形象变成「不存在」。
+
+        ⚠️ **目录名不合法时要留下痕迹**（见下面 `PET_ID_PATTERN` 那段）。
         """
         if not os.path.isdir(root):
             return []
@@ -825,10 +833,30 @@ class PetStore:
             logger.warning('读取形象目录失败 %s: %s', root, exc)
             return []
         for name in names:
-            if not PET_ID_PATTERN.match(name):
-                continue
             directory = os.path.join(root, name)
             if not os.path.isdir(directory):
+                continue
+            if not PET_ID_PATTERN.match(name):
+                # ★ 这里过去是**静默跳过**的，于是「目录名带中文」这类问题
+                # 表现为「我明明放进去了，列表里却没有」，而插件一声不吭
+                # ——用户只能靠猜。目录名就是 id（`_locate` / 帧 URL 全按它），
+                # 因此名字非法时**必须**说清是哪个目录、为什么不行。
+                #
+                # 只在「看起来像个形象包」时告警：`data/pets/<id>/overrides/`
+                # 那种情形下目录里没有 pet.json，属于正常情况，不该刷日志。
+                if os.path.isfile(os.path.join(directory, MANIFEST_FILENAME)):
+                    logger.warning(
+                        '形象目录名不合法，已跳过: %s（id 只能用小写字母、数字、"." "_" "-"，'
+                        '且必须以字母或数字开头；目录名就是形象 id）',
+                        directory,
+                    )
+                    self._invalid_dirs.append({
+                        'dir': directory,
+                        'name': name,
+                        'reason': '目录名不是合法的形象 id',
+                        'hint': 'id 只能用小写字母、数字、"." "_" "-"，且必须以字母或数字开头。'
+                                '把目录改名成合法的 id（例如 "xiaoka-mine"）即可。',
+                    })
                 continue
             if not os.path.isfile(os.path.join(directory, MANIFEST_FILENAME)):
                 continue
@@ -902,6 +930,22 @@ class PetStore:
             'staleOverrides': base['overrides'] if builtin_only else [],
             'thumb': self.thumbnail_spec(pet_id, pack),
         })
+        # ⚠️ `pet.json` 里的 `id` 与**目录名**不一致时提醒一下。
+        #
+        # 两者是同一个东西的两个来源：`_locate` / 帧 URL / 覆盖解析全按
+        # **目录名**，而 `pet.json` 的 `id` 只在该文件被单独搬运时才有意义。
+        # 用户复制内置形象时很容易只改一个（「我改了 id，还是不行」），
+        # 于是列表里的 id 与文件里写的对不上，排查时极其困惑。
+        #
+        # 这**不是错误**（包照常能用），因此只提示、不改行为。
+        if pack.id and pack.id != pet_id:
+            base['idMismatch'] = {
+                'manifestId': pack.id,
+                'dirId': pet_id,
+                'hint': f'pet.json 里的 id 是「{pack.id}」，而目录名是「{pet_id}」。'
+                        f'插件按**目录名**定位与生成图片地址，因此生效的 id 是「{pet_id}」。'
+                        f'想让它们一致，把 pet.json 的 id 改成「{pet_id}」即可。',
+            }
         return base
 
     def thumbnail_spec(self, pet_id: str, pack: PetPack = None) -> dict:
@@ -1209,6 +1253,15 @@ class PetStore:
             'declaredScale': clamp_scale(pack.scale),
             'declaredPixelated': bool(pack.pixelated),
             'writable': not self._is_builtin_only(pet_id),
+            # `pet.json` 的 `id` 与**目录名**不一致时带上提示（见 `_describe`）。
+            # 两者是同一个东西的两个来源，而目录名才是生效的那个。
+            'idMismatch': (
+                {'manifestId': pack.id, 'dirId': pet_id,
+                 'hint': f'pet.json 里的 id 是「{pack.id}」，而目录名是「{pet_id}」。'
+                         f'插件按**目录名**定位与生成图片地址，因此生效的 id 是「{pet_id}」。'
+                         f'想让它们一致，把 pet.json 的 id 改成「{pet_id}」即可。'}
+                if pack.id and pack.id != pet_id else None
+            ),
             'actions': actions,
             # **标准图像**：不播动画时显示的那一帧。前端在 idle 的「静止」阶段
             # 画它，而不是画「上一次随机抽到的那套动画的第 0 帧」——
@@ -2586,7 +2639,7 @@ class PetStore:
         buffer = io.BytesIO()
         try:
             with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
-                for name, payload in self._collect_export_files(directory, pack).items():
+                for name, payload in self._collect_export_files(directory, pack, pet_id).items():
                     archive.writestr(name, payload)
         except OSError as exc:
             raise PetError(
@@ -2597,8 +2650,12 @@ class PetStore:
             ) from exc
         return buffer.getvalue()
 
-    def _collect_export_files(self, directory: str, pack: PetPack) -> dict:
-        """收集需要打进 zip 的文件：manifest + 各动作实际用到的图 + 覆盖图。"""
+    def _collect_export_files(self, directory: str, pack: PetPack, pet_id: str) -> dict:
+        """收集需要打进 zip 的文件：manifest + 各动作实际用到的图 + 覆盖图。
+
+        `pet_id` 是**目录名**（不是 `pack.id`）——覆盖图的解析必须按它，
+        理由见下面那段注释。
+        """
         result = {}
         manifest = os.path.join(directory, MANIFEST_FILENAME)
         if os.path.isfile(manifest):
@@ -2614,8 +2671,18 @@ class PetStore:
                 for page in variant.sheets:
                     if page:
                         names.add(to_posix(page))
-            # 覆盖图也要带上，否则导出再导入会丢用户改动
-            path, source = self.resolve_frame_path(pack.id, action)
+            # 覆盖图也要带上，否则导出再导入会丢用户改动。
+            #
+            # ⚠️ 这里必须用**目录名**（`pet_id`），不能用 `pack.id`。
+            # 两者是**同一个东西的两个来源**：`_locate` / `resolve_frame_path`
+            # / 帧 URL 全按目录名，而 `pack.id` 来自 `pet.json`。
+            # 作者把 `pet.json` 的 `id` 写成别的值时（很容易发生——
+            # 用户复制内置形象后改了 id 却忘了改目录名），用 `pack.id` 会去
+            # 解析一个**不存在**的目录，于是覆盖图被**静默漏掉**：
+            # 包能导出、能再导入，只是用户的自定义图没了。
+            # 实测：目录 `my-copy` + `pet.json` id `something-else` 时，
+            # 导出包内只有 `pet.json` 与 `idle.png`，`overrides/idle.png` 消失。
+            path, source = self.resolve_frame_path(pet_id, action)
             if path and source == 'override':
                 names.add(f'{OVERRIDES_DIRNAME}/{action}{os.path.splitext(path)[1]}')
 

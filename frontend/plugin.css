@@ -636,6 +636,20 @@
   border-color: var(--color-warning, #d9a02c);
 }
 
+/* 通知里的标题/正文：标题加粗一行，正文跟在后面。
+ *
+ * 为什么需要：目录名不合法这类提示要**先说清是哪个目录**（标题），
+ * 再说怎么改（正文）。挤成一段长文字时用户会直接跳过去——
+ * 而这正是「我明明放进去了却没有」这类问题的唯一线索。 */
+.plugin-stm-pet .pet-notice-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.plugin-stm-pet .pet-notice-body {
+  opacity: 0.85;
+}
+
 .plugin-stm-pet .pet-notice.is-error {
   border-color: var(--color-danger, #d9534f);
 }

@@ -482,3 +482,149 @@ def test_builtin_breathing_origin_follows_each_anchor():
         assert entry['motionOrigin'] != '50% 100.00%', (
             f'{pet_id} 的原点落到了写死值上——说明没读 anchor.y'
         )
+
+
+# ==================================================== 形象目录的命名（真实踩过）
+
+def _store_with(tmp_path, names):
+    """建一个 store，`names` 是 `resources/pets/` 下的目录名（都放一份合法包）。"""
+    builtin = tmp_path / 'resources' / 'pets'
+    user = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    user.mkdir(parents=True)
+    source = tmp_path / 'source'
+    source.mkdir()
+    Image.new('RGBA', (96, 96), (10, 200, 10, 255)).save(source / 'idle.png')
+    for name in names:
+        target = builtin / name
+        target.mkdir(parents=True)
+        (target / 'idle.png').write_bytes((source / 'idle.png').read_bytes())
+        (target / 'pet.json').write_text(json.dumps({
+            'id': name if name.isascii() else 'whatever',
+            'name': 'X', 'size': {'w': 96, 'h': 96},
+            'animations': {'idle': {'sheet': 'idle.png', 'frames': 1}},
+        }, ensure_ascii=False), encoding='utf-8')
+    return PetStore(str(user), str(builtin))
+
+
+def test_invalid_dir_name_is_reported_not_silently_skipped(tmp_path):
+    """★ 目录名不合法时**必须留下痕迹**，不能静默跳过。
+
+    真实踩过：用户复制内置形象做自定义版，目录命名成 `xiaoka-自定义`
+    （很自然的中文命名），于是插件**一声不吭**地跳过它——
+    表现为「我明明放进去了，列表里却没有」，用户只能靠猜。
+
+    目录名**就是形象 id**（`_locate` / 帧 URL / 覆盖解析全按它），
+    而合法字符集是「小写字母、数字、`.` `_` `-`，且以字母或数字开头」。
+    因此这里既要跳过（不能让它进列表），也要把「哪个目录、为什么」报出来。
+    """
+    store = _store_with(tmp_path, ['good-one', 'xiaoka-自定义'])
+    items = store.list_pets()
+    assert [i['id'] for i in items] == ['good-one'], '非法目录名不该进列表'
+    assert len(store._invalid_dirs) == 1, '被跳过的目录必须被记下来'
+    entry = store._invalid_dirs[0]
+    assert entry['name'] == 'xiaoka-自定义'
+    assert 'id' in entry['hint'] and '小写字母' in entry['hint'], (
+        '提示要说清合法字符集，否则用户还是不知道该改成什么'
+    )
+
+
+def test_uppercase_dir_name_is_also_invalid(tmp_path):
+    """大写字母同样不合法（正则只允许小写）——这条最容易踩。"""
+    store = _store_with(tmp_path, ['Xiaoka-Copy'])
+    assert store.list_pets() == []
+    assert len(store._invalid_dirs) == 1
+
+
+def test_invalid_dir_without_manifest_is_not_reported(tmp_path):
+    """目录名不合法但**里面没有 pet.json** 时不告警。
+
+    那正是 `data/pets/<内置 id>/overrides/` 的形态（用户对内置形象做单动作
+    覆盖时会创建它）。把它当问题报出来会刷一屏假告警。
+    """
+    store = _store_with(tmp_path, ['good-one'])
+    stray = tmp_path / 'resources' / 'pets' / '带中文但没清单'
+    (stray / 'overrides').mkdir(parents=True)
+    store2 = PetStore(str(tmp_path / 'data'), str(tmp_path / 'resources' / 'pets'))
+    assert [i['id'] for i in store2.list_pets()] == ['good-one']
+    assert store2._invalid_dirs == [], '没有 pet.json 的目录不该被当成问题'
+
+
+def test_invalid_dirs_is_recollected_each_scan(tmp_path):
+    """每次列表都要**重新收集**——否则用户改名之后告警会一直挂着。"""
+    store = _store_with(tmp_path, ['xiaoka-自定义'])
+    assert len(store.list_pets()) == 0 and len(store._invalid_dirs) == 1
+    os.rename(str(tmp_path / 'resources' / 'pets' / 'xiaoka-自定义'),
+              str(tmp_path / 'resources' / 'pets' / 'xiaoka-mine'))
+    store2 = PetStore(str(tmp_path / 'data'), str(tmp_path / 'resources' / 'pets'))
+    assert [i['id'] for i in store2.list_pets()] == ['xiaoka-mine']
+    assert store2._invalid_dirs == []
+
+
+def test_manifest_id_mismatch_is_reported(tmp_path):
+    """★ `pet.json` 的 `id` 与目录名不一致时要提示。
+
+    两者是同一个东西的两个来源：**目录名**才是插件真正用的 id
+    （`_locate` / 帧 URL / 覆盖解析全按它），而 `pet.json` 的 `id` 只在
+    文件被单独搬运时才有意义。用户复制内置形象时很容易只改一个
+    （「我改了 id，还是不行」），于是列表里的 id 与文件里写的对不上。
+
+    这**不是错误**（包照常能用），因此只提示、不改行为。
+    """
+    builtin = tmp_path / 'resources' / 'pets'
+    user = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    user.mkdir(parents=True)
+    target = builtin / 'my-copy'
+    target.mkdir(parents=True)
+    Image.new('RGBA', (96, 96), (10, 200, 10, 255)).save(target / 'idle.png')
+    (target / 'pet.json').write_text(json.dumps({
+        'id': 'something-else', 'name': 'X', 'size': {'w': 96, 'h': 96},
+        'animations': {'idle': {'sheet': 'idle.png', 'frames': 1}},
+    }), encoding='utf-8')
+    store = PetStore(str(user), str(builtin))
+    item = store.list_pets()[0]
+    assert item['id'] == 'my-copy', '生效的 id 是**目录名**'
+    assert item['idMismatch']['manifestId'] == 'something-else'
+    assert item['idMismatch']['dirId'] == 'my-copy'
+    assert 'my-copy' in item['idMismatch']['hint']
+
+
+def test_no_mismatch_key_when_ids_agree(tmp_path):
+    """一致时不该多出这个键（否则面板会对每个正常形象都提示一遍）。"""
+    store = _store_with(tmp_path, ['good-one'])
+    assert 'idMismatch' not in store.list_pets()[0]
+
+
+def test_export_keeps_overrides_when_manifest_id_differs(tmp_path):
+    """★ 目录名与 `pet.json` id 不一致时，导出**不能**丢掉覆盖图。
+
+    `_collect_export_files` 过去用 `pack.id`（`pet.json` 里的）去解析覆盖，
+    而 `resolve_frame_path` / `_locate` 全按**目录名**——两者不一致时它会去
+    解析一个不存在的目录，于是覆盖图被**静默漏掉**：包能导出、能再导入，
+    只是用户的自定义图没了。实测：目录 `my-copy` + id `something-else` 时
+    导出包内只有 `pet.json` 与 `idle.png`。
+    """
+    import zipfile
+
+    builtin = tmp_path / 'resources' / 'pets'
+    user = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    target = user / 'pets' / 'my-copy'
+    target.mkdir(parents=True)
+    Image.new('RGBA', (384, 96), (10, 200, 10, 255)).save(target / 'idle.png')
+    (target / 'pet.json').write_text(json.dumps({
+        'id': 'something-else', 'name': 'X', 'size': {'w': 96, 'h': 96},
+        'animations': {'idle': {'sheet': 'idle.png', 'frames': 4}},
+    }), encoding='utf-8')
+    overrides = target / 'overrides'
+    overrides.mkdir()
+    Image.new('RGBA', (96, 96), (200, 10, 10, 255)).save(overrides / 'idle.png')
+
+    store = PetStore(str(user), str(builtin))
+    data = store.export_pet('my-copy')
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = archive.namelist()
+    assert 'overrides/idle.png' in names, (
+        f'覆盖图被漏掉了——导出用的是 pet.json 的 id 而不是目录名: {names}'
+    )

@@ -199,6 +199,13 @@ def register_routes(api, store: PetStore) -> None:
             'success': True,
             'items': items,
             'activePetId': active,
+            # 扫描时因**目录名不合法**被跳过的目录。
+            #
+            # 为什么要回给前端：目录名就是形象 id（`_locate` 与帧 URL 全按它），
+            # 而合法字符集是「小写字母/数字/. _ -」。用户把目录命名成
+            # `xiaoka-自定义` 这种（很自然的中文命名）时，插件过去是**静默跳过**
+            # 的——表现为「我明明放进去了，列表里却没有」，用户只能靠猜。
+            'invalidDirs': list(getattr(store, '_invalid_dirs', []) or []),
             'actions': list(ACTION_FALLBACKS),
             'limits': {
                 'maxImageBytes': MAX_IMAGE_BYTES,
@@ -803,6 +810,13 @@ def register_routes(api, store: PetStore) -> None:
             'declaredScale': pack.get('declaredScale'),
             'declaredPixelated': pack.get('declaredPixelated'),
             'writable': pack.get('writable', True),
+            # `pet.json` 的 `id` 与**目录名**不一致（见 `store._describe`）。
+            #
+            # 两者是同一个东西的两个来源，而**目录名**才是生效的那个
+            # （`_locate` / 帧 URL / 覆盖解析全按它）。用户复制内置形象时
+            # 很容易只改 `pet.json` 的 id（「我改了 id，还是不行」），
+            # 于是列表里的 id 与文件里写的对不上。这里透传给面板提示。
+            'idMismatch': pack.get('idMismatch') or None,
             'overrides': pack.get('overrides', []),
             'staleOverrides': pack.get('staleOverrides', []),
             'missingRequired': pack['missingRequired'],

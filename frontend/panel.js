@@ -128,6 +128,8 @@ export function createSettingsPanel({
   let activeId = '';
   let selectedId = '';
   let detail = null;
+  //: 扫描时因**目录名不合法**被跳过的目录（见 `refresh()` 里的说明）。
+  let invalidDirs = [];
   let busy = false;
   let notice = null;
   /**
@@ -638,6 +640,13 @@ export function createSettingsPanel({
     if (!data) return;
     pets = data.items || [];
     activeId = data.activePetId || '';
+    // 因**目录名不合法**被跳过的目录（后端 `_scan_dir` 收集）。
+    //
+    // 为什么要显示：目录名**就是形象 id**，而合法字符集是
+    // 「小写字母、数字、`.` `_` `-`，且以字母或数字开头」。
+    // 用户把目录命名成 `xiaoka-自定义` 这种（很自然的中文命名）时，
+    // 插件过去是**静默跳过**的——表现为「我明明放进去了，列表里却没有」。
+    invalidDirs = Array.isArray(data.invalidDirs) ? data.invalidDirs : [];
     if (data.limits) {
       limits = {
         scaleMin: Number(data.limits.scaleMin) || SCALE_MIN,
@@ -1135,6 +1144,14 @@ export function createSettingsPanel({
 
     // ---- 左栏：形象列表
     const list = el('div', 'pet-panel-list');
+    // 被跳过的目录**放在最上面**：这是「我明明放进去了却没有」的唯一解释，
+    // 埋在列表底部等于没说。
+    for (const skipped of invalidDirs) {
+      const box = el('div', 'pet-notice is-warn');
+      box.appendChild(el('div', 'pet-notice-title', `目录「${skipped.name}」被跳过`));
+      box.appendChild(el('div', 'pet-notice-body', skipped.hint || skipped.reason || ''));
+      list.appendChild(box);
+    }
     if (!pets.length) {
       list.appendChild(el('div', 'pet-empty', '还没有形象。点击「导入形象包」上传一个 .zip。'));
     }
@@ -1250,6 +1267,18 @@ export function createSettingsPanel({
     // 因此这里对**自建**形象给一个可编辑的输入框；对内置形象只显示
     // （内置形象是随插件发布的，作者固定为「官方」）。
     header.appendChild(renderAuthorRow());
+    // `pet.json` 的 `id` 与目录名不一致：**只提示、不拦**。
+    //
+    // 两者是同一个东西的两个来源，而**目录名**才是生效的那个
+    // （`_locate` / 帧 URL / 覆盖解析全按它）。用户复制内置形象时很容易
+    // 只改 `pet.json` 的 id（「我改了 id，还是不行」），于是列表里的 id
+    // 与文件里写的对不上，排查时极其困惑。
+    if (detail.idMismatch) {
+      const box = el('div', 'pet-notice is-warn');
+      box.appendChild(el('div', 'pet-notice-title', 'pet.json 里的 id 与目录名不一致'));
+      box.appendChild(el('div', 'pet-notice-body', detail.idMismatch.hint));
+      header.appendChild(box);
+    }
     if (detail.size) {
       header.appendChild(el(
         'div',
