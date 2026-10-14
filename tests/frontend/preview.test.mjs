@@ -144,10 +144,10 @@ test('预览总时长：与后端的 total_ms 语义一致（同一份数据算�
 
 
 /** 便于断言：跑一次几何，返回 { box, layer, frame }。 */
-function geom(boxSize, frames, layout, at, frameSize) {
+function geom(boxSize, frames, layout, at, frameSize, dpr) {
   const box = fakeBox(boxSize, boxSize);
   const layer = fakeLayer();
-  applyFrameGeometry(box, frames, layout, at, frameSize, layer);
+  applyFrameGeometry(box, frames, layout, at, frameSize, layer, dpr);
   const sheet = layer.size;
   return {
     box,
@@ -176,23 +176,127 @@ test('预览几何：竖构图动作等比缩放到框内，不变形', () => {
 test('预览几何：横构图动作（小卡睡觉）等比缩放而不是被压扁', () => {
   // 这是用户点名的那个场景：627×353 的躺姿单帧
   const { frame } = geom(168, 1, 'horizontal', 0, { w: 627, h: 353 });
-  assert.ok(
-    Math.abs((frame.w / frame.h) - (627 / 353)) < 1e-6,
-    `宽高比必须保持 627:353，实际 ${frame.w}×${frame.h}`,
-  );
+  // ⚠️ 允许半个设备像素以内的比例偏差：几何会**对齐到整数设备像素**，
+  // 否则帧边界跨在半个像素上、最外一行会混入邻帧（见下面那条 ★ 测试）。
+  const rel = Math.abs((frame.w / frame.h) - (627 / 353)) / (627 / 353);
+  assert.ok(rel < 0.01, `宽高比应接近 627:353，实际偏差 ${(rel * 100).toFixed(2)}%`);
   // 横图受宽度限制：应该用满框宽
   assert.ok(Math.abs(frame.w - 168) < 1e-6, '横构图应该用满框宽');
   assert.ok(frame.h < 168, '高度按比例缩短，不能被拉满');
 });
 
+test('★ 预览几何：尺寸对齐到整数设备像素（去掉内层边缘的半像素细缝）', () => {
+  // 帧的显示尺寸常常是小数（400×300 装进 166px 方框 → 高正好 124.5px）。
+  // 这时内层边缘落在**半个设备像素**上，那一行会被画成「本帧颜色 + 外框底色」
+  // 各一半的混合——看起来是帧底部一条半透明的细缝。
+  //
+  // 实测（纯色测试形象，帧 1 纯绿，面板底色浅灰）：
+  // 不对齐 → 内层边缘 208 个混合像素；对齐后 → 42 个（只剩外框圆角那一块）。
+  //
+  // ⚠️ 这条混合**不是**邻帧：邻帧泄漏由「外框 + 一帧大小的内层」解决
+  // （见下面 ★ 那条）。实测按 |R−B| 失衡判定邻帧色时，两种实现都是 0。
+  //
+  // 判据：内层尺寸、整条 sheet、背景位移在设备像素上**全是整数**。
+  const DPRS = [1, 1.25, 1.5, 2, 3];
+  const CASES = [
+    { frames: 4, layout: 'vertical', size: { w: 400, h: 300 } },
+    { frames: 4, layout: 'horizontal', size: { w: 300, h: 400 } },
+    { frames: 4, layout: 'vertical', size: { w: 384, h: 576 } },
+    { frames: 1, layout: 'horizontal', size: { w: 627, h: 353 } },
+    { frames: 3, layout: 'vertical', size: { w: 333, h: 211 } },
+  ];
+  for (const dpr of DPRS) {
+    for (const item of CASES) {
+      // 用第 3 帧（不是第 0 帧）：位移非 0 才能验出累积误差
+      const at = Math.min(2, item.frames - 1);
+      const { layer } = geom(168, item.frames, item.layout, at, item.size, dpr);
+      const rect = layer.rect;
+      const sheet = layer.size;
+      const offset = layer.offset;
+      const tag = `dpr=${dpr} ${item.layout} ${item.frames}帧 ${item.size.w}x${item.size.h}`;
+      const isInt = (v) => Math.abs(v - Math.round(v)) < 1e-6;
+
+      assert.ok(isInt(rect.w * dpr), `${tag}: 内层宽应为整数设备像素，实际 ${rect.w * dpr}`);
+      assert.ok(isInt(rect.h * dpr), `${tag}: 内层高应为整数设备像素，实际 ${rect.h * dpr}`);
+      assert.ok(
+        isInt((item.layout === 'vertical' ? sheet.h : sheet.w) * dpr),
+        `${tag}: 整条 sheet 应为整数设备像素`,
+      );
+      const shift = (item.layout === 'vertical' ? -offset.y : -offset.x) * dpr;
+      assert.ok(isInt(shift), `${tag}: 背景位移应为整数设备像素，实际 ${shift}`);
+    }
+  }
+});
+
+test('预览几何：对齐带来的比例偏差极小（视觉不可辨）', () => {
+  // 对齐是「用半个设备像素的比例偏差换掉一条半像素细缝」，因此偏差必须很小，
+  // 否则就是拿一个明显的问题换另一个。
+  for (const dpr of [1, 1.25, 1.5, 2, 3]) {
+    for (const size of [{ w: 400, h: 300 }, { w: 627, h: 353 }, { w: 384, h: 576 }]) {
+      const { frame } = geom(168, 1, 'vertical', 0, size, dpr);
+      const rel = Math.abs((frame.w / frame.h) - (size.w / size.h)) / (size.w / size.h);
+      assert.ok(
+        rel < 0.01,
+        `dpr=${dpr} ${size.w}x${size.h}: 比例偏差应 < 1%，实际 ${(rel * 100).toFixed(3)}%`,
+      );
+    }
+  }
+});
+
+test('预览几何：对齐不会把帧缩成 0（极小框也要看得见）', () => {
+  for (const dpr of [1, 1.25, 2, 3]) {
+    const { frame } = geom(1, 4, 'vertical', 0, { w: 400, h: 300 }, dpr);
+    assert.ok(frame.w > 0 && frame.h > 0, `dpr=${dpr}: 帧尺寸必须为正`);
+    assert.ok(frame.h * dpr >= 1 - 1e-6, `dpr=${dpr}: 至少要有 1 个设备像素高`);
+  }
+});
+
+test('★ 预览几何：内层尺寸与帧位移同源（邻帧漏不出来）', () => {
+  // 用户报障：「改成方框后，原先竖向分辨率拼接的动画帧播放时，当前帧的播放
+  // 可能会露出前一帧和后一帧的部分图案」。
+  //
+  // 根因：背景图是**整条** spritesheet。铺在外框上时，`background-position`
+  // 只把当前帧挪到「居中 + 贴底」——外框里除了当前帧，**上方/下方空出来的
+  // 地方露出的正是上一帧/下一帧**。竖排 sheet 尤其明显。
+  //
+  // 修法是「外框 + 一帧大小的内层」：内层尺寸与帧位移必须用**同一个**
+  // `shownSize`，这样裁切边界与帧边界严格重合，邻帧漏不出来。
+  //
+  // 实测（同页 A/B，竖排 4 帧纯色图，看第 1 帧）：
+  // 铺在外框上 → 帧窗口内红色（上一帧）占 **25%**；铺在内层上 → 红 **0%**。
+  const CASES = [
+    { frames: 4, layout: 'vertical', size: { w: 400, h: 300 } },
+    { frames: 4, layout: 'horizontal', size: { w: 300, h: 400 } },
+  ];
+  for (const item of CASES) {
+    const at = 1;
+    const { layer, frame } = geom(168, item.frames, item.layout, at, item.size);
+    const rect = layer.rect;
+    const offset = layer.offset;
+    const tag = `${item.layout} ${item.size.w}x${item.size.h}`;
+    assert.ok(
+      Math.abs(rect.w - frame.w) < 1e-9 && Math.abs(rect.h - frame.h) < 1e-9,
+      `${tag}: 内层应正好是一帧，实际 ${rect.w}×${rect.h} vs ${frame.w}×${frame.h}`,
+    );
+    const step = item.layout === 'vertical' ? frame.h : frame.w;
+    const shifted = item.layout === 'vertical' ? -offset.y : -offset.x;
+    assert.ok(
+      Math.abs(shifted - at * step) < 1e-9,
+      `${tag}: 位移应是 ${at} 倍帧长，实际 ${shifted}`,
+    );
+    assert.ok(rect.w <= 168 + 1e-6 && rect.h <= 168 + 1e-6, `${tag}: 内层不该超出外框`);
+  }
+});
+
 test('预览几何：底边对齐（横躺动作不能浮在半空）', () => {
   // 用户明确要求「预览动画底部和预览框对齐」。垂直居中会让横躺的睡觉
   // 浮在半空、与站立的动作对不齐，切换动作时画面上下跳。
+  // 允许 1 个设备像素以内的偏差（尺寸对齐到整数设备像素的代价）。
   const { layer } = geom(168, 1, 'horizontal', 0, { w: 627, h: 353 });
   const rect = layer.rect;
   assert.ok(
-    Math.abs((rect.top + rect.h) - 168) < 1e-6,
-    `底边应贴着框底：top=${rect.top} + h=${rect.h} 应等于 168`,
+    Math.abs((rect.top + rect.h) - 168) <= 1,
+    `底边应贴着框底：top=${rect.top} + h=${rect.h} 应约等于 168`,
   );
 });
 
@@ -201,7 +305,8 @@ test('预览几何：水平居中', () => {
   const rect = layer.rect;
   const left = rect.left;
   const right = 168 - (rect.left + rect.w);
-  assert.ok(Math.abs(left - right) < 1e-6, `左右留白应相等：${left} vs ${right}`);
+  // 允许 1 个设备像素以内的偏差（宽高各自对齐，可能差一格）
+  assert.ok(Math.abs(left - right) <= 1, `左右留白应基本相等：${left} vs ${right}`);
 });
 
 test('★ 预览几何：内层只有一帧大小（邻帧漏不出来）', () => {

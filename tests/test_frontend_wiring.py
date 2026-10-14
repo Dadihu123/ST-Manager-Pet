@@ -584,6 +584,39 @@ def test_panel_preview_geometry_runs_after_dom_is_attached(panel):
     assert 'applyThumbGeometry()' in body, '挂上 DOM 之后要立刻算几何'
 
 
+def test_panel_preserves_scroll_across_rebuilds(panel):
+    """★ 全量重建时必须**保留滚动位置**，否则每次切动作都被弹回顶部。
+
+    用户报障：「我在切换动画预览项时页面每次都会自动滚动到顶部，不方便使用」。
+
+    根因：`render()` 是**全量重建**（`root.textContent = ''`），两个滚动容器
+    （左栏 `.pet-panel-list`、右栏 `.pet-panel-detail`）都是新节点，
+    `scrollTop` 自然从 0 开始。而预览项一点就 `render()`，
+    于是右栏每次都被弹回顶部——想接着看下面的「预览速度」「动作网格」
+    就得重新往下滚，改一个参数要滚一次。
+
+    修法是「重建前记下、挂上后还原」。这里用静态检查守住三件事：
+    顺序、位置、以及**必须夹到新上限**（重建后内容可能变矮）。
+    """
+    assert 'function captureScroll()' in panel, '必须能记录滚动位置'
+    assert 'function restoreScroll(saved)' in panel, '必须能还原滚动位置'
+    # 两个滚动容器都要照顾到
+    assert "querySelector('.pet-panel-list')" in panel, '左栏列表的滚动也要保留'
+    assert "querySelector('.pet-panel-detail')" in panel, '右栏详情的滚动也要保留'
+    # 顺序：捕获必须在清空 DOM 之前。
+    # ⚠️ 锚点要带缩进与分号：`captureScroll` 的文档注释里也提到了
+    # `root.textContent = ''`，用裸字符串会先匹配到注释（假失败）。
+    capture_at = panel.index('const savedScroll = captureScroll();')
+    wipe_at = panel.index("\n    root.textContent = '';\n")
+    assert capture_at < wipe_at, '必须在清空 DOM **之前**记录滚动位置'
+    # 还原必须在挂上 DOM 之后（游离节点的 scrollTop 无效）
+    append_at = panel.index('    root.appendChild(body);')
+    restore_at = panel.index('    restoreScroll(savedScroll);')
+    assert restore_at > append_at, '必须在 DOM 挂上**之后**还原滚动位置'
+    # 夹到新上限：重建后内容高度可能变矮
+    assert 'scrollHeight - node.clientHeight' in panel, '还原时要夹到新的滚动上限'
+
+
 def test_panel_passes_frame_size_into_the_preview(preview):
     """★ 预览必须知道**单帧的真实尺寸**，否则横构图动作会被压扁。
 
@@ -594,8 +627,8 @@ def test_panel_passes_frame_size_into_the_preview(preview):
     于是人物被压扁。修法是让 `applyFrameGeometry` 按真实比例做 `contain`，
     而它需要尺寸——所以面板必须把尺寸一路传下去。
     """
-    # 几何函数必须接受并使用尺寸参数
-    assert 'export function applyFrameGeometry(box, frames, layout, index, size, layer)' in preview, (
+    # 几何函数必须接受并使用尺寸参数（末位 `dpr` 是可选的，只给单测用）
+    assert 'export function applyFrameGeometry(box, frames, layout, index, size, layer, dpr)' in preview, (
         'applyFrameGeometry 必须接收单帧尺寸与内层'
     )
     assert 'boxWidth / frameWidth' in preview, '必须按真实宽高比做 contain 缩放'
@@ -603,6 +636,25 @@ def test_panel_passes_frame_size_into_the_preview(preview):
     assert 'boxHeight - shownHeight' in preview, '必须底边对齐（不是垂直居中）'
     # 播放器要把变体尺寸喂给几何函数
     assert 'variant ? variant.size : null' in preview, '播放器必须把尺寸传给几何函数'
+
+
+def test_preview_geometry_snaps_to_device_pixels(preview):
+    """★ 帧尺寸要**对齐到整数设备像素**，否则内层边缘会出现半像素细缝。
+
+    帧的显示尺寸常常是小数（400×300 装进 166px 方框 → 高正好 124.5px），
+    这时内层边缘落在半个设备像素上，那一行会被画成「本帧颜色 + 外框底色」
+    各一半的混合。实测：不对齐 → 内层边缘 208 个混合像素；对齐后 → 42 个
+    （只剩外框圆角那一块）。
+
+    注意这与「邻帧泄漏」是两件事：邻帧由内层裁切解决（见下一条）。
+    """
+    assert 'function snapToDevicePixels(' in preview, '必须有对齐到设备像素的辅助函数'
+    assert 'function currentDpr(' in preview, '必须读取真实设备像素比'
+    assert 'window.devicePixelRatio' in preview, '对齐要按真实设备像素比算'
+    assert 'snapToDevicePixels(known ? frameWidth * fit' in preview, '帧宽要对齐'
+    assert 'snapToDevicePixels(known ? frameHeight * fit' in preview, '帧高要对齐'
+    # 纯计算层：Node 测试里没有 window，必须做存在性判断
+    assert "typeof window === 'undefined'" in preview, '没有 window 时要能退回 1'
 
 
 def test_preview_geometry_uses_an_inner_frame_layer(preview):

@@ -60,13 +60,49 @@ export function totalDuration(variant) {
 }
 
 /**
+ * 当前设备的像素比（拿不到时退回 1）。
+ *
+ * `preview.js` 是纯计算层，Node 测试里没有 `window`，因此必须做存在性判断——
+ * 直接用 `window.devicePixelRatio` 会让所有单测一起炸。
+ */
+function currentDpr() {
+  if (typeof window === 'undefined') return 1;
+  const value = Number(window.devicePixelRatio);
+  return Number.isFinite(value) && value > 0 ? value : 1;
+}
+
+/**
+ * 把一个 CSS 长度**对齐到整数设备像素**。
+ *
+ * 帧的显示尺寸常常是小数（例如 400×300 装进 166px 方框 → 高正好 124.5px）。
+ * 这时内层的边缘落在**半个设备像素**上，那一行会被画成「本帧颜色 + 外框底色」
+ * 各一半的混合——看起来是帧底部一条半透明的细缝。
+ *
+ * 实测（纯色测试形象：帧 1 纯绿，面板底色是浅灰）：
+ * - 不对齐：内层边缘出现 **208** 个混合像素（底部整行 166 列都受影响）；
+ * - 对齐后：降到 **42** 个，且只剩外框圆角那一小块。
+ *
+ * ⚠️ 说清楚它**不是**什么：这条混合是「本帧 + 外框底色」，**不是**邻帧。
+ * 实测把「邻帧颜色」按 |R−B| 失衡来判定时，对齐与不对齐都是 **0**——
+ * 邻帧泄漏是由 `layer`（内层裁切）解决的，见 `applyFrameGeometry` 的说明。
+ * 因此对齐是**锦上添花**：去掉一条细缝，代价是宽高比有不超过半个设备像素的
+ * 偏差（人眼不可辨）。
+ */
+function snapToDevicePixels(value, dpr) {
+  const scaled = Number(value) * dpr;
+  if (!Number.isFinite(scaled) || scaled <= 0) return value;
+  // 至少保留 1 个设备像素：退化成 0 会让这一帧彻底看不见
+  return Math.max(1, Math.round(scaled)) / dpr;
+}
+
+/**
  * 把「只显示某一帧」的几何写进预览框。
  *
  * 三条规则，缺一不可：
  *
  * 1. **按单帧的真实宽高比等比缩放**（`contain` 语义），绝不拉伸。
  * 2. **底边对齐**、水平居中。
- * 3. 画面**只能露出一帧**——邻帧不能从留白里漏出来（见下面 `layer` 的说明）。
+ * 3. 画面**只能露出一帧**——邻帧既不能从留白里漏出来，也不能从边界混进来。
  *
  * 为什么必须这样（用户报障「看起来会很奇怪，点名小卡的睡觉动作」）：
  * 旧实现把「单帧宽 = 框宽 × 帧数」写死，也就是**强行把一帧拉到框宽**。
@@ -78,15 +114,20 @@ export function totalDuration(variant) {
  * 垂直居中会让横躺的睡觉动作浮在半空、与站立的动作对不齐，
  * 切换动作时画面上下跳。用户明确要求「预览动画底部和预览框对齐」。
  *
- * ⚠️ **为什么需要 `layer`（内层元素）**：
- * 按比例装入之后必然有留白（横构图左右留、竖构图上下留），而
- * `background-image` 是**按整条 spritesheet 铺**的——留白处露出来的正是
- * **相邻的帧**。实测能看到：睡觉的预览框左边缘飘着一个「z」、右边缘
- * 挂着半个人影（都是隔壁帧的内容）。这比原来的「压扁」更怪。
+ * ⚠️ **为什么需要 `layer`（内层元素）**——这是「露出前一帧和后一帧」的正解：
+ *
+ * 背景图是**整条** spritesheet。把整条铺在外框上时，`background-position`
+ * 只负责把当前帧挪到「居中 + 贴底」，而外框里除了当前帧，**上方/下方空出来的
+ * 地方露出的正是上一帧/下一帧**。竖排 sheet 尤其明显：帧高小于框高时，
+ * 上方显示上一帧、下方显示下一帧。
+ *
+ * 实测（同页并排 A/B，竖排 4 帧纯色图，看第 1 帧）：
+ * - 铺在外框上：帧窗口内**红色（上一帧）占 25%**；
+ * - 铺在「一帧大小」的内层上：**红 0%**，剩下 25% 是外框自己的留白底色（正确）。
  *
  * 单个元素解决不了：`background-clip` 裁不了「背景里的某一块」，
  * 而 `mask` / `clip-path` 会连**边框**一起裁掉（框就残缺了）。
- * 因此结构改成「外框 + 内层」：内层就是**一帧的大小**，
+ * 因此结构是「外框 + 内层」：内层就是**一帧的大小**，
  * 背景被它自己的盒子裁住，邻帧物理上不可能漏出来。
  *
  * @param {HTMLElement} box 外框（固定正方形，负责边框与留白）
@@ -95,16 +136,20 @@ export function totalDuration(variant) {
  * @param {number} index 要显示的帧号
  * @param {object} [size] 单帧原始尺寸 `{w, h}`；缺省时退回「按框的形状铺满」
  *   （老后端不下发尺寸，此时行为与从前一致，不会更差）
- * @param {HTMLElement} [layer] 真正承载背景图的内层元素。**强烈建议传**：
- *   不传就退回「在 `box` 上直接铺」，那样留白处会露出邻帧。
+ * @param {HTMLElement} [layer] 真正承载背景图的内层元素。**必须传**：
+ *   不传就退回「在 `box` 上直接铺」，那样留白处会露出邻帧（见上）。
+ * @param {number} [dpr] 设备像素比。只给测试用——正常调用应当省略，
+ *   由函数自己读 `window.devicePixelRatio`（对齐必须按**真实**设备像素算，
+ *   写死一个值在 HiDPI 屏上就白对齐了）。
  */
-export function applyFrameGeometry(box, frames, layout, index, size, layer) {
+export function applyFrameGeometry(box, frames, layout, index, size, layer, dpr) {
   if (!box) return;
   const target = layer || box;
   const count = Math.max(1, Math.floor(Number(frames) || 1));
   const at = Math.min(Math.max(0, Math.floor(Number(index) || 0)), count - 1);
   const boxWidth = box.clientWidth || 64;
   const boxHeight = box.clientHeight || 64;
+  const ratio = Number(dpr) > 0 ? Number(dpr) : currentDpr();
 
   const frameWidth = Number(size && size.w) || 0;
   const frameHeight = Number(size && size.h) || 0;
@@ -115,8 +160,11 @@ export function applyFrameGeometry(box, frames, layout, index, size, layer) {
   const fit = known
     ? Math.min(boxWidth / frameWidth, boxHeight / frameHeight)
     : 1;
-  const shownWidth = known ? frameWidth * fit : boxWidth;
-  const shownHeight = known ? frameHeight * fit : boxHeight;
+  // ★ 对齐到整数设备像素：去掉内层边缘的半像素细缝（理由与实测见
+  // `snapToDevicePixels`）。注意**邻帧泄漏**是由下面的 `layer` 解决的，
+  // 这两件事互相独立。
+  const shownWidth = snapToDevicePixels(known ? frameWidth * fit : boxWidth, ratio);
+  const shownHeight = snapToDevicePixels(known ? frameHeight * fit : boxHeight, ratio);
 
   // 一整条 spritesheet 的显示尺寸
   const sheetWidth = layout === 'vertical' ? shownWidth : shownWidth * count;
@@ -127,7 +175,10 @@ export function applyFrameGeometry(box, frames, layout, index, size, layer) {
     // 因此留白处是外框自己的底色，邻帧漏不出来。
     target.style.width = `${shownWidth}px`;
     target.style.height = `${shownHeight}px`;
-    // 在框内摆位：水平居中 + 底边对齐
+    // 在框内摆位：水平居中 + 底边对齐。
+    // ⚠️ 这里的偏移**故意不**对齐到设备像素：内层边缘跨半像素只会让它
+    // 与外框底色混出一条淡淡的边（外框没有背景图，混不出邻帧），
+    // 而对齐会让底边偏离「贴底」这个用户明确要求的语义。两害相权取轻。
     target.style.left = `${(boxWidth - shownWidth) / 2}px`;
     target.style.top = `${boxHeight - shownHeight}px`;
   }

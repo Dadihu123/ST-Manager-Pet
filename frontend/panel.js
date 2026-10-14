@@ -989,8 +989,53 @@ export function createSettingsPanel({
 
   // ---------------------------------------------------------------- 渲染
 
+  /**
+   * 记住 / 还原两个滚动容器的位置。
+   *
+   * 为什么需要：`render()` 是**全量重建**（`root.textContent = ''`），
+   * 于是两个滚动容器（左栏列表 `.pet-panel-list`、右栏详情
+   * `.pet-panel-detail`）都是**新节点**，`scrollTop` 自然从 0 开始。
+   *
+   * 用户报障：「切换动画预览项时页面每次都会自动滚动到顶部，不方便使用」。
+   * 预览项一点就 `render()`，于是右栏每次都被弹回顶部——想接着看下面的
+   * 「预览速度」「动作网格」就得重新往下滚，改一个参数要滚一次。
+   *
+   * 为什么不能改成「只重渲染变化的部分」：面板里几乎所有交互（换图、改倍率、
+   * 改触发时间、切选中形象）都会改变右栏的结构，做增量更新要维护一整套
+   * diff 逻辑，而这块代码的复杂度已经很高了。**保留滚动位置**能用极小代价
+   * 拿到用户真正在意的那部分体验。
+   *
+   * ⚠️ 还原必须**在 DOM 挂上之后**（`scrollTop` 对游离节点无效），
+   * 而且要**夹到新的上限**——重建后内容高度可能变矮（例如从「新建表单」
+   * 切回详情），直接把旧值写回去会被浏览器夹掉，但显式夹一下更清楚。
+   */
+  function captureScroll() {
+    if (!root) return null;
+    const list = root.querySelector('.pet-panel-list');
+    const detail = root.querySelector('.pet-panel-detail');
+    if (!list && !detail) return null;
+    return {
+      list: list ? list.scrollTop : 0,
+      detail: detail ? detail.scrollTop : 0,
+    };
+  }
+
+  function restoreScroll(saved) {
+    if (!root || !saved) return;
+    const apply = (selector, value) => {
+      const node = root.querySelector(selector);
+      if (!node) return;
+      const max = Math.max(0, node.scrollHeight - node.clientHeight);
+      node.scrollTop = Math.min(Math.max(0, Number(value) || 0), max);
+    };
+    apply('.pet-panel-list', saved.list);
+    apply('.pet-panel-detail', saved.detail);
+  }
+
   function render() {
     if (!root || disposed) return;
+    // 重建之前先记下滚动位置，收尾时还原（见 `captureScroll` 的说明）
+    const savedScroll = captureScroll();
     // 重渲染会把预览框的 DOM 换掉，旧播放器必须停掉（否则它还在给已摘除的
     // 节点写 style，并留下一个永远跑着的定时器）
     if (player) {
@@ -1052,6 +1097,8 @@ export function createSettingsPanel({
     applyThumbGeometry();
     // 动画预览器同理：要在 DOM 挂上之后才知道预览框的真实宽度
     if (!creating) mountPreviewPlayer();
+    // 最后还原滚动位置：必须在 DOM 挂上之后（游离节点的 scrollTop 无效）
+    restoreScroll(savedScroll);
   }
 
   function renderPetCard(pet) {

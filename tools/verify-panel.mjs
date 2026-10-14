@@ -65,12 +65,17 @@ async function main() {
           id: card.dataset.petId,
           hasImage: Boolean(url),
           frames,
+          // 排布方向：vertical 的整条 sheet 是**竖**的，几何按高度放大
+          // （本段在模板字符串里，注释中不能用反引号。）
+          layout: box.dataset.layout === 'vertical' ? 'vertical' : 'horizontal',
           bgSize: cs.backgroundSize,
           bgPos: cs.backgroundPosition,
           // 用 clientWidth（内容盒）：JS 里算几何用的就是它。
           // 用 getBoundingClientRect 会算上 1px 边框，差 2px（假失败）。
           boxWidth: box.clientWidth,
+          boxHeight: box.clientHeight,
           expectedWidth: Math.round(box.clientWidth * frames),
+          expectedHeight: Math.round(box.clientHeight * frames),
         });
       }
       return out;
@@ -83,17 +88,29 @@ async function main() {
       JSON.stringify(thumbs),
     );
 
-    // 多帧卡片的几何必须按「框宽 × 帧数」放大（否则只会露出最左边的透明边）
+    // 多帧卡片的几何必须按「框尺寸 × 帧数」放大（否则只会露出最左边/最上边的透明边）。
+    //
+    // ⚠️ 必须**分排布方向**判断：`horizontal` 放大的是宽度、对齐是
+    // 「左对齐 + 顶部对齐」（`0% 0%`）；`vertical` 放大的是高度、
+    // 对齐是「水平居中 + 顶部对齐」（计算值 `50% 0%`）。
+    // 早先这里只按 `0%` 开头判，把竖排形象误判成失败——是**判据**的漏洞，
+    // 不是几何的错（竖排形象是合法输入，`layout` 是包级字段）。
     const geometryOk = thumbs.filter((item) => item.frames > 1).every((item) => {
+      if (item.layout === 'vertical') {
+        const height = parseFloat(item.bgSize.split(/\s+/)[1]);
+        return Number.isFinite(height)
+          && Math.abs(height - item.expectedHeight) <= 2
+          && item.bgPos.startsWith('50%');
+      }
       const width = parseFloat(item.bgSize);
       return Number.isFinite(width)
         && Math.abs(width - item.expectedWidth) <= 2
-        && item.bgPos.startsWith('0%') ;
+        && item.bgPos.startsWith('0%');
     });
     record(
-      '② 多帧缩略图按「框宽 × 帧数」放大且左对齐（不再只剩透明边）',
+      '② 多帧缩略图按「框尺寸 × 帧数」放大且贴边对齐（不再只剩透明边）',
       geometryOk,
-      thumbs.map((i) => `${i.id}: ${i.bgSize} @ ${i.bgPos} (frames=${i.frames})`).join('；'),
+      thumbs.map((i) => `${i.id}(${i.layout}): ${i.bgSize} @ ${i.bgPos} (frames=${i.frames})`).join('；'),
     );
 
     // 真实像素：截图缩略图区域，确认**不是**整片空白
@@ -106,21 +123,32 @@ async function main() {
         const cs = getComputedStyle(box);
         const url = cs.backgroundImage.replace(/^url\\(["']?/, '').replace(/["']?\\)$/, '');
         if (!url) { out.push({ id: card.dataset.petId, ink: 0, error: 'no url' }); continue; }
-        // 把「按几何算出的那一帧」画到 canvas 上，数非透明像素
+        // 把「按几何算出的那一帧」画到 canvas 上，数非透明像素。
+        // ⚠️ 同样要分排布方向：竖排 sheet 的帧是**上下**切的，
+        // 按 width/frames 取会拿到「整条高、1/4 宽」的区域，全是空的。
+        // （本段在模板字符串里，注释中不能用反引号。）
         const frames = Number(box.dataset.frames) || 1;
+        const vertical = box.dataset.layout === 'vertical';
         const blob = await (await fetch(url, { cache: 'no-store' })).blob();
         const bmp = await createImageBitmap(blob);
-        const frameW = Math.round(bmp.width / frames);
+        const frameW = vertical ? bmp.width : Math.round(bmp.width / frames);
+        const frameH = vertical ? Math.round(bmp.height / frames) : bmp.height;
         const canvas = document.createElement('canvas');
-        canvas.width = frameW; canvas.height = bmp.height;
+        canvas.width = frameW; canvas.height = frameH;
         const ctx = canvas.getContext('2d');
-        ctx.drawImage(bmp, 0, 0, frameW, bmp.height, 0, 0, frameW, bmp.height);
-        const data = ctx.getImageData(0, 0, frameW, bmp.height).data;
+        ctx.drawImage(bmp, 0, 0, frameW, frameH, 0, 0, frameW, frameH);
+        const data = ctx.getImageData(0, 0, frameW, frameH).data;
         let ink = 0;
         for (let at = 3; at < data.length; at += 4 * 97) {
           if (data[at] > 16) ink += 1;
         }
-        out.push({ id: card.dataset.petId, frameW, ink, total: Math.ceil(data.length / (4 * 97)) });
+        out.push({
+          id: card.dataset.petId,
+          frameW,
+          frameH,
+          ink,
+          total: Math.ceil(data.length / (4 * 97)),
+        });
       }
       return out;
     })()`);
