@@ -16,6 +16,138 @@ import path from 'node:path';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** 我们创建的 profile 目录前缀（用于启动时清扫上一次的残留）。 */
+const PROFILE_PREFIX = 'pet-cdp-';
+
+/**
+ * **所有活着的浏览器实例**，供进程退出时统一回收。
+ *
+ * 为什么必须有这个：`close()` 只在脚本正常走到那一步时才被调用。
+ * 验收脚本一旦在中途抛错（断言失败、超时、`page.evaluate` 里的异常），
+ * 后面的 `b.close()` 就不会执行，那个 profile 目录（含整个 Chrome
+ * 用户数据，几十 MB）就永远留在临时目录里。
+ *
+ * 实测后果：反复跑 14 个验收套件时，残留目录把 **C 盘撑爆**
+ * （`ENOSPC: no space left on device`），连 pytest 都写不出结果文件。
+ */
+const liveSessions = new Set();
+let cleanupRegistered = false;
+
+/** 把「进程无论怎么退出都回收 profile」挂上（只挂一次）。 */
+function registerCleanup() {
+  if (cleanupRegistered) return;
+  cleanupRegistered = true;
+
+  const sweep = () => {
+    for (const session of liveSessions) session.killNow();
+    liveSessions.clear();
+  };
+
+  // 正常退出
+  process.on('exit', sweep);
+  // Ctrl-C / 被 kill
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {
+    process.on(signal, () => {
+      sweep();
+      process.exit(1);
+    });
+  }
+  // ★ 抛错退出——这是**最主要**的泄漏路径（断言失败就走到这里）
+  process.on('uncaughtException', (error) => {
+    sweep();
+    process.stderr.write(`${error && error.stack ? error.stack : error}\n`);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    sweep();
+    process.stderr.write(`${reason && reason.stack ? reason.stack : reason}\n`);
+    process.exit(1);
+  });
+}
+
+/**
+ * 进程是否还活着（用来判断某个 profile 是不是残留）。
+ *
+ * `process.kill(pid, 0)` 不发信号，只做权限/存在性检查——
+ * 这是判断 pid 存活的标准手法，Windows 上也管用。
+ */
+function isAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM = 进程存在但不属于我们（仍然算活着）
+    return error && error.code === 'EPERM';
+  }
+}
+
+/**
+ * 清扫**上一次**运行留下的 profile 目录。
+ *
+ * 三条判据，任一条成立就删：
+ *
+ * 1. `owner.json` 里的 pid **已经不在了** —— 正常退出、抛错退出、
+ *    被 Ctrl-C 都走这条（最可靠的一条）；
+ * 2. 没有 `owner.json`（老版本留下的）且目录**超过 2 小时**没动过；
+ * 3. 目录**超过 6 小时**没动过 —— 兜底。
+ *
+ * 第 3 条是为了「进程还活着但脚本卡住了」这种情况：那时 pid 是活的，
+ * 前两条都不成立，但目录其实已经没人用了。有这条上限，
+ * 磁盘占用就**一定有界**，不会再出现把 C 盘撑爆那种事。
+ *
+ * 判据用 pid 而不是「按时间猜」是因为同一台机器上可能同时跑着两个验收
+ * （不同的 pid），按时间清扫会把别人正在用的目录删掉。
+ */
+function sweepStaleProfiles() {
+  const tmp = os.tmpdir();
+  let entries = [];
+  try {
+    entries = fs.readdirSync(tmp, { withFileTypes: true });
+  } catch {
+    return; // 临时目录读不了就算了，不该因此让验收失败
+  }
+  const staleCutoff = Date.now() - 2 * 60 * 60 * 1000;
+  const hardCutoff = Date.now() - 6 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(PROFILE_PREFIX)) continue;
+    const dir = path.join(tmp, entry.name);
+    let age = Infinity;
+    try {
+      age = fs.statSync(dir).mtimeMs;
+    } catch {
+      continue; // 刚被别的进程删掉了
+    }
+    let stale = age < hardCutoff;
+    if (!stale) {
+      try {
+        const owner = JSON.parse(fs.readFileSync(path.join(dir, 'owner.json'), 'utf8'));
+        stale = !isAlive(Number(owner && owner.pid));
+      } catch {
+        // 没有 owner.json（老版本留下的）或内容坏了 → 按时间判断
+        stale = age < staleCutoff;
+      }
+    }
+    if (!stale) continue;
+    // Windows 上删不掉通常是 Chrome 还没退干净；重试几次再放弃
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+        removed += 1;
+        break;
+      } catch {
+        // 同步重试之间不能 await，用忙等换时间（这里只发生在清扫残留时）
+        const until = Date.now() + 150;
+        while (Date.now() < until) { /* 等 Chrome 放开文件句柄 */ }
+      }
+    }
+  }
+  if (removed) {
+    process.stderr.write(`[cdp] 清扫了 ${removed} 个上次残留的浏览器 profile\n`);
+  }
+}
+
 /** 在常见安装位置里找浏览器可执行文件。 */
 export function findBrowser() {
   const candidates = [
@@ -46,8 +178,21 @@ export function findBrowser() {
  * 因此这是验证「移动端不挂载」的开关。
  */
 export async function launch({ width = 1440, height = 900, headless = true, extraArgs = [] } = {}) {
+  registerCleanup();
+  sweepStaleProfiles();
+
   const executable = findBrowser();
-  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pet-cdp-'));
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), PROFILE_PREFIX));
+  // 记下 owner：下次启动时靠它判断这个目录是不是残留（见 `sweepStaleProfiles`）
+  try {
+    fs.writeFileSync(
+      path.join(userDataDir, 'owner.json'),
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+      'utf8',
+    );
+  } catch {
+    // 写不进去不影响本次运行（只是下次清扫时退化成按时间判断）
+  }
   const args = [
     `--user-data-dir=${userDataDir}`,
     `--window-size=${width},${height}`,
@@ -63,7 +208,9 @@ export async function launch({ width = 1440, height = 900, headless = true, extr
     'about:blank',
   ];
 
-  const child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  // ★ `stdio: 'ignore'` 而不是 `'pipe'`：我们**从不读**这两个流，
+  // 而管道会占着 Node 的事件循环、还要额外缓冲 Chrome 的输出。
+  const child = spawn(executable, args, { stdio: 'ignore' });
   // DevTools 端口写在 user-data-dir 的 DevToolsActivePort 里（第一行是端口）
   const portFile = path.join(userDataDir, 'DevToolsActivePort');
   let port = 0;
@@ -81,16 +228,38 @@ export async function launch({ width = 1440, height = 900, headless = true, extr
   }
   if (!port) {
     child.kill();
+    removeProfile(userDataDir);
     throw new Error('浏览器未在 10 秒内暴露 DevTools 端口');
   }
 
   const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
   const browser = new CdpSession(version.webSocketDebuggerUrl);
 
-  return {
+  let closed = false;
+  const session = {
     port,
     child,
     browser,
+    userDataDir,
+    /**
+     * **同步**杀掉浏览器进程，并尽力回收目录（供进程退出钩子用）。
+     *
+     * 为什么是「尽力」：退出钩子里删目录在 Windows 上经常失败——
+     * `child.kill()` 之后 Chrome 还没来得及放开文件句柄，`rmSync` 抛
+     * EBUSY/EPERM。这时**不能等**（钩子里没有异步的余地，也不能把
+     * 退出拖住几秒），因此删不掉就放弃，留给下次启动的
+     * `sweepStaleProfiles()` 按 pid 清扫——那时 Chrome 肯定退干净了。
+     *
+     * 为什么不干脆不删：`killNow` 之后立刻删其实**经常成功**
+     * （进程已经收到终止信号），试一下的成本只有一次 `rmSync`。
+     */
+    killNow() {
+      if (closed) return;
+      closed = true;
+      try { browser.close(); } catch { /* 已经断了 */ }
+      try { child.kill(); } catch { /* 已经退出 */ }
+      try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch { /* 交给下次清扫 */ }
+    },
     async newPage() {
       const target = await browser.send('Target.createTarget', { url: 'about:blank' });
       const page = new CdpSession(
@@ -98,12 +267,67 @@ export async function launch({ width = 1440, height = 900, headless = true, extr
       );
       return page;
     },
-    close() {
+    /**
+     * 关掉浏览器并**回收 profile 目录**。
+     *
+     * ★ 这里必须**等子进程真的退出**再删目录。
+     *
+     * 原来的写法是 `child.kill()` 之后**立刻** `rmSync()`——在 Windows 上
+     * 那一刻 Chrome 还握着目录里的文件句柄，`rmSync` 抛 EBUSY/EPERM，
+     * 而 `catch {}` 把它吞了。于是**每一次**验收都留下一个几十 MB 的
+     * profile，反复跑就把 C 盘撑爆（实测 `ENOSPC`）。
+     *
+     * 现在：等 `exit` 事件（最多 5 秒）→ 再删，并带重试。
+     */
+    async close() {
+      if (closed) return;
+      closed = true;
+      liveSessions.delete(session);
       try { browser.close(); } catch { /* 已经断了 */ }
+      await waitForExit(child, 5000);
       try { child.kill(); } catch { /* 已经退出 */ }
-      try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch { /* 尽力而为 */ }
+      removeProfile(userDataDir);
     },
   };
+  liveSessions.add(session);
+  return session;
+}
+
+/** 等子进程退出（最多 `timeoutMs`），已退出则立即返回。 */
+function waitForExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => {
+      child.removeListener('exit', done);
+      resolve();
+    }, timeoutMs);
+    child.once('exit', done);
+  });
+}
+
+/**
+ * 删掉 profile 目录，**带重试**。
+ *
+ * Windows 上删目录失败几乎总是「文件还被占着」，等一下就好——
+ * 因此重试而不是一次放弃。全部失败时给出提示（而不是静默吞掉），
+ * 这样再出现膨胀时能立刻看到原因。
+ */
+function removeProfile(dir, attempts = 5) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return true;
+    } catch {
+      const until = Date.now() + 120 * (attempt + 1);
+      while (Date.now() < until) { /* 同步重试之间用忙等换时间 */ }
+    }
+  }
+  process.stderr.write(
+    `[cdp] 无法删除浏览器 profile: ${dir}\n`
+    + '      下次启动时会自动清扫（按 owner.json 里的 pid 判断）\n',
+  );
+  return false;
 }
 
 /** 一条 CDP 连接（浏览器级或页面级）。 */

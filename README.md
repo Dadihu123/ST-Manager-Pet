@@ -1320,6 +1320,33 @@ node tools/verify-visibility.mjs # 关闭宠物（显示开关）：13 项
 影子宿主的做法：用 junction 复用宿主的 `core/` `static/` `templates/`，
 但 `data/` 是真实独立目录，因此**宿主仓库一个字节都不写**。
 
+#### profile 目录的回收（踩过的坑）
+
+`tools/cdp.mjs` 每次 `launch()` 都会 `mkdtempSync` 造一个新的 Chrome
+用户数据目录（`%TEMP%\pet-cdp-*`，几十 MB）。**这些目录必须回收**，
+否则反复跑验收会把磁盘吃光——实测跑到 `ENOSPC: no space left on device`，
+连 pytest 都写不出结果文件。
+
+原来的 `close()` 是 `child.kill()` 之后**立刻** `rmSync()`。在 Windows 上
+那一刻 Chrome 还握着目录里的文件句柄，`rmSync` 抛 EBUSY/EPERM，
+而 `catch {}` 把它吞了 —— 于是**每一次**验收都留下一个目录。
+
+现在的四道保障：
+
+| 保障 | 解决什么 |
+|---|---|
+| `close()` **等子进程退出**再删，并带重试 | 正常路径不留残留 |
+| `exit` / `uncaughtException` / `unhandledRejection` / `SIGINT` 钩子 | **断言失败**就抛错退出，那是主要的泄漏路径 |
+| 启动时 `sweepStaleProfiles()` 清扫 | 进程被硬杀（收不到钩子）的残留 |
+| 绝对时限兜底（6 小时） | 「进程活着但脚本卡住」那种 pid 仍存活的残留 |
+
+清扫按 `owner.json` 里的 **pid 是否存活**判断，而不是只按时间——
+同一台机器上并行跑两个验收时，按时间清扫会把对方正在用的目录删掉
+（表现为随机的、极难查的失败）。
+
+`tests/test_cdp_no_profile_leak.py` 钉住这四条，并逐个检查
+**每个 `tools/verify-*.mjs` 都把 `browser.close()` 包在 `finally` 里**。
+
 `verify-anim.mjs` / `verify-panel.mjs` / `verify-still.mjs` 是三条**只有真跑起来
 才看得出问题**的验收线：
 

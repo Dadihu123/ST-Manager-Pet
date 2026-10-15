@@ -68,6 +68,28 @@
 
 ### 修复
 
+**验收工具泄漏浏览器 profile，把磁盘吃光**
+
+- 现象：反复跑验收之后 `ENOSPC: no space left on device`，连 pytest 都
+  写不出结果文件；C 盘被 `%TEMP%\pet-cdp-*` 占满。
+- 根因：`tools/cdp.mjs` 的 `close()` 是 `child.kill()` 之后**立刻**
+  `rmSync()`。在 Windows 上那一刻 Chrome 还握着目录里的文件句柄，
+  `rmSync` 抛 EBUSY/EPERM，而 `catch {}` 把它吞了 —— 于是**每一次**
+  验收都留下一个几十 MB 的目录，而且完全没有提示。
+- 四道保障（缺一条就会重新膨胀）：
+  1. `close()` **等子进程退出**再删，并带重试；
+  2. `exit` / `uncaughtException` / `unhandledRejection` / `SIGINT`
+     钩子 —— **断言失败抛错**是主要的泄漏路径，那些脚本走不到 `close()`；
+  3. 启动时清扫上一次的残留（进程被硬杀时收不到钩子）；
+  4. **绝对时限兜底（6 小时）** —— 兜住「进程活着但脚本卡住」，
+     那种情况 pid 仍存活，前三条都盖不住，磁盘占用就没有上界。
+- 清扫按 `owner.json` 里的 **pid 是否存活**判断，而不是只按时间：
+  并行跑两个验收时，按时间清扫会把对方正在用的目录删掉。
+- 顺带把 `spawn` 的 `stdio` 从 `'pipe'` 改成 `'ignore'`：我们从不读那两个
+  流，而管道会额外缓冲 Chrome 的输出（写满后 Chrome 自己会卡住）。
+- `tests/test_cdp_no_profile_leak.py`（9 项）钉住这四条，并逐个检查
+  每个 `tools/verify-*.mjs` 都把 `browser.close()` 包在 `finally` 里。
+
 **自动漫游从不触发**（用户报障：「将漫游的时间调整到 200ms-300ms
 结果半天触发不了，闲置的倒是看起来正常」）
 
