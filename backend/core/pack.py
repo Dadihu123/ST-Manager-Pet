@@ -684,6 +684,9 @@ _MIN_FRAME_SIZE = 1
 #: 512×768，在高分屏上放大后不够清晰。上限本身仍要存在——它是解码炸弹防线
 #: 的一部分（真正的硬上限是 `imports.MAX_IMAGE_DIMENSION`）。
 _MAX_FRAME_SIZE = 1024
+#: 公开别名：`store` 层在「面板改单帧尺寸」时要用同一个上限
+#: （两处写死不同数字的话，面板能填的值会被后端拒绝）。
+MAX_FRAME_SIZE = _MAX_FRAME_SIZE
 
 
 @dataclass
@@ -1840,6 +1843,169 @@ def parse_schedule(raw_value) -> dict:
     「面板上设了能用，手写进包却报错」。
     """
     return _parse_schedule(raw_value)
+
+
+#: 面板能改的**每动作动画字段**，以及它们与 `pet.json` 字段名的对应。
+#:
+#: 为什么是白名单而不是「把提交的键都塞进去」：面板提交的键一旦被原样写进
+#: `pet.json`，一个拼错的键就会变成一个**永远不生效**的字段（包能读、
+#: 宠物能跑，只是那个设置没用）——那是本项目一直在避免的失败模式。
+ANIMATION_PATCH_FIELDS = (
+    'frames', 'fps', 'loop', 'frameMs',
+    'layout', 'cols', 'rows', 'weight', 'motion',
+)
+
+#: 面板能改的**形象级**字段。
+PET_PATCH_FIELDS = (
+    'name', 'author', 'scale', 'pixelated', 'animSpeed', 'autoRoam',
+    'anchor', 'physics', 'still', 'schedule',
+)
+
+
+def parse_animation_patch(action: str, patch: dict, *, frames_hint: int = 0) -> dict:
+    """校验并规范化一份**每动作动画**的补丁，返回可直接写进 `pet.json` 的片段。
+
+    为什么要单独一个入口：面板改的是 `pet.json` 里**动作对象**的若干字段
+    （`fps` / `frameMs` / `loop` / 排布 / 权重 / `motion`），而那个对象
+    在包里有三种合法写法（字符串、单套对象、`variants` 数组）。补丁必须
+    **就地合并**到正确的那一层，且合并之后整份 `pet.json` 仍然能被
+    `loads_pack` 读出来。
+
+    这里只做**字段级**校验（类型 / 区间 / 互斥），整体校验交给调用方
+    在写盘前用 `loads_pack` 跑一遍——那样「面板写得进去、包读不出来」
+    这种最坏的情况不会发生。
+
+    Args:
+        action: 动作名（只用于报错信息与 `motion` 的帧号校验）。
+        patch: `{字段名: 值}`。`None` 表示**删除**该字段（回落到默认值）。
+        frames_hint: 这个动作当前的帧数，用于校验 `frameMs` 长度与
+            `motion.blink.frames` 的帧号。
+
+    Returns:
+        dict: 规范化后的片段（值为 `None` 的键表示「删除」）。
+    """
+    if not isinstance(patch, dict):
+        raise _field_error(f'animations.{action}', '补丁应为对象')
+
+    result = {}
+    for key, value in patch.items():
+        if key not in ANIMATION_PATCH_FIELDS:
+            # 明确报错而不是静默忽略：静默忽略会让面板看起来「改上了」，
+            # 而包里的值其实没变。
+            raise _field_error(
+                f'animations.{action}.{key}',
+                '不是可修改的动画字段',
+                hint=f'能改的是 {"、".join(ANIMATION_PATCH_FIELDS)}。',
+            )
+
+        if value is None:
+            result[key] = None
+            continue
+
+        if key == 'frames':
+            result[key] = _read_positive_int(
+                {'frames': value}, 'frames', 1, low=1, high=MAX_FRAMES,
+                where=f'animations.{action}.frames',
+            )
+        elif key == 'fps':
+            # `_read_fps` 没有 `where` 参数，它的报错字段名就是传入的 key；
+            # 因此这里把键名**当成**带前缀的名字传进去，报错才会指向
+            # `animations.idle.fps` 而不是裸的 `v`。
+            result[key] = _read_fps(
+                {f'animations.{action}.fps': value}, f'animations.{action}.fps', 8,
+            )
+        elif key == 'loop':
+            if not isinstance(value, bool):
+                raise _field_error(
+                    f'animations.{action}.loop', '应为布尔值',
+                    hint='loop 只能是 true 或 false。',
+                )
+            result[key] = value
+        elif key == 'frameMs':
+            if value == []:
+                result[key] = None
+                continue
+            count = int(frames_hint) if frames_hint else 0
+            if count <= 0:
+                # 没有帧数就无法校验长度。这种情况应当由调用方先读包拿到帧数，
+                # 因此这里是「调用方用错了」而不是「用户填错了」。
+                raise _field_error(
+                    f'animations.{action}.frameMs',
+                    '需要先知道帧数才能校验每帧时长',
+                    hint='这是内部错误，请把这个形象的动作帧数一起提交。',
+                )
+            result[key] = _read_frame_ms(
+                {f'animations.{action}.frameMs': value},
+                f'animations.{action}.frameMs', count,
+            )
+        elif key in ('layout', 'cols', 'rows'):
+            # 排布三兄弟一起校验（它们互相约束），由调用方把三者拼成一个
+            # 完整对象再走 `_parse_layout`。这里只查类型与区间。
+            if key == 'layout':
+                if not isinstance(value, str) or value.strip().lower() not in LAYOUTS:
+                    raise _field_error(
+                        f'animations.{action}.layout',
+                        f'应为 {" / ".join(LAYOUTS)}',
+                        hint='horizontal = 横排一行；vertical = 竖排一列；'
+                             'grid = 网格（要同时给 cols / rows）。',
+                    )
+                result[key] = value.strip().lower()
+            else:
+                result[key] = _read_positive_int(
+                    {key: value}, key, 1, low=1, high=MAX_FRAMES,
+                    where=f'animations.{action}.{key}',
+                )
+        elif key == 'weight':
+            result[key] = _read_weight(
+                {f'animations.{action}.weight': value},
+                f'animations.{action}.weight',
+            )
+        elif key == 'motion':
+            if value == {} or value is False:
+                result[key] = None
+                continue
+            parsed = _parse_motion(
+                value, f'animations.{action}', frames=int(frames_hint) or 0,
+                animated=False,
+            )
+            # 全空（既没呼吸也没眨眼）等同于「删除」，写一个空对象进包里
+            # 只会让 `pet.json` 多一行没意义的内容。
+            result[key] = parsed.to_dict() if parsed.enabled else None
+
+    return result
+
+
+#: 物理参数的合法区间（与 `_PHYSICS_RANGES` 同一份）。
+def parse_physics_patch(patch: dict) -> dict:
+    """校验并规范化一份**物理参数**补丁。
+
+    物理参数调坏了宠物会变得很怪（穿墙、飞走、刹不住），因此这里逐项
+    校验区间，且**明确报错**而不是静默夹住——作者/用户填了 99999 时
+    应当被告知超出范围，而不是悄悄改成上限然后「看起来没反应」。
+    """
+    if not isinstance(patch, dict):
+        raise _field_error('physics', '应为对象')
+    result = {}
+    for key, value in patch.items():
+        if key not in _PHYSICS_RANGES:
+            raise _field_error(
+                f'physics.{key}', '不是可调的物理参数',
+                hint=f'能调的是 {"、".join(sorted(_PHYSICS_RANGES))}。',
+            )
+        if value is None:
+            result[key] = None
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise _field_error(f'physics.{key}', '应为数字')
+        low, high = _PHYSICS_RANGES[key]
+        number = float(value)
+        if not (low <= number <= high):
+            raise _field_error(
+                f'physics.{key}', f'应在 {low} ~ {high} 之间，实际为 {value}',
+                hint='调得越极端，宠物看起来越不像在正常走动。',
+            )
+        result[key] = number
+    return result
 
 
 def _parse_trigger(raw_spec: dict, behavior: str, *, where: str) -> Trigger:

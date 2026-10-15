@@ -80,6 +80,7 @@ from .pack import (
     LAYOUT_ANIMATED,
     MAX_IDLE_PLAYS,
     MAX_FRAMES,
+    MAX_FRAME_SIZE,
     MAX_SCHEDULE_MS,
     MIN_SCHEDULE_MS,
     ONE_SHOT_ACTIONS,
@@ -98,6 +99,8 @@ from .pack import (
     decode_bytes,
     loads as loads_pack,
     motion_transform_origin,
+    parse_animation_patch,
+    parse_physics_patch,
     parse_schedule,
 )
 from .paths import is_action_name, is_safe_relative_name, safe_join, to_posix
@@ -2128,6 +2131,347 @@ class PetStore:
         return self.runtime_pack(final_id)
 
     # ------------------------------------------------------------ 包元信息
+
+    def _patch_manifest(self, pet_id: str, mutate) -> dict:
+        """读 `pet.json` → 让 `mutate(manifest)` 就地改 → 校验 → 写回。
+
+        ★ 这是**所有**「写回 pet.json」入口的公共骨架，它保证三件事：
+
+        1. **保住未知字段**。读的是原始 dict（不是 `PetPack`），因此作者写的
+           任何字段（包括插件还不认识的）都原样保留。用 `PetPack.to_dict()`
+           重写会把未知字段**静默丢掉**——而 `pet.json` 是作者的作品，
+           我们无权替他删东西。
+        2. **写盘前整体校验一遍**。`loads_pack` 跑不过就不写：宁可拒绝，
+           也不要留下一个自己都读不出来的包（那种包在列表里显示成坏包，
+           而用户完全不知道是哪一步弄坏的）。
+        3. **原子写**（`_write_json` 走临时文件 + 替换），中途失败不会
+           留下半个 `pet.json`。
+
+        Args:
+            pet_id: 形象 id（会先过 `assert_writable`）。
+            mutate: `(manifest: dict) -> None`，就地修改；可以抛 `PetError`。
+
+        Returns:
+            dict: `runtime_pack()` 的结果。
+        """
+        pet_id = self.assert_writable(pet_id)
+        directory = self.user_pet_dir(pet_id)
+        manifest_path = os.path.join(directory, MANIFEST_FILENAME)
+
+        with self._lock:
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as handle:
+                    manifest = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise PetError(
+                    CODE_PACK_UNREADABLE,
+                    f'读取 pet.json 失败: {exc}',
+                    user_msg='这个形象的配置文件读不出来，可能已损坏。',
+                    http_status=500,
+                ) from exc
+            if not isinstance(manifest, dict):
+                raise PetError(
+                    CODE_PACK_UNREADABLE,
+                    'pet.json 根节点不是对象',
+                    user_msg='这个形象的配置文件格式不对。',
+                    http_status=500,
+                )
+
+            mutate(manifest)
+
+            # 整体校验：写进去的必须能被读回来
+            loads_pack(
+                json.dumps(manifest, ensure_ascii=False).encode('utf-8'),
+                pack_id=pet_id,
+            )
+            self._write_json(manifest_path, manifest)
+
+        return self.runtime_pack(pet_id)
+
+    @staticmethod
+    def _action_manifest_node(manifest: dict, action: str) -> dict:
+        """取某动作在 `pet.json` 里**可写的那个对象**，必要时就地升级写法。
+
+        `pet.json` 里一个动作有三种合法写法：
+
+        - 字符串：`"idle": "idle.png"`（最省事）
+        - 对象：`"idle": {"sheet": "idle.png", "frames": 4}`
+        - 多套：`"idle": {"variants": [{...}, {...}]}`
+
+        面板要改的是「动画参数」（fps / 每帧时长 / 排布 / 权重 / motion）。
+        对前两种写法，参数写在该动作**自己**的层级；对第三种，参数写在
+        **每一套**里。这里统一处理：
+
+        - 字符串写法会被**升级成对象**（`{"sheet": "idle.png"}`）——否则
+          没地方挂参数。这是「就地升级」，语义不变。
+        - 多套写法返回**第一套**（面板一次改一套；`variants` 的下标由
+          调用方通过 `variant` 指定，见 `update_action_animation`）。
+
+        Returns:
+            dict: 可以就地写入参数的那个对象。
+
+        Raises:
+            PetError: 动作不存在，或写法本身非法。
+        """
+        animations = manifest.get('animations')
+        if not isinstance(animations, dict) or action not in animations:
+            raise PetError(
+                CODE_PACK_ANIMATION_MISSING,
+                f'包里没有动作 {action}',
+                user_msg=f'这个形象没有「{action}」这个动作。',
+                http_status=404,
+            )
+        node = animations[action]
+        if isinstance(node, str):
+            # 升级成对象写法（语义完全不变，只是从「只有一张图」变成
+            # 「一张图 + 若干参数」）
+            node = {'sheet': node}
+            animations[action] = node
+        if not isinstance(node, dict):
+            raise PetError(
+                CODE_PACK_FIELD_INVALID,
+                f'animations.{action} 写法非法',
+                user_msg=f'「{action}」这个动作的配置格式不对。',
+            )
+        return node
+
+    def update_action_animation(
+        self, pet_id: str, action: str, patch: dict, *, variant: int = 0,
+    ) -> dict:
+        """改写**用户自建形象**某个动作的动画参数（写回 `pet.json`）。
+
+        用户要求：「pet.json 里面支持了非常多的调节参数，结果界面上没多少
+        能调整的……比如我想调整下不同动作的帧率，每帧之间的间隔，
+        结果发现没有入口」。这个入口就是那条路。
+
+        能改的字段见 `pack.ANIMATION_PATCH_FIELDS`（帧数 / 帧率 / 循环 /
+        每帧时长 / 排布 / 网格 / 权重 / 程序化运动）。传 `None` 表示
+        **删除该字段**（回落到默认值）。
+
+        Args:
+            pet_id: 形象 id（只对自建形象开放，内置形象是随包资源）。
+            action: 动作名。
+            patch: `{字段名: 值}`。
+            variant: 改第几套动画（多套写法时用；默认第一套）。
+
+        Returns:
+            dict: `runtime_pack()` 的结果。
+        """
+        action = str(action or '').strip()
+        if not is_action_name(action):
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'动作名非法: {action!r}',
+                user_msg='动作名不合法。',
+            )
+        pack = self.load_pack(pet_id)
+        spec = pack.animations.get(action)
+        if spec is None:
+            raise PetError(
+                CODE_PACK_ANIMATION_MISSING,
+                f'包里没有动作 {action}',
+                user_msg=f'这个形象没有「{action}」这个动作。',
+                http_status=404,
+            )
+        variants = spec.variants or []
+        index = max(0, min(int(variant or 0), max(0, len(variants) - 1)))
+        frames_hint = variants[index].frames if index < len(variants) else 0
+
+        cleaned = parse_animation_patch(action, patch, frames_hint=frames_hint)
+
+        def mutate(manifest):
+            node = self._action_manifest_node(manifest, action)
+            target = node
+            if isinstance(node.get('variants'), list) and node['variants']:
+                list_index = min(index, len(node['variants']) - 1)
+                target = node['variants'][list_index]
+                if not isinstance(target, dict):
+                    raise PetError(
+                        CODE_PACK_FIELD_INVALID,
+                        f'animations.{action}.variants[{list_index}] 写法非法',
+                        user_msg=f'「{action}」第 {list_index + 1} 套动画的配置格式不对。',
+                    )
+            for key, value in cleaned.items():
+                if value is None:
+                    target.pop(key, None)
+                else:
+                    target[key] = value
+
+        return self._patch_manifest(pet_id, mutate)
+
+    def update_pet_physics(self, pet_id: str, patch: dict) -> dict:
+        """改写**用户自建形象**的物理参数（写回 `pet.json` 的 `physics`）。
+
+        用户要求把这类「比较容易出问题的设置项」也开放出来，让用户自己决定。
+        能改的是 `gravity` / `walkSpeed` / `friction` / `terminalVelocity` /
+        `bounce`（区间见 `pack._PHYSICS_RANGES`）。传 `None` 表示删除该项
+        （回落到默认值）。
+
+        ⚠️ 调坏了宠物会变得很怪（飞走 / 刹不住 / 穿墙），因此这里
+        **明确报错**而不是静默夹住——填了 99999 应当被告知超范围，
+        而不是悄悄改成上限然后「看起来没反应」。
+        """
+        cleaned = parse_physics_patch(patch)
+
+        def mutate(manifest):
+            node = manifest.get('physics')
+            if not isinstance(node, dict):
+                node = {}
+                manifest['physics'] = node
+            for key, value in cleaned.items():
+                if value is None:
+                    node.pop(key, None)
+                else:
+                    node[key] = value
+            if not node:
+                # 全删光了就把 `physics` 整个去掉，别留一个空对象
+                manifest.pop('physics', None)
+
+        return self._patch_manifest(pet_id, mutate)
+
+    def update_pet_layout(self, pet_id: str, patch: dict) -> dict:
+        """改写**形象级**的几个字段：`anchor` / `scale` / `pixelated` 等。
+
+        与 `update_pet_meta` 的区别：那个处理名字 / 作者 / 标准图像 / 节奏
+        （都带各自的校验与副作用），这个处理**纯数值/布尔**的几个字段，
+        统一走 `_patch_manifest`。
+
+        能改的字段见 `pack.PET_PATCH_FIELDS`。`anchor` 传 `{x, y}`（部分更新），
+        其余传标量或 `None`（删除 → 回落默认）。
+        """
+        if not isinstance(patch, dict):
+            raise PetError(CODE_WRITE_FAILED, '补丁应为对象', user_msg='设置格式不对。')
+        allowed = {'anchor', 'scale', 'pixelated', 'animSpeed', 'autoRoam', 'size'}
+        stray = sorted(key for key in patch if key not in allowed)
+        if stray:
+            raise PetError(
+                CODE_PACK_FIELD_INVALID,
+                f'不能这样改: {stray[0]}',
+                user_msg=f'「{stray[0]}」不能在这里改。',
+                hint=f'能改的是 {"、".join(sorted(allowed))}。',
+            )
+
+        def mutate(manifest):
+            if 'anchor' in patch:
+                raw = patch['anchor']
+                if raw is None:
+                    manifest.pop('anchor', None)
+                elif isinstance(raw, dict):
+                    node = manifest.get('anchor')
+                    if not isinstance(node, dict):
+                        node = {}
+                        manifest['anchor'] = node
+                    for axis in ('x', 'y'):
+                        if axis not in raw:
+                            continue
+                        value = raw[axis]
+                        if value is None:
+                            node.pop(axis, None)
+                            continue
+                        if isinstance(value, bool) or not isinstance(value, (int, float)):
+                            raise PetError(
+                                CODE_PACK_FIELD_INVALID,
+                                f'anchor.{axis} 应为数字',
+                                user_msg='锚点只能是 0~1 之间的数字。',
+                                hint='0 = 贴左/贴上，1 = 贴右/贴下；'
+                                     '例如 y: 0.99 表示「脚底几乎在最下沿」。',
+                            )
+                        number = float(value)
+                        if not (0.0 <= number <= 1.0):
+                            raise PetError(
+                                CODE_PACK_FIELD_INVALID,
+                                f'anchor.{axis} 应在 0 ~ 1 之间，实际为 {value}',
+                                user_msg='锚点只能是 0~1 之间的数字。',
+                                hint='0 = 贴左/贴上，1 = 贴右/贴下。',
+                            )
+                        node[axis] = number
+                    if not node:
+                        manifest.pop('anchor', None)
+                else:
+                    raise PetError(
+                        CODE_PACK_FIELD_INVALID, 'anchor 应为对象',
+                        user_msg='锚点格式不对。',
+                    )
+            for key, low, high in (
+                ('scale', SCALE_RANGE[0], SCALE_RANGE[1]),
+                ('animSpeed', ANIM_SPEED_RANGE[0], ANIM_SPEED_RANGE[1]),
+            ):
+                if key not in patch:
+                    continue
+                value = patch[key]
+                if value is None:
+                    manifest.pop(key, None)
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise PetError(
+                        CODE_PACK_FIELD_INVALID, f'{key} 应为数字',
+                        user_msg='这个设置需要一个数字。',
+                    )
+                number = float(value)
+                if not (low <= number <= high):
+                    raise PetError(
+                        CODE_PACK_FIELD_INVALID,
+                        f'{key} 应在 {low} ~ {high} 之间，实际为 {value}',
+                        user_msg=f'这个设置要在 {low} ~ {high} 之间。',
+                    )
+                manifest[key] = number
+            for key in ('pixelated', 'autoRoam'):
+                if key not in patch:
+                    continue
+                value = patch[key]
+                if value is None:
+                    manifest.pop(key, None)
+                    continue
+                if not isinstance(value, bool):
+                    raise PetError(
+                        CODE_PACK_FIELD_INVALID, f'{key} 应为布尔值',
+                        user_msg='这个设置只能是开或关。',
+                    )
+                manifest[key] = value
+            if 'size' in patch:
+                raw = patch['size']
+                if raw is None:
+                    manifest.pop('size', None)
+                elif isinstance(raw, dict):
+                    node = manifest.get('size')
+                    if not isinstance(node, dict):
+                        node = {}
+                        manifest['size'] = node
+                    for axis in ('w', 'h'):
+                        if axis not in raw:
+                            continue
+                        value = raw[axis]
+                        if value is None:
+                            node.pop(axis, None)
+                            continue
+                        if (isinstance(value, bool) or not isinstance(value, int)):
+                            if isinstance(value, float) and value.is_integer():
+                                value = int(value)
+                            else:
+                                raise PetError(
+                                    CODE_PACK_FIELD_INVALID,
+                                    f'size.{axis} 应为整数',
+                                    user_msg='单帧尺寸要写整数像素。',
+                                )
+                        number = int(value)
+                        if not (1 <= number <= MAX_FRAME_SIZE):
+                            raise PetError(
+                                CODE_PACK_FIELD_INVALID,
+                                f'size.{axis} 应在 1 ~ {MAX_FRAME_SIZE} 之间，'
+                                f'实际为 {value}',
+                                user_msg=f'单帧尺寸要在 1 ~ {MAX_FRAME_SIZE} 像素之间。',
+                                hint='这是**单帧**的贴图尺寸，不是整张 spritesheet。',
+                            )
+                        node[axis] = number
+                    if not node:
+                        manifest.pop('size', None)
+                else:
+                    raise PetError(
+                        CODE_PACK_FIELD_INVALID, 'size 应为对象',
+                        user_msg='单帧尺寸格式不对。',
+                    )
+
+        return self._patch_manifest(pet_id, mutate)
 
     def update_pet_meta(
         self,

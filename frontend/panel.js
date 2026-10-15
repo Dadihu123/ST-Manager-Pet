@@ -170,6 +170,199 @@ function buildSpeedHint(value, declared) {
   return base + tail;
 }
 
+/**
+ * **帮助页的内容**。
+ *
+ * 用户要求：「因为当前的设置项之类的比较多，所以可以给页面添加一个帮助页，
+ * 具体的帮助按钮请使用已有的，里面可以解释下不同参数的设置用途以及推荐值，
+ * 前面说的哪个 motion 和 physics 这类比较容易出问题的设置项在帮助里面说清楚即可」。
+ *
+ * 写法上刻意做成**数据**而不是一堆 DOM 代码：内容会随设置项增加而变长，
+ * 数据表改起来不会漏掉结构（每项都是「名称 / 说明 / 推荐值」三段）。
+ *
+ * `risky: true` 的那几项会额外用醒目颜色标出「容易调坏」的提醒——
+ * 它们正是用户点名要讲清楚的两类（`motion` 与 `physics`）。
+ */
+const HELP_SECTIONS = [
+  {
+    title: '形象与外观',
+    entries: [
+      {
+        term: '大小倍率',
+        body: '把整个宠物放大或缩小。0.25× ~ 4×，按形象分别记住。',
+        recommend: '真人立绘一般 0.3~0.6×；像素风小图 1~3×。'
+          + '提示行里会实时显示「当前约多少像素高」，按那个数判断更直观。',
+      },
+      {
+        term: '渲染方式',
+        body: '放大时怎么插值。平滑 = 边缘柔和；像素风 = 保持硬边。',
+        recommend: '写实插画与真人形象用「平滑」（硬边会出现块状锯齿）；'
+          + '像素风形象用「硬边」才不会糊。形象包可以自己声明，这里是覆盖它。',
+      },
+      {
+        term: '动画速度',
+        body: '统一放慢或加快这个形象的所有动作。1× 按包内声明的帧率播放，'
+          + '2× 表示播放时间翻倍（更慢）。',
+        recommend: '觉得「动作太快看不清」就调大（1.5~2×）；'
+          + '觉得「半天不动一下」就调小（0.6~0.8×）。'
+          + '它只做整体缩放，不改包里的帧率——因此非均匀帧时长的节奏仍然保留。',
+      },
+      {
+        term: '自动漫游',
+        body: '闲着的时候这个形象会不会自己在屏幕底部走一走。',
+        recommend: '会走的形象开着；坐着的猫、躺着的玩偶建议关掉——'
+          + '原地不动更自然。走动的间隔在下面「触发时间」里调。',
+      },
+      {
+        term: '单帧尺寸（进阶）',
+        body: '一张贴图里单帧的像素尺寸，不是整张 spritesheet 的大小。',
+        recommend: '一般不用改：新建形象时会自动按你上传的图算出来。'
+          + '只有手写 pet.json 或图片被替换过之后才需要动它。',
+        risky: true,
+      },
+      {
+        term: '锚点（进阶）',
+        body: '「脚底」在单帧里的相对位置，0 = 最上/最左，1 = 最下/最右。'
+          + '宠物站立、呼吸、缩放都以此为原点。',
+        recommend: 'y 一般取 0.95~1.0（脚底贴着图的下沿）。'
+          + '调错的后果是「宠物悬空」或「陷进地面」，而且一眼就能看出来，'
+          + '所以放心试。',
+        risky: true,
+      },
+    ],
+  },
+  {
+    title: '触发时间',
+    entries: [
+      {
+        term: '待机小动作',
+        body: '闲着的时候偶尔动一下。默认每 6~18 秒随机播一遍，播完回到静止。',
+        recommend: '想更活泼就调小（3~8 秒），想更安静就调大（20~60 秒）。'
+          + '不建议小于 2 秒——那看起来像在抽搐。',
+      },
+      {
+        term: '自动漫游',
+        body: '闲着的时候自己走一走。默认每 3~9 秒一趟。',
+        recommend: '3~15 秒比较自然。调得很小时宠物会几乎一直在走'
+          + '（它走得比间隔慢），看起来像在来回踱步。',
+      },
+      {
+        term: '打盹',
+        body: '多久没人理它就睡着。睡着之后任何操作都会把它唤醒。',
+        recommend: '60~300 秒。它不会打断当前动作——'
+          + '如果到点那一刻它正在走或在播小动作，会等它做完再睡。',
+      },
+    ],
+  },
+  {
+    title: '每个动作的动画（进阶）',
+    entries: [
+      {
+        term: '帧率 / 每帧时长',
+        body: '帧率是「每秒播几帧」；每帧时长可以给每一帧单独设一个毫秒数，'
+          + '用来做「停顿一下再动」这类不均匀节奏。两者同时存在时每帧时长优先。',
+        recommend: '均匀节奏用帧率就够了（2~8 fps 适合待机）。'
+          + '非均匀节奏的例子：`[400, 300, 300, 600]` —— 第一帧多停一会，'
+          + '最后一帧停久一点再循环，看起来比匀速自然得多。',
+      },
+      {
+        term: '循环',
+        body: '播完最后一帧之后回到第一帧，还是停在最后一帧。',
+        recommend: '待机、走路、睡觉这类持续状态要开；'
+          + '点击、落地这类一次性动作关掉。包通常已经设好了，一般不用改。',
+      },
+      {
+        term: '排布 / 列数 / 行数',
+        body: '一张图里帧怎么摆：横排一行、竖排一列，或者网格（多行多列）。'
+          + '网格要同时给列数与行数。',
+        recommend: '帧数多时用网格：4×4 的网格一张图能放 16 帧，'
+          + '而横排一行只能放到图片宽度允许为止。',
+      },
+      {
+        term: '权重（多套动画）',
+        body: '一个动作可以挂好几套动画，每次触发按权重随机选一套。'
+          + '权重是相对比例：两套都填 5 就是各一半；填 1 / 3 就是 25% 与 75%。',
+        recommend: '想「大部分时候用 A、偶尔来一下 B」就填 5 / 1。'
+          + '这比堆很多帧更省显存，也更像「它自己有小情绪」。',
+      },
+      {
+        term: '程序化运动（呼吸 / 眨眼）',
+        body: '不用额外画帧，靠合成器驱动的整体运动：'
+          + '呼吸 = 以脚底为原点做轻微的纵向缩放；眨眼 = 在指定的几帧之间快速跳一下。',
+        recommend: '呼吸幅度 0.005~0.02（0.02 已经很明显了），周期 2~5 秒。'
+          + '它不会让宠物长出新的姿势——整身缩放无法 articulate 四肢，'
+          + '所以做不出「走路循环」；它适合让静止的待机图看起来是活的。'
+          + '眨眼需要你有一条真的有闭眼帧的图，否则会把睁眼帧当成眨眼。',
+        risky: true,
+      },
+    ],
+  },
+  {
+    title: '物理参数（进阶）',
+    entries: [
+      {
+        term: '重力 gravity',
+        body: '下落的加速度（像素/秒²）。',
+        recommend: '默认 1800。调大 = 掉得更急、更「重」；'
+          + '调小 = 飘（小于 400 就明显像在月球上）。',
+        risky: true,
+      },
+      {
+        term: '走速 walkSpeed',
+        body: '自动漫游时的水平速度（像素/秒）。',
+        recommend: '默认 60。小宠物（64px）用 30~50，'
+          + '大立绘用 80~150，否则它看起来像在「滑」。',
+        risky: true,
+      },
+      {
+        term: '摩擦 friction',
+        body: '每秒保留多少水平速度（越小刹车越快）。',
+        recommend: '默认 0.02（走停约 0.4 秒）。'
+          + '调到 0.5 以上会「刹不住」，甩一下能滑出屏幕；'
+          + '调到 0 会立刻停住，看起来像撞墙。',
+        risky: true,
+      },
+      {
+        term: '终端速度 terminalVelocity',
+        body: '下落速度的上限（像素/秒），防止一帧掉太远。',
+        recommend: '默认 2400。除非屏幕特别高，否则不用改。',
+        risky: true,
+      },
+      {
+        term: '弹性 bounce',
+        body: '落地时弹回多少速度（0 = 不弹，1 = 原速弹回）。',
+        recommend: '默认 0.15（轻轻一顿）。0.4 以上会像皮球，'
+          + '0 则「啪」地贴在地上。',
+        risky: true,
+      },
+    ],
+  },
+  {
+    title: '其它',
+    entries: [
+      {
+        term: '标准图像',
+        body: '不播动画时显示的那一帧（「平时」的样子）。',
+        recommend: '建议显式设一张。不设时会回落到 idle 的第一帧，'
+          + '而 idle 挂了两套动画时那可能是个怪姿势（比如抬着头）。',
+      },
+      {
+        term: '每动作换图（覆盖）',
+        body: '单独替换某个动作的图，不改形象包本身。内置形象也能用。',
+        recommend: '只想换个待机图时用它，比复制整个形象轻。'
+          + '内置形象上遗留的覆盖不会生效（插件会提示并让你一键清理）。',
+      },
+      {
+        term: '勿扰与播报开关',
+        body: '在「设置 → 插件 → 桌面宠物」里，是全局的：'
+          + '控制要不要弹提示，与是哪只宠物无关。',
+        recommend: '宠物自己的行为参数（大小、速度、触发时间…）都在这个面板里'
+          + '按形象设置，两处不会互相打架。',
+      },
+    ],
+  },
+];
+
 export function createSettingsPanel({
   api, getConfig, getOwnSettings, onConfigChanged, onPetChanged,
   getHidden, onHiddenChange,
@@ -237,6 +430,35 @@ export function createSettingsPanel({
   /** 预览器的速度倍率（越大越慢），与桌面宠物用的是同一个语义。 */
   let previewSpeed = 1;
   /**
+   * **进阶区块的折叠状态**（`键 → 是否展开`）。
+   *
+   * 为什么放在模块级而不是 `createSettingsPanel` 里：它要**跨重渲染**保留。
+   * 面板每次改设置都会整片重渲染（`render()`），不记住的话用户展开
+   * 「物理参数」之后一拖滑块它就又收起来了——那比一开始就不展开更烦人。
+   *
+   * 也不用 `localStorage`：那是「记住用户偏好」的语义，而这个只是
+   * 「这一屏的临时展开状态」，关掉面板再打开应当回到默认（收起）。
+   */
+  const expandedSections = new Map();
+  /** 右栏是否正在显示**帮助页**（替换掉形象详情）。 */
+  let showingHelp = false;
+  /**
+   * 正在编辑**动画参数**的动作名（`''` = 没在编辑）。
+   *
+   * 为什么用「就地展开一个编辑区」而不是弹窗：宿主的面板已经是 modal 了，
+   * 再套一层在窄屏上会挤成一条缝；而且用户往往要**对照着动作网格里的
+   * 预览**调参数（「帧率改大一点看看」），弹窗会挡住它。
+   */
+  let editingAction = '';
+  /**
+   * 动画参数编辑区的**草稿值**（`{字段名: 值}`）。
+   *
+   * 为什么要草稿：这些字段有联动（改了 `frames` 之后 `frameMs` 的长度
+   * 就得跟着变），逐字段即时提交会让中间状态写进包里。因此编辑区先攒在
+   * 草稿里，用户点「保存」才一次性提交。
+   */
+  let actionDraft = null;
+  /**
    * 预览器是否处于「播放」状态。
    *
    * 必须**独立记录**，不能在渲染时读 `player.playing`：`render()` 一开始就把
@@ -279,6 +501,72 @@ export function createSettingsPanel({
     if (className) node.className = className;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+
+  /**
+   * 一个**可折叠**的设置区块（默认收起）。
+   *
+   * 为什么要它：用户要求「设置项会放开比较多，因此要考虑好 UI 的设计……
+   * 应当避免一股脑地把所有的设置项都展开来，比如可以按照你分析的常用与否的
+   * 设置项来分级，常用的就是直接可以看到，那些不太常用的，则平时收起来，
+   * 用户需要的时候可以随时展开」。
+   *
+   * 因此分两档：
+   * - **常用**：直接平铺（大小倍率、渲染方式、触发时间、动画预览）；
+   * - **进阶**：收进这里（物理参数、锚点、每动作动画参数…）。
+   *
+   * 折叠状态**按区块名记住**（模块级 `expandedSections`）：重渲染时不会
+   * 自己弹回去——面板每次改设置都会整体重渲染，不记住的话用户展开之后
+   * 一拖滑块它就又收起来了。
+   *
+   * @param {string} title 区块标题。
+   * @param {object} options
+   * @param {string} options.key 折叠状态的键（默认用标题）。
+   * @param {string} options.hint 标题下方的一行说明（收起时也显示）。
+   * @param {string} options.badge 标题右侧的徽章文字。
+   * @param {boolean} options.defaultOpen 首次渲染时是否展开。
+   */
+  function renderCollapsible(title, options = {}) {
+    const key = options.key || title;
+    const open = expandedSections.has(key)
+      ? expandedSections.get(key)
+      : Boolean(options.defaultOpen);
+
+    const section = el('div', 'pet-section is-collapsible');
+    if (open) section.classList.add('is-open');
+
+    const head = el('button', 'pet-section-toggle');
+    head.type = 'button';
+    head.dataset.marqueeIgnore = 'true';
+    head.dataset.sectionKey = key;
+    head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    // 三角指示器：收起时朝右、展开时朝下。用 CSS 画，不引入图标资源。
+    head.appendChild(el('span', 'pet-section-caret'));
+    head.appendChild(el('span', 'pet-section-toggle-label', title));
+    if (options.badge) {
+      head.appendChild(el('span', 'pet-badge', options.badge));
+    }
+    head.appendChild(el('span', 'pet-section-toggle-hint', open ? '收起' : '展开'));
+    head.addEventListener('click', () => {
+      // 就地切换，**不整片重渲染**：重渲染会丢掉正在编辑的输入框内容，
+      // 而用户可能只是展开看一眼再继续填。
+      const next = !section.classList.contains('is-open');
+      section.classList.toggle('is-open', next);
+      head.setAttribute('aria-expanded', next ? 'true' : 'false');
+      const hint = head.querySelector('.pet-section-toggle-hint');
+      if (hint) hint.textContent = next ? '收起' : '展开';
+      expandedSections.set(key, next);
+    });
+    section.appendChild(head);
+
+    if (options.hint) {
+      section.appendChild(el('div', 'pet-field-hint', options.hint));
+    }
+    const body = el('div', 'pet-section-body');
+    section.appendChild(body);
+    // 调用方往 `body` 里塞内容
+    section.body = body;
+    return section;
   }
 
   function button(label, className, onClick) {
@@ -1201,6 +1489,14 @@ export function createSettingsPanel({
       pickFile({ accept: '.zip,application/zip', onPicked: (file) => importPack(file) });
     }));
     toolbar.appendChild(button('刷新', '', () => withBusy(refresh)));
+    // 帮助按钮：用**已有的按钮样式**（`pet-button`），不引入新的视觉语言。
+    // 用户要求「具体的帮助按钮请使用已有的」。
+    toolbar.appendChild(button('参数说明', 'is-help', () => {
+      showingHelp = !showingHelp;
+      creating = false;
+      notice = null;
+      render();
+    }));
     toolbar.appendChild(el('div', 'pet-panel-toolbar-spacer'));
     const count = el('span', 'pet-card-meta', `${pets.length} 个形象`);
     toolbar.appendChild(count);
@@ -1243,7 +1539,7 @@ export function createSettingsPanel({
     body.appendChild(list);
 
     // ---- 右栏：选中形象的详情（或新建表单）
-    body.appendChild(creating ? renderCreate() : renderDetail());
+    body.appendChild(creating ? renderCreate() : (showingHelp ? renderHelp() : renderDetail()));
     root.appendChild(body);
 
     // 缩略图几何依赖「帧数」，而帧数在 `detail` 里 —— 必须在 DOM 挂上、
@@ -1322,6 +1618,52 @@ export function createSettingsPanel({
     }
     card.appendChild(copy);
     return card;
+  }
+
+  /**
+   * **帮助页**：把 `HELP_SECTIONS` 渲染成一屏可滚动的说明。
+   *
+   * 用户要求：「可以给页面添加一个帮助页，具体的帮助按钮请使用已有的，
+   * 里面可以解释下不同参数的设置用途以及推荐值」。
+   *
+   * 它替换掉右栏的**详情**（而不是弹一个新的 modal）：宿主的面板本身已经
+   * 是一个 modal 了，再套一层 modal 在窄屏上会挤成一条缝；而且用户读说明时
+   * 往往想对照着左边的形象看。
+   *
+   * `risky: true` 的条目额外用醒目色标出——那正是用户点名要讲清楚的
+   * 「比较容易出问题的设置项」（程序化运动与物理参数）。
+   */
+  function renderHelp() {
+    const wrap = el('div', 'pet-panel-detail');
+
+    const bar = el('div', 'pet-help-back');
+    bar.appendChild(button('← 返回设置', '', () => {
+      showingHelp = false;
+      render();
+    }));
+    bar.appendChild(el('span', 'pet-card-meta', '参数说明与推荐值'));
+    wrap.appendChild(bar);
+
+    for (const group of HELP_SECTIONS) {
+      const section = el('div', 'pet-section');
+      section.appendChild(el('div', 'pet-section-title', group.title));
+      for (const entry of group.entries) {
+        const row = el('div', 'pet-help-entry');
+        const term = el('div', 'pet-help-term');
+        term.appendChild(el('span', null, entry.term));
+        if (entry.risky) {
+          term.appendChild(el('span', 'pet-badge is-warn', '易调坏'));
+        }
+        row.appendChild(term);
+        row.appendChild(el('div', 'pet-help-body', entry.body));
+        if (entry.recommend) {
+          row.appendChild(el('div', 'pet-help-recommend', `推荐：${entry.recommend}`));
+        }
+        section.appendChild(row);
+      }
+      wrap.appendChild(section);
+    }
+    return wrap;
   }
 
   function renderDetail() {
@@ -1420,6 +1762,16 @@ export function createSettingsPanel({
 
     // ---- 动画预览（可以直接播具体动作，内置形象同样支持）
     wrap.appendChild(renderPreview());
+
+    // ---- 进阶：物理参数 / 锚点与单帧尺寸（**默认收起**）
+    //
+    // 用户要求：「应当避免一股脑地把所有的设置项都展开来……常用的就是直接
+    // 可以看到，那些不太常用的，则平时收起来，用户需要的时候可以随时展开」。
+    // 物理参数调坏了宠物会变得很怪，因此它属于「不常用但要能调」那一档。
+    if (detail.writable) {
+      wrap.appendChild(renderPhysicsEditor());
+      wrap.appendChild(renderAnchorEditor());
+    }
 
     // ---- 遗留覆盖提示（内置形象专属）
     if (detail.staleOverrides && detail.staleOverrides.length) {
@@ -1798,6 +2150,225 @@ export function createSettingsPanel({
         : ''),
     ));
     return field;
+  }
+
+  /**
+   * **物理参数**编辑区（默认收起）。
+   *
+   * 用户要求把这类「比较容易出问题」的设置项也开放出来，让用户自己决定，
+   * 并在帮助页里说清楚。每一项都给了推荐值区间——物理参数没有「绝对正确」，
+   * 只有「看起来像不像在正常走动」。
+   *
+   * 提交时**逐项**发（不像动画参数那样攒草稿）：这些字段互相独立，
+   * 拖完松手就生效最符合直觉，而且即时看到效果正是调物理的乐趣所在。
+   */
+  function renderPhysicsEditor() {
+    const section = renderCollapsible('物理参数', {
+      key: 'physics',
+      badge: '进阶',
+      hint: '重力、走速、摩擦、终端速度、弹性。调坏了宠物会变得很怪，'
+        + '但改动是立刻看得见的，所以放心试——点「恢复默认」随时能回来。',
+    });
+
+    const current = detail.physics || {};
+    const specs = [
+      {
+        key: 'gravity',
+        label: '重力',
+        unit: '像素/秒²',
+        min: 0,
+        max: 20000,
+        step: 50,
+        fallback: 1800,
+        hint: '默认 1800。调大 = 掉得更急；小于 400 会明显像在月球上。',
+      },
+      {
+        key: 'walkSpeed',
+        label: '走速',
+        unit: '像素/秒',
+        min: 0,
+        max: 2000,
+        step: 5,
+        fallback: 60,
+        hint: '默认 60。小宠物（64px）用 30~50，大立绘用 80~150。',
+      },
+      {
+        key: 'friction',
+        label: '摩擦',
+        unit: '每秒保留比例',
+        min: 0,
+        max: 1,
+        step: 0.01,
+        fallback: 0.02,
+        hint: '默认 0.02（走停约 0.4 秒）。越小刹车越快；'
+          + '0.5 以上会「刹不住」。',
+      },
+      {
+        key: 'terminalVelocity',
+        label: '终端速度',
+        unit: '像素/秒',
+        min: 1,
+        max: 20000,
+        step: 50,
+        fallback: 2400,
+        hint: '默认 2400。下落速度的上限，防止一帧掉太远。',
+      },
+      {
+        key: 'bounce',
+        label: '弹性',
+        unit: '0~1',
+        min: 0,
+        max: 1,
+        step: 0.01,
+        fallback: 0.15,
+        hint: '默认 0.15（轻轻一顿）。0.4 以上会像皮球，0 则「啪」地贴地。',
+      },
+    ];
+
+    for (const spec of specs) {
+      const value = Number(current[spec.key]);
+      const fallback = Number.isFinite(value) ? value : spec.fallback;
+      const field = el('div', 'pet-field');
+      const head = el('div', 'pet-slider-head');
+      head.appendChild(el('span', 'pet-field-label', `${spec.label}（${spec.unit}）`));
+      const readout = el('span', 'pet-slider-value', formatNumber(fallback));
+      head.appendChild(readout);
+      field.appendChild(head);
+
+      const row = createSliderRow({
+        min: spec.min,
+        max: spec.max,
+        step: spec.step,
+        value: fallback,
+        label: spec.label,
+        format: (v) => String(v),
+        onInput: (v) => { readout.textContent = formatNumber(v); },
+        onCommit: (v) => updatePhysics({ [spec.key]: v }),
+      });
+      row.slider.dataset.physicsKey = spec.key;
+      field.appendChild(row.row);
+      const rangeRow = el('div', 'pet-slider-range');
+      rangeRow.appendChild(el('span', null, formatNumber(spec.min)));
+      rangeRow.appendChild(el('span', null, formatNumber(spec.max)));
+      field.appendChild(rangeRow);
+      field.appendChild(el('div', 'pet-field-hint', spec.hint));
+      section.body.appendChild(field);
+    }
+
+    const bar = el('div', 'pet-panel-toolbar');
+    bar.appendChild(button('恢复默认物理参数', 'is-icon', () => {
+      const patch = {};
+      for (const spec of specs) patch[spec.key] = null;
+      updatePhysics(patch);
+    }));
+    section.body.appendChild(bar);
+    section.body.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '这些值写在这个形象包里，只影响它自己。',
+    ));
+    return section;
+  }
+
+  /**
+   * **锚点 / 单帧尺寸**编辑区（默认收起）。
+   *
+   * 这两项都「一调就看得出来」——锚点错了宠物会悬空或陷进地面，
+   * 单帧尺寸错了会露出邻帧或框住一片空白。因此它们属于「进阶但安全」：
+   * 开放出来让用户自己试，比藏着更实用。
+   */
+  function renderAnchorEditor() {
+    const section = renderCollapsible('锚点与单帧尺寸', {
+      key: 'anchor',
+      badge: '进阶',
+      hint: '锚点是「脚底」在单帧里的相对位置（0 = 最上/最左，1 = 最下/最右）。'
+        + '宠物站立、呼吸、缩放都以此为原点。调错的后果一眼就能看出来。',
+    });
+
+    const anchor = detail.anchor || {};
+    const size = detail.size || {};
+
+    const anchorRow = el('div', 'pet-editor-row');
+    anchorRow.appendChild(editorNumber({
+      label: '锚点 X',
+      hint: '0 = 最左，1 = 最右；一般 0.5',
+      value: Number.isFinite(Number(anchor.x)) ? Number(anchor.x) : 0.5,
+      min: 0,
+      max: 1,
+      step: 0.01,
+      onInput: (value) => updateLayout({ anchor: { x: value } }),
+    }));
+    anchorRow.appendChild(editorNumber({
+      label: '锚点 Y',
+      hint: '0 = 最上，1 = 最下；脚底一般 0.95~1',
+      value: Number.isFinite(Number(anchor.y)) ? Number(anchor.y) : 1,
+      min: 0,
+      max: 1,
+      step: 0.01,
+      onInput: (value) => updateLayout({ anchor: { y: value } }),
+    }));
+    section.body.appendChild(anchorRow);
+
+    const sizeRow = el('div', 'pet-editor-row');
+    sizeRow.appendChild(editorNumber({
+      label: '单帧宽',
+      hint: '像素',
+      value: Number(size.w) || 64,
+      min: 1,
+      max: 1024,
+      step: 1,
+      onInput: (value) => updateLayout({ size: { w: Math.round(value) } }),
+    }));
+    sizeRow.appendChild(editorNumber({
+      label: '单帧高',
+      hint: '像素',
+      value: Number(size.h) || 64,
+      min: 1,
+      max: 1024,
+      step: 1,
+      onInput: (value) => updateLayout({ size: { h: Math.round(value) } }),
+    }));
+    section.body.appendChild(sizeRow);
+
+    section.body.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '单帧尺寸是一张贴图里单帧的大小，不是整张 spritesheet 的大小。',
+    ));
+    const bar = el('div', 'pet-panel-toolbar');
+    bar.appendChild(button('恢复默认锚点', 'is-icon', () => {
+      updateLayout({ anchor: null });
+    }));
+    section.body.appendChild(bar);
+    return section;
+  }
+
+  /** 提交物理参数（写回 `pet.json`）。 */
+  async function updatePhysics(patch) {
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(selectedId)}/physics`,
+        { method: 'POST', body: { patch } },
+      );
+      if (!data) return;
+      setNotice('ok', '物理参数已更新');
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+    });
+  }
+
+  /** 提交锚点 / 单帧尺寸（写回 `pet.json`）。 */
+  async function updateLayout(patch) {
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(selectedId)}/layout`,
+        { method: 'POST', body: { patch } },
+      );
+      if (!data) return;
+      setNotice('ok', '已更新');
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+    });
   }
 
   function renderSchedule() {
@@ -2413,6 +2984,16 @@ export function createSettingsPanel({
       row.appendChild(button('换图', 'is-icon', () => {
         pickFile({ accept: 'image/*', onPicked: (file) => uploadActionImage(entry.action, file) });
       }));
+      // 「动画参数」：帧率 / 每帧时长 / 循环 / 排布 / 权重 / 程序化运动。
+      //
+      // 用户要求：「比如我想调整下不同动作的帧率，每帧之间的间隔，
+      // 结果发现没有入口，目前只能去直接修改 pet.json 里面的值」。
+      // 这个按钮就是那个入口——**只对自建形象开放**（内置形象先复制）。
+      row.appendChild(button('动画参数', 'is-icon', () => {
+        editingAction = editingAction === entry.action ? '' : entry.action;
+        actionDraft = editingAction ? buildActionDraft(entry) : null;
+        render();
+      }));
       if (entry.overridden) {
         row.appendChild(button('恢复', 'is-icon', () => clearActionImage(entry.action)));
       }
@@ -2420,7 +3001,424 @@ export function createSettingsPanel({
       row.appendChild(el('span', 'pet-card-meta', '只读'));
     }
     tile.appendChild(row);
+
+    // 就地展开的动画参数编辑区
+    if (editingAction === entry.action && actionDraft) {
+      tile.appendChild(renderActionEditor(entry));
+    }
     return tile;
+  }
+
+  /**
+   * 从动作条目里取一份**可编辑的草稿**（动画参数的初值）。
+   *
+   * 取值来源是后端下发的 `entry`（它已经把回退链算完），因此对**回退**
+   * 动作也能编辑——但那种情况下保存会写进**这个动作自己**的声明，
+   * 从而把它从「回退」变成「自带」，这是符合直觉的。
+   */
+  function buildActionDraft(entry) {
+    const grid = frameGrid({
+      frames: entry.frames,
+      layout: entry.layout,
+      cols: entry.cols,
+      rows: entry.rows,
+    });
+    const motion = normalizeMotion(entry);
+    return {
+      frames: Math.max(1, Number(entry.frames) || 1),
+      fps: Number(entry.fps) || 8,
+      loop: entry.loop !== false,
+      // 非均匀帧时长：包没声明时给一个「按帧率均匀」的初值，
+      // 用户改起来有个起点（而不是一片空白）
+      frameMs: Array.isArray(entry.frameMs) && entry.frameMs.length
+        ? entry.frameMs.slice()
+        : [],
+      useFrameMs: Array.isArray(entry.frameMs) && entry.frameMs.length > 0,
+      layout: grid.cols > 1 && grid.rows > 1 ? 'grid'
+        : (grid.rows > 1 ? 'vertical' : 'horizontal'),
+      cols: grid.cols,
+      rows: grid.rows,
+      weight: Number(entry.weight) || 1,
+      breatheAmp: motionBreathes(motion) ? motion.amplitude : 0,
+      breathePeriod: motionBreathes(motion) ? motion.periodMs : 3200,
+      blinkFrames: motionBlinks(motion) ? motion.blinkFrames.slice() : [],
+      blinkEvery: motionBlinks(motion) ? motion.blinkEveryMs.slice() : [3000, 7000],
+      blinkDuration: motionBlinks(motion) ? motion.blinkDurationMs : 160,
+    };
+  }
+
+  /**
+   * **动画参数编辑区**（就地展开在动作卡片下方）。
+   *
+   * 用户要求：「pet.json 里面支持了非常多的调节参数，结果界面上没多少能
+   * 调整的……比如我想调整下不同动作的帧率，每帧之间的间隔」。
+   *
+   * 设计取舍：
+   * - 先攒草稿、点「保存」才提交——这些字段有联动（`frames` 决定
+   *   `frameMs` 的长度），逐字段即时提交会把中间状态写进包里；
+   * - 非均匀帧时长默认收起（勾选后才展开逐帧输入框）：绝大多数动作是
+   *   均匀的，一上来就铺 4~70 个输入框会把面板撑爆；
+   * - 每个字段都带一句「推荐值」，与帮助页同一套口径。
+   */
+  function renderActionEditor(entry) {
+    const box = el('div', 'pet-action-editor');
+    const draft = actionDraft;
+
+    // ---- 帧率 / 循环
+    const row1 = el('div', 'pet-editor-row');
+    row1.appendChild(editorNumber({
+      label: '帧率',
+      hint: '每秒播几帧',
+      value: draft.fps,
+      min: 0.5,
+      max: 60,
+      step: 0.5,
+      onInput: (value) => { draft.fps = value; },
+    }));
+    const loopField = el('div', 'pet-field');
+    loopField.appendChild(el('div', 'pet-field-label', '循环'));
+    const loopChoice = el('div', 'pet-choice-row');
+    for (const option of [
+      { value: true, label: '循环' },
+      { value: false, label: '播一遍' },
+    ]) {
+      const node = el(
+        'button',
+        `pet-choice ${draft.loop === option.value ? 'is-active' : ''}`.trim(),
+        option.label,
+      );
+      node.type = 'button';
+      node.dataset.marqueeIgnore = 'true';
+      node.addEventListener('click', () => {
+        draft.loop = option.value;
+        for (const sibling of loopChoice.children) {
+          sibling.classList.toggle('is-active', sibling === node);
+        }
+      });
+      loopChoice.appendChild(node);
+    }
+    loopField.appendChild(loopChoice);
+    row1.appendChild(loopField);
+    box.appendChild(row1);
+
+    // ---- 每帧时长（非均匀节奏）
+    const frameMsToggle = el('label', 'pet-editor-check');
+    const frameMsBox = el('input');
+    frameMsBox.type = 'checkbox';
+    frameMsBox.checked = draft.useFrameMs;
+    frameMsBox.dataset.marqueeIgnore = 'true';
+    frameMsToggle.appendChild(frameMsBox);
+    frameMsToggle.appendChild(el('span', null, '自定义每帧时长（非均匀节奏）'));
+    box.appendChild(frameMsToggle);
+
+    const frameMsWrap = el('div', 'pet-editor-frames');
+    frameMsWrap.style.display = draft.useFrameMs ? '' : 'none';
+    const rebuildFrameMs = () => {
+      frameMsWrap.textContent = '';
+      const count = Math.max(1, Number(draft.frames) || 1);
+      // 数量对不上时按帧率铺一个均匀的初值——比留空或截断友好
+      if (!Array.isArray(draft.frameMs) || draft.frameMs.length !== count) {
+        const each = Math.round(1000 / (Number(draft.fps) || 8));
+        draft.frameMs = Array.from({ length: count }, () => each);
+      }
+      for (let index = 0; index < count; index += 1) {
+        const cell = el('div', 'pet-editor-frame-cell');
+        cell.appendChild(el('div', 'pet-editor-frame-label', `第 ${index + 1} 帧`));
+        const input = el('input', 'pet-input pet-editor-frame-input');
+        input.type = 'number';
+        input.min = '17';
+        input.max = '10000';
+        input.step = '10';
+        input.value = String(draft.frameMs[index] ?? 100);
+        input.dataset.marqueeIgnore = 'true';
+        input.addEventListener('input', () => {
+          draft.frameMs[index] = Number(input.value) || 100;
+        });
+        cell.appendChild(input);
+        frameMsWrap.appendChild(cell);
+      }
+    };
+    rebuildFrameMs();
+    frameMsBox.addEventListener('change', () => {
+      draft.useFrameMs = frameMsBox.checked;
+      frameMsWrap.style.display = draft.useFrameMs ? '' : 'none';
+      if (draft.useFrameMs) rebuildFrameMs();
+    });
+    box.appendChild(frameMsWrap);
+    box.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '单位毫秒。开启后每帧单独设停顿时间（帧率会被忽略）——'
+      + '例如 400 / 300 / 300 / 600，最后一帧多停一会再循环，看起来比匀速自然。',
+    ));
+
+    // ---- 帧数与排布
+    const row2 = el('div', 'pet-editor-row');
+    row2.appendChild(editorNumber({
+      label: '帧数',
+      hint: '一张图里有多少帧',
+      value: draft.frames,
+      min: 1,
+      max: 1024,
+      step: 1,
+      onInput: (value) => {
+        draft.frames = Math.max(1, Math.round(value));
+        if (draft.useFrameMs) rebuildFrameMs();
+      },
+    }));
+    const layoutField = el('div', 'pet-field');
+    layoutField.appendChild(el('div', 'pet-field-label', '排布'));
+    const layoutSelect = el('select', 'pet-input');
+    layoutSelect.dataset.marqueeIgnore = 'true';
+    for (const option of [
+      { value: 'horizontal', label: '横排一行' },
+      { value: 'vertical', label: '竖排一列' },
+      { value: 'grid', label: '网格' },
+    ]) {
+      const node = el('option', null, option.label);
+      node.value = option.value;
+      layoutSelect.appendChild(node);
+    }
+    layoutSelect.value = draft.layout;
+    layoutField.appendChild(layoutSelect);
+    row2.appendChild(layoutField);
+    box.appendChild(row2);
+
+    const gridRow = el('div', 'pet-editor-row');
+    const colsField = editorNumber({
+      label: '列数',
+      hint: '网格的列',
+      value: draft.cols,
+      min: 1,
+      max: 1024,
+      step: 1,
+      onInput: (value) => { draft.cols = Math.max(1, Math.round(value)); },
+    });
+    const rowsField = editorNumber({
+      label: '行数',
+      hint: '网格的行',
+      value: draft.rows,
+      min: 1,
+      max: 1024,
+      step: 1,
+      onInput: (value) => { draft.rows = Math.max(1, Math.round(value)); },
+    });
+    gridRow.appendChild(colsField);
+    gridRow.appendChild(rowsField);
+    const syncGridVisibility = () => {
+      const show = draft.layout === 'grid';
+      colsField.style.display = show ? '' : 'none';
+      rowsField.style.display = show ? '' : 'none';
+    };
+    syncGridVisibility();
+    layoutSelect.addEventListener('change', () => {
+      draft.layout = layoutSelect.value;
+      syncGridVisibility();
+    });
+    box.appendChild(gridRow);
+
+    // ---- 权重（多套动画时才有意义）
+    const row3 = el('div', 'pet-editor-row');
+    row3.appendChild(editorNumber({
+      label: '权重',
+      hint: '多套动画时的相对比例',
+      value: draft.weight,
+      min: 0,
+      max: 1000,
+      step: 0.5,
+      onInput: (value) => { draft.weight = value; },
+    }));
+    box.appendChild(row3);
+
+    // ---- 程序化运动（呼吸 / 眨眼）
+    //
+    // 这是用户点名「容易出问题」的一项，因此编辑区里也把边界说清楚。
+    box.appendChild(el('div', 'pet-editor-divider'));
+    box.appendChild(el('div', 'pet-field-label', '程序化运动（不占额外帧）'));
+    const row4 = el('div', 'pet-editor-row');
+    row4.appendChild(editorNumber({
+      label: '呼吸幅度',
+      hint: '0.02 已很明显；0 = 关闭',
+      value: draft.breatheAmp,
+      min: 0,
+      max: 0.08,
+      step: 0.002,
+      onInput: (value) => { draft.breatheAmp = value; },
+    }));
+    row4.appendChild(editorNumber({
+      label: '呼吸周期（秒）',
+      hint: '一次呼吸多久',
+      value: draft.breathePeriod / 1000,
+      min: 0.8,
+      max: 20,
+      step: 0.2,
+      onInput: (value) => { draft.breathePeriod = value * 1000; },
+    }));
+    box.appendChild(row4);
+
+    const blinkField = el('div', 'pet-field');
+    blinkField.appendChild(el('div', 'pet-field-label', '眨眼帧'));
+    const blinkInput = el('input', 'pet-input');
+    blinkInput.type = 'text';
+    blinkInput.placeholder = '例如 2,3（留空 = 不眨眼）';
+    blinkInput.value = draft.blinkFrames.join(',');
+    blinkInput.dataset.marqueeIgnore = 'true';
+    blinkInput.addEventListener('input', () => {
+      draft.blinkFrames = blinkInput.value
+        .split(/[,，\s]+/)
+        .map((part) => Number(part))
+        .filter((number) => Number.isInteger(number) && number >= 0);
+    });
+    blinkField.appendChild(blinkInput);
+    blinkField.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '要填真的有闭眼的那几帧（从 0 开始数），否则会把睁眼帧当成眨眼。',
+    ));
+    box.appendChild(blinkField);
+
+    // ---- 操作
+    const actions = el('div', 'pet-panel-toolbar');
+    actions.appendChild(button('保存', 'is-primary', () => saveActionAnimation(entry.action)));
+    actions.appendChild(button('取消', '', () => {
+      editingAction = '';
+      actionDraft = null;
+      render();
+    }));
+    if (entry.kind === 'animated') {
+      actions.appendChild(el(
+        'span',
+        'pet-card-meta',
+        '这个动作是动图容器（浏览器播放），帧率与帧时长对它无效',
+      ));
+    }
+    box.appendChild(actions);
+    return box;
+  }
+
+  /**
+   * 一个「标签 + 数字框」的小组件（编辑区里用）。
+   *
+   * 比滑块更适合这里：这些值要么需要精确输入（帧率 2.5、幅度 0.012），
+   * 要么范围很窄（帧数 1~1024），滑块的精度不够。
+   */
+  function editorNumber(options) {
+    const field = el('div', 'pet-field');
+    field.appendChild(el('div', 'pet-field-label', options.label));
+    const input = el('input', 'pet-input');
+    input.type = 'number';
+    input.min = String(options.min);
+    input.max = String(options.max);
+    input.step = String(options.step);
+    input.value = String(options.value);
+    input.dataset.marqueeIgnore = 'true';
+    input.addEventListener('input', () => {
+      const number = Number(input.value);
+      if (!Number.isFinite(number)) return;
+      const clamped = Math.min(Math.max(number, options.min), options.max);
+      options.onInput(clamped);
+    });
+    field.appendChild(input);
+    if (options.hint) {
+      field.appendChild(el('div', 'pet-field-hint', options.hint));
+    }
+    return field;
+  }
+
+  /**
+   * 把编辑区的草稿**一次性**提交给后端（写回 `pet.json`）。
+   *
+   * 只提交**真的改过**的字段：全量提交会让「本来没声明的字段」被写成
+   * 显式值，`pet.json` 会越来越臃肿，而作者原本的「没意见」语义也丢了。
+   */
+  async function saveActionAnimation(action) {
+    const draft = actionDraft;
+    if (!draft) return;
+    const entry = (detail.actions || []).find((item) => item.action === action) || {};
+    const patch = {};
+
+    if (Number(entry.fps) !== Number(draft.fps)) patch.fps = draft.fps;
+    if ((entry.loop !== false) !== Boolean(draft.loop)) patch.loop = Boolean(draft.loop);
+    if (Number(entry.frames) !== Number(draft.frames)) patch.frames = draft.frames;
+
+    const hadFrameMs = Array.isArray(entry.frameMs) && entry.frameMs.length > 0;
+    if (draft.useFrameMs) {
+      const same = hadFrameMs
+        && entry.frameMs.length === draft.frameMs.length
+        && entry.frameMs.every((value, index) => Number(value) === Number(draft.frameMs[index]));
+      if (!same) patch.frameMs = draft.frameMs.map((value) => Number(value) || 100);
+    } else if (hadFrameMs) {
+      // 关掉 = 删除该字段（回落到按帧率的均匀节奏）
+      patch.frameMs = null;
+    }
+
+    const grid = frameGrid({
+      frames: entry.frames, layout: entry.layout, cols: entry.cols, rows: entry.rows,
+    });
+    const currentLayout = grid.cols > 1 && grid.rows > 1 ? 'grid'
+      : (grid.rows > 1 ? 'vertical' : 'horizontal');
+    if (currentLayout !== draft.layout) patch.layout = draft.layout;
+    if (draft.layout === 'grid') {
+      if (grid.cols !== draft.cols) patch.cols = draft.cols;
+      if (grid.rows !== draft.rows) patch.rows = draft.rows;
+    }
+    if (Number(entry.weight) !== Number(draft.weight)) patch.weight = draft.weight;
+
+    // 程序化运动：把草稿拼成一个完整的 motion 对象（或 null = 删除）
+    const motion = normalizeMotion(entry);
+    const hadBreathe = motionBreathes(motion);
+    const hadBlink = motionBlinks(motion);
+    const wantBreathe = Number(draft.breatheAmp) > 0;
+    const wantBlink = draft.blinkFrames.length > 0;
+    const breatheSame = hadBreathe === wantBreathe
+      && (!wantBreathe || (Number(motion.amplitude) === Number(draft.breatheAmp)
+        && Number(motion.periodMs) === Number(draft.breathePeriod)));
+    const blinkSame = hadBlink === wantBlink
+      && (!wantBlink || (motion.blinkFrames.join(',') === draft.blinkFrames.join(',')
+        && Number(motion.blinkDurationMs) === Number(draft.blinkDuration)));
+    if (!breatheSame || !blinkSame) {
+      if (!wantBreathe && !wantBlink) {
+        patch.motion = null;
+      } else {
+        const next = {};
+        if (wantBreathe) {
+          next.breathe = {
+            amplitude: Number(draft.breatheAmp),
+            periodMs: Math.round(Number(draft.breathePeriod)),
+          };
+        }
+        if (wantBlink) {
+          next.blink = {
+            frames: draft.blinkFrames.slice(),
+            everyMs: [Number(draft.blinkEvery[0]), Number(draft.blinkEvery[1])],
+            durationMs: Math.round(Number(draft.blinkDuration)),
+          };
+        }
+        patch.motion = next;
+      }
+    }
+
+    if (!Object.keys(patch).length) {
+      setNotice('ok', '没有改动');
+      editingAction = '';
+      actionDraft = null;
+      render();
+      return;
+    }
+
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(selectedId)}/actions/${encodeURIComponent(action)}/animation`,
+        { method: 'POST', body: { patch } },
+      );
+      if (!data) return;
+      setNotice('ok', `「${ACTION_LABELS[action] || action}」的动画参数已保存`);
+      editingAction = '';
+      actionDraft = null;
+      // 让运行中的宠物立刻用上新参数
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+    });
   }
 
   /**

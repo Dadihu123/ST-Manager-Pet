@@ -628,6 +628,75 @@ def register_routes(api, store: PetStore) -> None:
 
         return jsonify({'success': True, 'pet': runtime(pet_id)})
 
+    @api.route('/pets/<pet_id>/actions/<action>/animation', ['POST'])
+    @_handle
+    def update_action_animation(pet_id, action):
+        """改写某动作的**动画参数**（帧率 / 每帧时长 / 循环 / 排布 / 权重 / 运动）。
+
+        用户要求：「pet.json 里面支持了非常多的调节参数，结果界面上没多少
+        能调整的……比如我想调整下不同动作的帧率，每帧之间的间隔，
+        结果发现没有入口，目前只能去直接修改 pet.json 里面的值」。
+
+        写的是**包本身**（`pet.json`），因此只对用户自建形象开放——
+        内置形象是随包发布的资源（先「复制为我的形象」再改）。
+
+        请求体：`{"variant": 0, "patch": {"fps": 3, "loop": false, ...}}`。
+        `patch` 里某个键传 `null` 表示**删除该字段**（回落到默认值）。
+        """
+        payload = _json_body()
+        patch = payload.get('patch')
+        if not isinstance(patch, dict):
+            raise PetError(
+                CODE_WRITE_FAILED, 'patch 应为对象',
+                user_msg='动画设置格式不对。',
+            )
+        pack = store.update_action_animation(
+            pet_id, action, patch, variant=int(payload.get('variant') or 0),
+        )
+        return jsonify({'success': True, 'pet': pack})
+
+    @api.route('/pets/<pet_id>/physics', ['POST'])
+    @_handle
+    def update_pet_physics(pet_id):
+        """改写某形象的**物理参数**（重力 / 走速 / 摩擦 / 终端速度 / 弹性）。
+
+        用户要求把这类「比较容易出问题的设置项」也开放出来，让用户自己决定，
+        并在帮助页里说清风险。写的是包本身，因此只对自建形象开放。
+        """
+        payload = _json_body()
+        patch = payload.get('patch')
+        if not isinstance(patch, dict):
+            raise PetError(
+                CODE_WRITE_FAILED, 'patch 应为对象',
+                user_msg='物理设置格式不对。',
+            )
+        pack = store.update_pet_physics(pet_id, patch)
+        return jsonify({'success': True, 'pet': pack})
+
+    @api.route('/pets/<pet_id>/layout', ['POST'])
+    @_handle
+    def update_pet_layout(pet_id):
+        """改写某形象的**锚点 / 单帧尺寸 / 倍率 / 动画速度 / 自动漫游**等形象级字段。
+
+        与 `/appearance` 的分工：那个改的是「用户怎么看」（落在
+        `data/settings.json`，内置形象也能改）；这个改的是「形象本身」
+        （写进 `pet.json`，只对自建形象开放）。
+
+        ⚠️ `scale` / `animSpeed` / `autoRoam` 三个键**两边都能写**，
+        但含义不同：`/appearance` 写的是**用户的偏好**（优先级更高），
+        这里写的是**作者在包里声明的建议值**。面板据此区分
+        「我调的」与「作者建议的」。
+        """
+        payload = _json_body()
+        patch = payload.get('patch')
+        if not isinstance(patch, dict):
+            raise PetError(
+                CODE_WRITE_FAILED, 'patch 应为对象',
+                user_msg='设置格式不对。',
+            )
+        pack = store.update_pet_layout(pet_id, patch)
+        return jsonify({'success': True, 'pet': pack})
+
     @api.route('/pets/<pet_id>/overrides', ['DELETE'])
     @_handle
     def clear_overrides(pet_id):
@@ -833,6 +902,11 @@ def register_routes(api, store: PetStore) -> None:
             'author': pack.get('author', ''),
             'source': pack.get('source', ''),
             'size': pack.get('size'),
+            # 锚点与物理参数：面板的「进阶」区块要拿它们渲染编辑控件。
+            # 这两项**只能写回 pet.json**（它们描述的是形象本身，
+            # 不是「用户怎么看」），因此内置形象只读。
+            'anchor': pack.get('anchor'),
+            'physics': pack.get('physics'),
             'scale': pack.get('scale'),
             'pixelated': pack.get('pixelated'),
             'declaredScale': pack.get('declaredScale'),

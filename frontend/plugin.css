@@ -614,6 +614,202 @@
   gap: 6px;
 }
 
+/* ---------------------------------------------------------------- 可折叠区块
+ *
+ * 用户要求「应当避免一股脑地把所有的设置项都展开来……常用的就是直接可以
+ * 看到，那些不太常用的，则平时收起来，用户需要的时候可以随时展开」。
+ *
+ * 收起时**只留标题行**（带一行说明），展开时才显示内容。
+ * 折叠状态由 `.is-open` 控制，JS 只切类名——不整片重渲染，
+ * 免得用户正在填的输入框被换掉。
+ */
+.plugin-stm-pet .pet-section.is-collapsible {
+  padding: 0;
+  overflow: hidden;
+}
+
+.plugin-stm-pet .pet-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.plugin-stm-pet .pet-section-toggle:hover {
+  background: var(--surface-container-raised, rgba(0, 0, 0, 0.03));
+}
+
+.plugin-stm-pet .pet-section-toggle-label {
+  flex: 0 0 auto;
+}
+
+/* 「展开 / 收起」提示贴在右边，收起时也在——用户一眼知道这里能点开 */
+.plugin-stm-pet .pet-section-toggle-hint {
+  margin-left: auto;
+  font-weight: 400;
+  font-size: 11px;
+  opacity: 0.6;
+}
+
+/* 三角指示器：纯 CSS 画（不引入图标资源）。
+ * 收起朝右、展开朝下——这是折叠控件的通用语言。 */
+.plugin-stm-pet .pet-section-caret {
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 5px solid currentColor;
+  opacity: 0.55;
+  transition: transform 0.15s ease;
+}
+
+.plugin-stm-pet .pet-section.is-open .pet-section-caret {
+  transform: rotate(90deg);
+}
+
+/* 收起时**不显示**内容区。用 `display: none` 而不是 `height: 0`：
+ * 里面的表单控件（range / number）在 `height: 0` 下仍可被 Tab 聚焦，
+ * 会出现「焦点跑到看不见的地方」。 */
+.plugin-stm-pet .pet-section-body {
+  display: none;
+  padding: 0 12px 12px;
+}
+
+.plugin-stm-pet .pet-section.is-open .pet-section-body {
+  display: block;
+}
+
+/* 折叠区块里的说明文字：收起时也显示（它是「这里有什么」的提示） */
+.plugin-stm-pet .pet-section.is-collapsible > .pet-field-hint {
+  padding: 0 12px 10px;
+  margin: 0;
+}
+
+/* ---------------------------------------------------------------- 帮助页 */
+.plugin-stm-pet .pet-help-entry {
+  border-top: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+  padding: 10px 0;
+}
+
+.plugin-stm-pet .pet-help-entry:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.plugin-stm-pet .pet-help-term {
+  font-weight: 600;
+  font-size: 12px;
+  margin-bottom: 3px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.plugin-stm-pet .pet-help-body {
+  font-size: 11px;
+  line-height: 1.65;
+  opacity: 0.9;
+}
+
+.plugin-stm-pet .pet-help-recommend {
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--color-warning, #d9a02c);
+}
+
+/* 帮助页顶部的「返回」行 */
+.plugin-stm-pet .pet-help-back {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+/* ---------------------------------------------------------------- 动画参数编辑区
+ *
+ * 就地展开在动作卡片下方。用一块浅色底把它与卡片主体分开——
+ * 它属于「这个动作的进阶设置」，不是卡片的一部分。
+ */
+.plugin-stm-pet .pet-action-editor {
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--surface-container-raised, rgba(0, 0, 0, 0.03));
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 一行放两个字段（帧率 + 循环）。窄屏时自动换行。 */
+.plugin-stm-pet .pet-editor-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.plugin-stm-pet .pet-editor-row > .pet-field {
+  flex: 1 1 110px;
+  min-width: 0;
+}
+
+.plugin-stm-pet .pet-editor-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.plugin-stm-pet .pet-editor-divider {
+  height: 1px;
+  background: var(--border-subtle, rgba(0, 0, 0, 0.08));
+  margin: 2px 0;
+}
+
+/* 逐帧输入框：横向铺开，帧数多时**横向滚动**而不是换行——
+ * 换行会让「第几帧」的序号跳来跳去，很难对照。 */
+.plugin-stm-pet .pet-editor-frames {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.plugin-stm-pet .pet-editor-frame-cell {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.plugin-stm-pet .pet-editor-frame-label {
+  font-size: 10px;
+  opacity: 0.7;
+  white-space: nowrap;
+}
+
+.plugin-stm-pet .pet-editor-frame-input {
+  width: 68px;
+}
+
+/* 「易调坏」徽章：帮助页里标出用户点名要讲清楚的那几项 */
+.plugin-stm-pet .pet-badge.is-warn {
+  border-color: var(--color-warning, #d9a02c);
+  color: var(--color-warning, #d9a02c);
+}
+
 .plugin-stm-pet .pet-empty {
   padding: 24px;
   text-align: center;
