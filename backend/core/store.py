@@ -2277,7 +2277,14 @@ class PetStore:
         index = max(0, min(int(variant or 0), max(0, len(variants) - 1)))
         frames_hint = variants[index].frames if index < len(variants) else 0
 
-        cleaned = parse_animation_patch(action, patch, frames_hint=frames_hint)
+        cleaned = parse_animation_patch(
+            action, patch,
+            frames_hint=frames_hint,
+            # 动图容器不切帧，帧率 / 每帧时长 / 循环 / 帧数 / 排布对它
+            # 都没有意义——传进去让解析层明确拒绝，而不是写进包里之后
+            # 让 `loads_pack` 抛一个「整包读不出来」的含糊错误。
+            animated=any(v.layout == LAYOUT_ANIMATED for v in variants),
+        )
 
         def mutate(manifest):
             node = self._action_manifest_node(manifest, action)

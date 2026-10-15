@@ -295,3 +295,79 @@ def test_parse_physics_patch_validates_ranges():
     with pytest.raises(PetError):
         parse_physics_patch({'gravity': 'heavy'})
     assert parse_physics_patch({'friction': 0.5}) == {'friction': 0.5}
+
+
+# ==================================================== 动图容器：无意义的字段要挡住
+#
+# `layout: "animated"` 的动图容器由浏览器直接播放 Gif / WebP，**不切帧**，
+# 因此帧率 / 每帧时长 / 循环 / 帧数 / 排布对它全都没有意义。
+#
+# 为什么必须在**字段级**挡住：放任它写进 `pet.json` 之后，
+# `_patch_manifest` 的整体校验（`loads_pack`）会抛一个「整包读不出来」的
+# 含糊错误——用户看到的是「保存失败」而不是「帧率对动图没有意义」。
+# 实测踩到过：往容器补 `layout: "grid"` 时字段级校验放行，
+# 错误直到整体校验才出现。
+
+
+def _container_store(tmp_path):
+    return _store(tmp_path, animations={
+        'idle': {'sheet': 'idle.gif', 'layout': 'animated'},
+    })
+
+
+def test_animated_container_rejects_frame_fields(tmp_path):
+    """★ 往动图容器写帧率 / 循环 / 帧数 / 排布要**明确报错**。"""
+    store = _container_store(tmp_path)
+    for label, patch in (
+        ('fps', {'fps': 5}),
+        ('loop', {'loop': False}),
+        ('frames', {'frames': 8}),
+        ('frameMs', {'frameMs': [100]}),
+        ('layout', {'layout': 'grid', 'cols': 2, 'rows': 2}),
+    ):
+        with pytest.raises(PetError) as info:
+            store.update_action_animation('mine', 'idle', patch)
+        assert 'animated' in str(info.value) or '没有意义' in str(info.value), (
+            f'{label} 的报错没说清原因: {info.value}'
+        )
+
+
+def test_animated_container_still_allows_weight_and_motion(tmp_path):
+    """★ 但**权重**与**呼吸**对容器是有意义的，不能一起挡掉。
+
+    呼吸是 sprite 上的 CSS 变换，与「谁在播」无关；权重决定选哪一套容器。
+    （眨眼不行——没有可跳的帧，`_parse_motion(animated=True)` 已经管住了。）
+    """
+    store = _container_store(tmp_path)
+    store.update_action_animation('mine', 'idle', {'weight': 3})
+    store.update_action_animation(
+        'mine', 'idle',
+        {'motion': {'breathe': {'amplitude': 0.02, 'periodMs': 3000}}},
+    )
+    pack = store.load_pack('mine')
+    primary = pack.animations['idle'].primary
+    assert primary.layout == 'animated'
+    assert primary.motion.enabled, '容器应当能呼吸'
+
+
+def test_animated_container_blink_is_rejected(tmp_path):
+    """容器**不能**眨眼——没有可跳的帧。"""
+    store = _container_store(tmp_path)
+    with pytest.raises(PetError):
+        store.update_action_animation('mine', 'idle', {
+            'motion': {'blink': {'frames': [1], 'everyMs': [3000, 7000], 'durationMs': 160}},
+        })
+
+
+def test_frame_pet_still_accepts_frame_fields(tmp_path):
+    """反向确认：普通逐帧形象上这些字段**照常可用**。
+
+    （不做这条的话，「挡住容器」的改动可能被写成「谁都不让写」。）
+    """
+    store = _store(tmp_path)
+    store.update_action_animation('mine', 'idle', {
+        'fps': 3, 'loop': False, 'frames': 4, 'frameMs': [300, 300, 300, 600],
+    })
+    node = _manifest(store)['animations']['idle']
+    assert node['fps'] == 3.0 and node['loop'] is False
+    assert node['frameMs'] == [300.0, 300.0, 300.0, 600.0]

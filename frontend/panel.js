@@ -1013,6 +1013,18 @@ export function createSettingsPanel({
     previewAction = 'idle';
     previewVariant = 0;
     previewPlaying = true;
+    // ★ 同时**丢掉动画参数编辑草稿**。
+    //
+    // `editingAction` / `actionDraft` 是模块级的，不清的话切到新形象后
+    // 编辑区会带着**上一个形象**的帧率 / 帧数 / 呼吸幅度显示出来，
+    // 而点「保存」会把这些值写进**新形象**的 pet.json——那是静默的数据损坏
+    // （用户只是看了一眼另一个形象）。
+    //
+    // 放在这里而不是卡片的 click 里：`loadDetail` 是**所有**换形象路径的
+    // 唯一漏斗（点卡片、设为当前形象、新建、复制、导入、删除后回落…），
+    // 挂在 click 上会漏掉其余入口。
+    editingAction = '';
+    actionDraft = null;
     if (!disposed) render();
   }
 
@@ -3072,46 +3084,77 @@ export function createSettingsPanel({
    *   均匀的，一上来就铺 4~70 个输入框会把面板撑爆；
    * - 每个字段都带一句「推荐值」，与帮助页同一套口径。
    */
+  /**
+   * 这个动作是不是**动图容器**（`layout: "animated"`，由浏览器播 Gif/WebP）。
+   *
+   * ⚠️ 判据是 `layout`，**不是** `kind`。`entry.kind === 'animated'` 说的是
+   * 「这个动作有 sheet、能播帧」（`pack.KIND_ANIMATED`），对**每一个**正常
+   * 形象都成立——第一版拿它当判据，于是每个动作的编辑区都写着
+   * 「这个动作是动图容器（浏览器播放）」，而用户明明挂的是普通 PNG。
+   *
+   * 容器路线不切帧，因此帧率 / 每帧时长 / 循环 / 帧数 / 排布对它**全都无效**
+   * （后端的 `_parse_animated_layout` 明确禁止作者写这些字段，
+   * 面板提交也会被拒）。因此这些控件对它要**藏起来**，
+   * 而不是让用户填完再吃一个报错。
+   */
+  function isAnimatedContainer(entry) {
+    return Boolean(entry) && entry.layout === 'animated';
+  }
+
   function renderActionEditor(entry) {
     const box = el('div', 'pet-action-editor');
     const draft = actionDraft;
+    const container = isAnimatedContainer(entry);
+
+    // ---- 动图容器：只有「权重」与「程序化运动」对它有意义
+    if (container) {
+      box.appendChild(el(
+        'div',
+        'pet-field-hint',
+        '这个动作是动图容器（由浏览器播放 Gif / WebP），不切帧，'
+        + '因此帧率、每帧时长、循环、帧数、排布对它都没有意义。'
+        + '能调的是下面的权重与程序化运动。',
+      ));
+    }
 
     // ---- 帧率 / 循环
     const row1 = el('div', 'pet-editor-row');
-    row1.appendChild(editorNumber({
-      label: '帧率',
-      hint: '每秒播几帧',
-      value: draft.fps,
-      min: 0.5,
-      max: 60,
-      step: 0.5,
-      onInput: (value) => { draft.fps = value; },
-    }));
-    const loopField = el('div', 'pet-field');
-    loopField.appendChild(el('div', 'pet-field-label', '循环'));
-    const loopChoice = el('div', 'pet-choice-row');
-    for (const option of [
-      { value: true, label: '循环' },
-      { value: false, label: '播一遍' },
-    ]) {
-      const node = el(
-        'button',
-        `pet-choice ${draft.loop === option.value ? 'is-active' : ''}`.trim(),
-        option.label,
-      );
-      node.type = 'button';
-      node.dataset.marqueeIgnore = 'true';
-      node.addEventListener('click', () => {
-        draft.loop = option.value;
-        for (const sibling of loopChoice.children) {
-          sibling.classList.toggle('is-active', sibling === node);
-        }
-      });
-      loopChoice.appendChild(node);
+    if (!container) {
+      row1.appendChild(editorNumber({
+        label: '帧率',
+        hint: '每秒播几帧',
+        value: draft.fps,
+        min: 0.5,
+        max: 60,
+        step: 0.5,
+        onInput: (value) => { draft.fps = value; },
+      }));
+      const loopField = el('div', 'pet-field');
+      loopField.appendChild(el('div', 'pet-field-label', '循环'));
+      const loopChoice = el('div', 'pet-choice-row');
+      for (const option of [
+        { value: true, label: '循环' },
+        { value: false, label: '播一遍' },
+      ]) {
+        const node = el(
+          'button',
+          `pet-choice ${draft.loop === option.value ? 'is-active' : ''}`.trim(),
+          option.label,
+        );
+        node.type = 'button';
+        node.dataset.marqueeIgnore = 'true';
+        node.addEventListener('click', () => {
+          draft.loop = option.value;
+          for (const sibling of loopChoice.children) {
+            sibling.classList.toggle('is-active', sibling === node);
+          }
+        });
+        loopChoice.appendChild(node);
+      }
+      loopField.appendChild(loopChoice);
+      row1.appendChild(loopField);
     }
-    loopField.appendChild(loopChoice);
-    row1.appendChild(loopField);
-    box.appendChild(row1);
+    if (row1.children.length) box.appendChild(row1);
 
     // ---- 每帧时长（非均匀节奏）
     const frameMsToggle = el('label', 'pet-editor-check');
@@ -3121,7 +3164,7 @@ export function createSettingsPanel({
     frameMsBox.dataset.marqueeIgnore = 'true';
     frameMsToggle.appendChild(frameMsBox);
     frameMsToggle.appendChild(el('span', null, '自定义每帧时长（非均匀节奏）'));
-    box.appendChild(frameMsToggle);
+    if (!container) box.appendChild(frameMsToggle);
 
     const frameMsWrap = el('div', 'pet-editor-frames');
     frameMsWrap.style.display = draft.useFrameMs ? '' : 'none';
@@ -3156,95 +3199,108 @@ export function createSettingsPanel({
       frameMsWrap.style.display = draft.useFrameMs ? '' : 'none';
       if (draft.useFrameMs) rebuildFrameMs();
     });
-    box.appendChild(frameMsWrap);
-    box.appendChild(el(
-      'div',
-      'pet-field-hint',
-      '单位毫秒。开启后每帧单独设停顿时间（帧率会被忽略）——'
-      + '例如 400 / 300 / 300 / 600，最后一帧多停一会再循环，看起来比匀速自然。',
-    ));
+    if (!container) {
+      box.appendChild(frameMsWrap);
+      box.appendChild(el(
+        'div',
+        'pet-field-hint',
+        '单位毫秒。开启后每帧单独设停顿时间（帧率会被忽略）——'
+        + '例如 400 / 300 / 300 / 600，最后一帧多停一会再循环，看起来比匀速自然。',
+      ));
+    }
 
     // ---- 帧数与排布
-    const row2 = el('div', 'pet-editor-row');
-    row2.appendChild(editorNumber({
-      label: '帧数',
-      hint: '一张图里有多少帧',
-      value: draft.frames,
-      min: 1,
-      max: 1024,
-      step: 1,
-      onInput: (value) => {
-        draft.frames = Math.max(1, Math.round(value));
-        if (draft.useFrameMs) rebuildFrameMs();
-      },
-    }));
-    const layoutField = el('div', 'pet-field');
-    layoutField.appendChild(el('div', 'pet-field-label', '排布'));
-    const layoutSelect = el('select', 'pet-input');
-    layoutSelect.dataset.marqueeIgnore = 'true';
-    for (const option of [
-      { value: 'horizontal', label: '横排一行' },
-      { value: 'vertical', label: '竖排一列' },
-      { value: 'grid', label: '网格' },
-    ]) {
-      const node = el('option', null, option.label);
-      node.value = option.value;
-      layoutSelect.appendChild(node);
-    }
-    layoutSelect.value = draft.layout;
-    layoutField.appendChild(layoutSelect);
-    row2.appendChild(layoutField);
-    box.appendChild(row2);
+    if (!container) {
+      const row2 = el('div', 'pet-editor-row');
+      row2.appendChild(editorNumber({
+        label: '帧数',
+        hint: '一张图里有多少帧',
+        value: draft.frames,
+        min: 1,
+        max: 1024,
+        step: 1,
+        onInput: (value) => {
+          draft.frames = Math.max(1, Math.round(value));
+          if (draft.useFrameMs) rebuildFrameMs();
+        },
+      }));
+      const layoutField = el('div', 'pet-field');
+      layoutField.appendChild(el('div', 'pet-field-label', '排布'));
+      const layoutSelect = el('select', 'pet-input');
+      layoutSelect.dataset.marqueeIgnore = 'true';
+      for (const option of [
+        { value: 'horizontal', label: '横排一行' },
+        { value: 'vertical', label: '竖排一列' },
+        { value: 'grid', label: '网格' },
+      ]) {
+        const node = el('option', null, option.label);
+        node.value = option.value;
+        layoutSelect.appendChild(node);
+      }
+      layoutSelect.value = draft.layout;
+      layoutField.appendChild(layoutSelect);
+      row2.appendChild(layoutField);
+      box.appendChild(row2);
 
-    const gridRow = el('div', 'pet-editor-row');
-    const colsField = editorNumber({
-      label: '列数',
-      hint: '网格的列',
-      value: draft.cols,
-      min: 1,
-      max: 1024,
-      step: 1,
-      onInput: (value) => { draft.cols = Math.max(1, Math.round(value)); },
-    });
-    const rowsField = editorNumber({
-      label: '行数',
-      hint: '网格的行',
-      value: draft.rows,
-      min: 1,
-      max: 1024,
-      step: 1,
-      onInput: (value) => { draft.rows = Math.max(1, Math.round(value)); },
-    });
-    gridRow.appendChild(colsField);
-    gridRow.appendChild(rowsField);
-    const syncGridVisibility = () => {
-      const show = draft.layout === 'grid';
-      colsField.style.display = show ? '' : 'none';
-      rowsField.style.display = show ? '' : 'none';
-    };
-    syncGridVisibility();
-    layoutSelect.addEventListener('change', () => {
-      draft.layout = layoutSelect.value;
+      const gridRow = el('div', 'pet-editor-row');
+      const colsField = editorNumber({
+        label: '列数',
+        hint: '网格的列',
+        value: draft.cols,
+        min: 1,
+        max: 1024,
+        step: 1,
+        onInput: (value) => { draft.cols = Math.max(1, Math.round(value)); },
+      });
+      const rowsField = editorNumber({
+        label: '行数',
+        hint: '网格的行',
+        value: draft.rows,
+        min: 1,
+        max: 1024,
+        step: 1,
+        onInput: (value) => { draft.rows = Math.max(1, Math.round(value)); },
+      });
+      gridRow.appendChild(colsField);
+      gridRow.appendChild(rowsField);
+      const syncGridVisibility = () => {
+        const show = draft.layout === 'grid';
+        colsField.style.display = show ? '' : 'none';
+        rowsField.style.display = show ? '' : 'none';
+      };
       syncGridVisibility();
-    });
-    box.appendChild(gridRow);
+      layoutSelect.addEventListener('change', () => {
+        draft.layout = layoutSelect.value;
+        syncGridVisibility();
+      });
+      box.appendChild(gridRow);
+    }
 
-    // ---- 权重（多套动画时才有意义）
-    const row3 = el('div', 'pet-editor-row');
-    row3.appendChild(editorNumber({
-      label: '权重',
-      hint: '多套动画时的相对比例',
-      value: draft.weight,
-      min: 0,
-      max: 1000,
-      step: 0.5,
-      onInput: (value) => { draft.weight = value; },
-    }));
-    box.appendChild(row3);
+    // ---- 权重（**多套动画时才有意义**）
+    //
+    // 只有一套动画时权重没有任何作用（它只在「每次触发按权重随机选一套」
+    // 时有意义），因此那种情况下不显示——与「不展示无意义的设置项」
+    // 同一个原则。要加第二套动画得改 `pet.json`（面板暂不支持增删套数）。
+    const variantCount = Array.isArray(entry.variants) ? entry.variants.length : 1;
+    if (variantCount > 1) {
+      const row3 = el('div', 'pet-editor-row');
+      row3.appendChild(editorNumber({
+        label: `权重（共 ${variantCount} 套动画）`,
+        hint: '相对比例：都填 5 就是各一半；填 5 与 1 就是 5/6 与 1/6',
+        value: draft.weight,
+        min: 0,
+        max: 1000,
+        step: 0.5,
+        onInput: (value) => { draft.weight = value; },
+      }));
+      box.appendChild(row3);
+    }
 
     // ---- 程序化运动（呼吸 / 眨眼）
     //
     // 这是用户点名「容易出问题」的一项，因此编辑区里也把边界说清楚。
+    // 动图容器**可以**呼吸（那是 sprite 上的 CSS 变换），但不能眨眼
+    // （没有可跳的帧）——后端的 `_parse_motion(animated=True)` 就是这么定的。
     box.appendChild(el('div', 'pet-editor-divider'));
     box.appendChild(el('div', 'pet-field-label', '程序化运动（不占额外帧）'));
     const row4 = el('div', 'pet-editor-row');
@@ -3268,26 +3324,28 @@ export function createSettingsPanel({
     }));
     box.appendChild(row4);
 
-    const blinkField = el('div', 'pet-field');
-    blinkField.appendChild(el('div', 'pet-field-label', '眨眼帧'));
-    const blinkInput = el('input', 'pet-input');
-    blinkInput.type = 'text';
-    blinkInput.placeholder = '例如 2,3（留空 = 不眨眼）';
-    blinkInput.value = draft.blinkFrames.join(',');
-    blinkInput.dataset.marqueeIgnore = 'true';
-    blinkInput.addEventListener('input', () => {
-      draft.blinkFrames = blinkInput.value
-        .split(/[,，\s]+/)
-        .map((part) => Number(part))
-        .filter((number) => Number.isInteger(number) && number >= 0);
-    });
-    blinkField.appendChild(blinkInput);
-    blinkField.appendChild(el(
-      'div',
-      'pet-field-hint',
-      '要填真的有闭眼的那几帧（从 0 开始数），否则会把睁眼帧当成眨眼。',
-    ));
-    box.appendChild(blinkField);
+    if (!container) {
+      const blinkField = el('div', 'pet-field');
+      blinkField.appendChild(el('div', 'pet-field-label', '眨眼帧'));
+      const blinkInput = el('input', 'pet-input');
+      blinkInput.type = 'text';
+      blinkInput.placeholder = '例如 2,3（留空 = 不眨眼）';
+      blinkInput.value = draft.blinkFrames.join(',');
+      blinkInput.dataset.marqueeIgnore = 'true';
+      blinkInput.addEventListener('input', () => {
+        draft.blinkFrames = blinkInput.value
+          .split(/[,，\s]+/)
+          .map((part) => Number(part))
+          .filter((number) => Number.isInteger(number) && number >= 0);
+      });
+      blinkField.appendChild(blinkInput);
+      blinkField.appendChild(el(
+        'div',
+        'pet-field-hint',
+        '要填真的有闭眼的那几帧（从 0 开始数），否则会把睁眼帧当成眨眼。',
+      ));
+      box.appendChild(blinkField);
+    }
 
     // ---- 操作
     const actions = el('div', 'pet-panel-toolbar');
@@ -3297,13 +3355,6 @@ export function createSettingsPanel({
       actionDraft = null;
       render();
     }));
-    if (entry.kind === 'animated') {
-      actions.appendChild(el(
-        'span',
-        'pet-card-meta',
-        '这个动作是动图容器（浏览器播放），帧率与帧时长对它无效',
-      ));
-    }
     box.appendChild(actions);
     return box;
   }
@@ -3349,32 +3400,48 @@ export function createSettingsPanel({
     const entry = (detail.actions || []).find((item) => item.action === action) || {};
     const patch = {};
 
-    if (Number(entry.fps) !== Number(draft.fps)) patch.fps = draft.fps;
-    if ((entry.loop !== false) !== Boolean(draft.loop)) patch.loop = Boolean(draft.loop);
-    if (Number(entry.frames) !== Number(draft.frames)) patch.frames = draft.frames;
+    // ★ 动图容器**只提交权重与程序化运动**。
+    //
+    // 帧率 / 每帧时长 / 循环 / 帧数 / 排布对容器都没有意义，后端的
+    // `_parse_animated_layout` 会直接拒绝（实测提交 fps 得到
+    // `pack_field_invalid`）。编辑区已经把这些控件藏起来了，但提交侧
+    // 也必须挡住——否则「草稿里的默认值恰好与现状不同」时会误提交，
+    // 用户点了保存却吃一个看不懂的报错。
+    const container = isAnimatedContainer(entry);
 
-    const hadFrameMs = Array.isArray(entry.frameMs) && entry.frameMs.length > 0;
-    if (draft.useFrameMs) {
-      const same = hadFrameMs
-        && entry.frameMs.length === draft.frameMs.length
-        && entry.frameMs.every((value, index) => Number(value) === Number(draft.frameMs[index]));
-      if (!same) patch.frameMs = draft.frameMs.map((value) => Number(value) || 100);
-    } else if (hadFrameMs) {
-      // 关掉 = 删除该字段（回落到按帧率的均匀节奏）
-      patch.frameMs = null;
-    }
+    if (!container) {
+      if (Number(entry.fps) !== Number(draft.fps)) patch.fps = draft.fps;
+      if ((entry.loop !== false) !== Boolean(draft.loop)) patch.loop = Boolean(draft.loop);
+      if (Number(entry.frames) !== Number(draft.frames)) patch.frames = draft.frames;
 
-    const grid = frameGrid({
-      frames: entry.frames, layout: entry.layout, cols: entry.cols, rows: entry.rows,
-    });
-    const currentLayout = grid.cols > 1 && grid.rows > 1 ? 'grid'
-      : (grid.rows > 1 ? 'vertical' : 'horizontal');
-    if (currentLayout !== draft.layout) patch.layout = draft.layout;
-    if (draft.layout === 'grid') {
-      if (grid.cols !== draft.cols) patch.cols = draft.cols;
-      if (grid.rows !== draft.rows) patch.rows = draft.rows;
+      const hadFrameMs = Array.isArray(entry.frameMs) && entry.frameMs.length > 0;
+      if (draft.useFrameMs) {
+        const same = hadFrameMs
+          && entry.frameMs.length === draft.frameMs.length
+          && entry.frameMs.every((value, index) => Number(value) === Number(draft.frameMs[index]));
+        if (!same) patch.frameMs = draft.frameMs.map((value) => Number(value) || 100);
+      } else if (hadFrameMs) {
+        // 关掉 = 删除该字段（回落到按帧率的均匀节奏）
+        patch.frameMs = null;
+      }
+
+      const grid = frameGrid({
+        frames: entry.frames, layout: entry.layout, cols: entry.cols, rows: entry.rows,
+      });
+      const currentLayout = grid.cols > 1 && grid.rows > 1 ? 'grid'
+        : (grid.rows > 1 ? 'vertical' : 'horizontal');
+      if (currentLayout !== draft.layout) patch.layout = draft.layout;
+      if (draft.layout === 'grid') {
+        if (grid.cols !== draft.cols) patch.cols = draft.cols;
+        if (grid.rows !== draft.rows) patch.rows = draft.rows;
+      }
     }
     if (Number(entry.weight) !== Number(draft.weight)) patch.weight = draft.weight;
+    // 单套动画时权重无意义（编辑区也不显示它），别把它写进包里
+    if (Object.prototype.hasOwnProperty.call(patch, 'weight')
+      && (!Array.isArray(entry.variants) || entry.variants.length <= 1)) {
+      delete patch.weight;
+    }
 
     // 程序化运动：把草稿拼成一个完整的 motion 对象（或 null = 删除）
     const motion = normalizeMotion(entry);

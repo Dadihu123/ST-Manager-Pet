@@ -384,6 +384,103 @@ try {
 
   const relevant = consoleErrors.filter((line) => !line.includes('favicon'));
   record('⑥ 运行期无未捕获异常 / 错误日志', relevant.length === 0, relevant.slice(0, 4).join('\n        '));
+
+  // ============================================ ⑦ 动图容器：无意义的字段要藏起来
+  //
+  // `layout: "animated"` 的动图容器由浏览器直接播 Gif / WebP，**不切帧**，
+  // 因此帧率 / 每帧时长 / 循环 / 帧数 / 排布对它全都没有意义，
+  // 后端的 `_parse_animated_layout` 会直接拒绝这些字段。
+  //
+  // ⚠️ 判据必须是 `layout`，**不能**是 `entry.kind`：`kind === 'animated'`
+  // 说的是「这个动作有 sheet、能播帧」（`pack.KIND_ANIMATED`），
+  // 对**每一个**正常形象都成立——第一版拿它当判据，于是每个动作的编辑区
+  // 都写着「这个动作是动图容器（浏览器播放）」。
+  const containerId = await page.evaluate(`(async () => {
+    const list = await window.__petApi.api('/pets', { method: 'GET' });
+    for (const item of (list.items || []).filter((i) => i.writable)) {
+      const res = await window.__petApi.api('/pets/' + item.id + '/preview', { method: 'GET' });
+      if ((res.actions || []).some((a) => a.layout === 'animated')) return item.id;
+    }
+    return '';
+  })()`);
+
+  if (containerId) {
+    const container = await page.evaluate(`(async () => {
+      const cards = [...document.querySelectorAll('.plugin-stm-pet .pet-card')];
+      const card = cards.find((c) => c.dataset.petId === ${JSON.stringify(containerId)});
+      if (card) card.click();
+      await new Promise((r) => setTimeout(r, 1400));
+      const tile = [...document.querySelectorAll('.plugin-stm-pet .pet-action-tile')]
+        .find((t) => [...t.querySelectorAll('button')].some((b) => b.textContent.trim() === '动画参数'));
+      if (!tile) return { opened: false };
+      [...tile.querySelectorAll('button')].find((b) => b.textContent.trim() === '动画参数').click();
+      await new Promise((r) => setTimeout(r, 600));
+      const ed = document.querySelector('.plugin-stm-pet .pet-action-editor');
+      if (!ed) return { opened: false };
+      return {
+        opened: true,
+        labels: [...ed.querySelectorAll('.pet-field-label')].map((n) => n.textContent.trim()),
+        hint: (ed.querySelector('.pet-field-hint') || {}).textContent || '',
+      };
+    })()`);
+    record(
+      '⑦ ★ 动图容器：编辑区**不显示**帧率 / 帧数 / 排布（它们对容器没有意义）',
+      container.opened
+        && !container.labels.includes('帧率')
+        && !container.labels.includes('帧数')
+        && !container.labels.includes('排布'),
+      `字段=${JSON.stringify(container.labels)}`,
+    );
+    record(
+      '⑦ ★ 动图容器：仍然保留**呼吸**（容器可以呼吸，只是不能眨眼）',
+      container.opened && container.labels.some((l) => l.includes('呼吸')),
+      `字段=${JSON.stringify(container.labels)}`,
+    );
+    record(
+      '⑦ 动图容器：说明了「为什么不显示那些字段」',
+      container.opened && container.hint.includes('不切帧'),
+      `提示=${JSON.stringify(String(container.hint).trim().slice(0, 90))}`,
+    );
+  } else {
+    record('⑦ 动图容器用例', true, '沙箱里没有动图容器形象，跳过');
+  }
+
+  // ============================================ ⑧ 换形象要丢掉编辑草稿
+  //
+  // `editingAction` / `actionDraft` 是模块级的。切形象时不清掉的话，
+  // 编辑区会带着**上一个形象**的帧率 / 帧数 / 呼吸幅度显示出来，
+  // 而点「保存」会把这些值写进**新形象**的 pet.json——静默的数据损坏
+  // （用户只是看了一眼另一个形象）。
+  const stale = await page.evaluate(`(async () => {
+    const list = await window.__petApi.api('/pets', { method: 'GET' });
+    const writable = (list.items || []).filter((i) => i.writable);
+    if (writable.length < 2) return { skipped: true };
+    const cards = [...document.querySelectorAll('.plugin-stm-pet .pet-card')];
+    // 先给 A 打开编辑区
+    const a = cards.find((c) => c.dataset.petId === writable[0].id);
+    if (a) a.click();
+    await new Promise((r) => setTimeout(r, 1300));
+    const tile = [...document.querySelectorAll('.plugin-stm-pet .pet-action-tile')]
+      .find((t) => [...t.querySelectorAll('button')].some((b) => b.textContent.trim() === '动画参数'));
+    [...tile.querySelectorAll('button')].find((b) => b.textContent.trim() === '动画参数').click();
+    await new Promise((r) => setTimeout(r, 500));
+    const openedForA = Boolean(document.querySelector('.plugin-stm-pet .pet-action-editor'));
+    // 再切到 B
+    const b = cards.find((c) => c.dataset.petId === writable[1].id);
+    if (b) b.click();
+    await new Promise((r) => setTimeout(r, 1400));
+    return {
+      openedForA,
+      stillOpenForB: Boolean(document.querySelector('.plugin-stm-pet .pet-action-editor')),
+    };
+  })()`);
+  record(
+    '⑧ ★ 换形象后编辑区**不残留**（否则保存会把上一个形象的值写进这一个）',
+    stale.skipped || (stale.openedForA && !stale.stillOpenForB),
+    stale.skipped
+      ? '可写形象少于两个，跳过'
+      : `给 A 打开了编辑区=${stale.openedForA}；切到 B 之后还在=${stale.stillOpenForB}`,
+  );
 } finally {
   await browser.close();
 }

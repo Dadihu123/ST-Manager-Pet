@@ -1862,7 +1862,9 @@ PET_PATCH_FIELDS = (
 )
 
 
-def parse_animation_patch(action: str, patch: dict, *, frames_hint: int = 0) -> dict:
+def parse_animation_patch(
+    action: str, patch: dict, *, frames_hint: int = 0, animated: bool = False,
+) -> dict:
     """校验并规范化一份**每动作动画**的补丁，返回可直接写进 `pet.json` 的片段。
 
     为什么要单独一个入口：面板改的是 `pet.json` 里**动作对象**的若干字段
@@ -1880,12 +1882,29 @@ def parse_animation_patch(action: str, patch: dict, *, frames_hint: int = 0) -> 
         patch: `{字段名: 值}`。`None` 表示**删除**该字段（回落到默认值）。
         frames_hint: 这个动作当前的帧数，用于校验 `frameMs` 长度与
             `motion.blink.frames` 的帧号。
+        animated: 这个动作是不是**动图容器**（`layout: "animated"`）。
+            容器不切帧，因此帧率 / 每帧时长 / 循环 / 帧数 / 排布
+            **全都无意义**——这里明确报错，而不是写进去之后让
+            `loads_pack` 抛一个「整包读不出来」的含糊错误。
 
     Returns:
         dict: 规范化后的片段（值为 `None` 的键表示「删除」）。
     """
     if not isinstance(patch, dict):
         raise _field_error(f'animations.{action}', '补丁应为对象')
+
+    #: 动图容器上**没有意义**的字段（写它们必须报错，见 `animated` 参数）。
+    frame_only = ('fps', 'frameMs', 'loop', 'frames', 'layout', 'cols', 'rows')
+    if animated:
+        stray = [key for key in patch if key in frame_only]
+        if stray:
+            raise _field_error(
+                f'animations.{action}.{stray[0]}',
+                '动图容器不切帧，这个字段对它没有意义',
+                hint='容器（layout: "animated"）由浏览器直接播放 Gif / WebP，'
+                     '因此帧率、每帧时长、循环、帧数、排布都不适用。'
+                     '能调的是 weight 与 motion（呼吸）。',
+            )
 
     result = {}
     for key, value in patch.items():
