@@ -131,19 +131,26 @@ export async function activate(api) {
   /** 把宿主 config 与插件设置折算成宠物视图要的形态（键名归一）。 */
   function viewConfig(extra = {}) {
     const config = state.config || {};
-    // 倍率与渲染方式的**权威值来自后端**（它按「用户设置 > 包内声明 > 全局默认」
-    // 算好了，见 `store.effective_scale`）。这里只在形象数据还没到位时
-    // 用宿主表单的全局值兜底，避免启动瞬间跳一下。
     const pack = state.pack || {};
+    // ★ 倍率 / 渲染方式 / 动画速度 / 自动漫游 / 打盹阈值**全部按形象**，
+    // 权威值来自后端（它按「用户设置 > 包内声明 > 默认」算好了）。
+    //
+    // 为什么不再读宿主的 `config`：用户明确要求「不要搞全局的，在同一个
+    // 地方调整的数值却分成全局和形象绑定两种情况，用户可能会困惑」。
+    // 因此 `scale` / `auto_roam` / `sleep_after` / `anim_speed` 四个键
+    // 已从 `config_schema` 移出，这里也不再读它们——
+    // 只在形象数据还没到位时用**后端同一套默认值**兜底。
     return Object.assign({
       quietMode: config.quiet_mode === true,
-      autoRoam: config.auto_roam !== false,
-      scale: pack.scale !== undefined ? pack.scale : (Number(config.scale) || 1),
+      autoRoam: pack.autoRoam !== false,
+      scale: pack.scale !== undefined ? pack.scale : 1,
       pixelated: pack.pixelated === true,
-      sleepAfter: Number(config.sleep_after) || 120,
+      // 打盹阈值以 `schedule.sleep.afterMs` 为准（见 `petview.sleepAfterMs()`）；
+      // 这里给的只是「后端还没下发时」的兜底，与 `DEFAULT_SCHEDULE_MS.sleep` 一致。
+      sleepAfter: 120,
       // 动画速度倍率（越大越慢）。形象包已经按自己的节奏声明了 fps /
       // 非均匀帧时长，这里只做**整体缩放**——用户觉得「太快了」时不必改包。
-      animSpeed: Number(config.anim_speed) || 1,
+      animSpeed: Number(pack.animSpeed) || 1,
       showToast: config.show_toast === true,
       reducedMotion: state.hostState ? state.hostState.reducedMotion : false,
     }, extra);

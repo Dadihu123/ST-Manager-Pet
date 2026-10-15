@@ -623,6 +623,27 @@ DEFAULT_PIXELATED = False
 #: 优先级（`store.effective_scale`）：**用户设置 > 包内声明 > 宿主表单默认值**。
 DEFAULT_SCALE = 1.0
 
+#: 形象自带的**动画速度倍率**（可选字段）。语义与面板上那个「动画速度」一致：
+#: 越大越慢（2 = 播放时间翻倍）。`1.0` 表示「按包内 `fps` / `frameMs` 原速」。
+#:
+#: 为什么让包声明它：同一份素材在不同用途下想要的快慢不同——100 帧的平滑
+#: 循环按原速播可能太赶，4 帧的像素猫按原速播又可能太慢。作者最清楚。
+#: 优先级：**用户设置 > 包内声明 > 1.0**。
+DEFAULT_ANIM_SPEED = 1.0
+
+#: 动画速度倍率的合法区间。与前端 `ANIM_SPEED_MIN` / `ANIM_SPEED_MAX` 必须一致。
+#:
+#: 上界 4（播放时间翻四倍）已经慢到能看清每一帧；下界 0.25 是「四倍速」，
+#: 再快就看不清动作了。
+ANIM_SPEED_RANGE = (0.25, 4.0)
+
+#: 这个形象是否参与**自动漫游**（可选字段，缺省 true）。
+#:
+#: 允许关掉的理由：不是每个形象都「会走」——坐着的猫、躺着的玩偶自己溜达
+#: 起来很出戏。作者可以声明 `"autoRoam": false`。
+#: 优先级：**用户设置 > 包内声明 > true**。
+DEFAULT_AUTO_ROAM = True
+
 #: 倍率的合法区间：`(最小值, 最大值)`。全闭区间。
 #:
 #: 定这个区间的依据是「要同时覆盖二次元小图与真人立绘，又不能把宠物放大到
@@ -1299,6 +1320,10 @@ class PetPack:
     scale: float = DEFAULT_SCALE
     #: 是否按像素风渲染（可选，默认平滑插值，见 `DEFAULT_PIXELATED`）。
     pixelated: bool = DEFAULT_PIXELATED
+    #: 形象自带的**动画速度倍率**（可选，见 `DEFAULT_ANIM_SPEED`）。
+    anim_speed: float = DEFAULT_ANIM_SPEED
+    #: 这个形象是否参与**自动漫游**（可选，见 `DEFAULT_AUTO_ROAM`）。
+    auto_roam: bool = DEFAULT_AUTO_ROAM
     physics: dict = field(default_factory=lambda: dict(DEFAULT_PHYSICS))
     animations: dict = field(default_factory=dict)
     #: **标准图像**的原始声明（`None` = 作者没声明，回落 idle 首帧）。
@@ -1595,6 +1620,8 @@ class PetPack:
             'anchor': dict(self.anchor),
             'scale': self.scale,
             'pixelated': self.pixelated,
+            'animSpeed': self.anim_speed,
+            'autoRoam': self.auto_roam,
             'physics': dict(self.physics),
             'animations': {key: spec.to_dict() for key, spec in self.animations.items()},
             'still': self.resolve_still().to_dict(),
@@ -2726,6 +2753,24 @@ def from_dict(raw: dict, *, pack_id: str = '', allow_source_jpeg: bool = False) 
     # ---- 渲染方式（可选；缺省 = 平滑插值）----
     pack.pixelated = _read_bool(raw, 'pixelated', DEFAULT_PIXELATED)
 
+    # ---- 形象建议的动画速度倍率（可选；缺省 1.0 = 按包内 fps 原速）----
+    #
+    # 为什么让**包**能声明它：`fps` 是「这套动画的节奏」，而倍率是
+    # 「整体快慢」。同一份素材在不同用途下想要的快慢不同——100 帧的平滑
+    # 循环按原速播可能太赶，4 帧的像素猫按原速播又可能太慢。
+    # 作者最清楚自己的素材该多快，因此允许声明；用户在面板上还能覆盖。
+    pack.anim_speed = _read_number(
+        raw, 'animSpeed', DEFAULT_ANIM_SPEED,
+        low=ANIM_SPEED_RANGE[0], high=ANIM_SPEED_RANGE[1],
+    )
+
+    # ---- 这个形象是否参与自动漫游（可选；缺省 true）----
+    #
+    # 允许关掉的理由：不是每个形象都「会走」——坐着的猫、躺着的玩偶
+    # 自己溜达起来很出戏。作者可以声明 `"autoRoam": false` 表示
+    # 「我这个形象不适合漫游」；用户在面板上还能按形象覆盖。
+    pack.auto_roam = _read_bool(raw, 'autoRoam', DEFAULT_AUTO_ROAM)
+
     # ---- 物理 ----
     pack.physics = _parse_mapping(
         raw.get('physics'), 'physics', DEFAULT_PHYSICS,
@@ -2787,7 +2832,7 @@ def from_dict(raw: dict, *, pack_id: str = '', allow_source_jpeg: bool = False) 
     # ---- 向前兼容：记录被忽略的未知顶层字段 ----
     known = {
         'format', 'id', 'name', 'author', 'size', 'anchor', 'scale', 'pixelated',
-        'physics', 'animations', 'still', 'schedule',
+        'physics', 'animations', 'still', 'schedule', 'animSpeed', 'autoRoam',
     }
     pack.ignored_fields = sorted(str(key) for key in raw.keys() if key not in known)
 

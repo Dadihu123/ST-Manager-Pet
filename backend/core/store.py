@@ -83,7 +83,10 @@ from .pack import (
     MAX_SCHEDULE_MS,
     MIN_SCHEDULE_MS,
     ONE_SHOT_ACTIONS,
+    ANIM_SPEED_RANGE,
     BEHAVIOR_FIELDS,
+    DEFAULT_ANIM_SPEED,
+    DEFAULT_AUTO_ROAM,
     SCHEDULE_BEHAVIORS,
     SLEEP_AFTER_RANGE,
     STILL_ACTION,
@@ -154,6 +157,18 @@ DEFAULT_SETTINGS = {
     #: 与 `petScales` 同样的道理：像素风与写实插画对放大方式的要求**互斥**
     #: （前者要硬边、后者要平滑），包能声明默认值，用户还能按自己屏幕覆盖。
     'petPixelated': {},
+    #: 逐形象的**动画速度倍率**覆盖：`{pet_id: float}`（越大越慢）。
+    #:
+    #: 与 `petScales` / `petPixelated` 同一套规则（用户设置 > 包内声明 > 默认）。
+    #: 为什么**不**放在宿主的 `config_schema` 里：用户明确要求
+    #: 「不要搞全局的，在同一个地方调整的数值却分成全局和形象绑定两种情况，
+    #: 用户可能会困惑」——面板里那一片设置全部按形象，不再混着全局值。
+    'petAnimSpeeds': {},
+    #: 逐形象的**自动漫游开关**覆盖：`{pet_id: bool}`。
+    #:
+    #: 不是每个形象都「会走」——坐着的猫、躺着的玩偶自己溜达起来很出戏。
+    #: 包可以声明 `"autoRoam": false`，用户还能按形象覆盖。
+    'petAutoRoam': {},
     #: 逐形象的**时间驱动行为节奏**覆盖：
     #: `{pet_id: {行为名: {'minIntervalMs': int, 'maxIntervalMs': int, 'plays': int}}}`。
     #:
@@ -240,6 +255,20 @@ def clamp_schedule_ms(value) -> int:
     except (TypeError, ValueError):
         return MIN_SCHEDULE_MS
     return int(min(max(number, MIN_SCHEDULE_MS), MAX_SCHEDULE_MS))
+
+
+def clamp_anim_speed(value) -> float:
+    """把动画速度倍率夹到合法区间内（与 `pack.ANIM_SPEED_RANGE` 一致）。
+
+    与 `clamp_scale` 同样的取舍：夹住而不是抛错（值来自设置文件或包）。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_ANIM_SPEED
+    if number != number:  # NaN
+        return DEFAULT_ANIM_SPEED
+    return float(min(max(number, ANIM_SPEED_RANGE[0]), ANIM_SPEED_RANGE[1]))
 
 
 def clamp_sleep_after_ms(value) -> int:
@@ -437,6 +466,8 @@ class PetStore:
         settings['petScales'] = {}
         settings['petPixelated'] = {}
         settings['petSchedules'] = {}
+        settings['petAnimSpeeds'] = {}
+        settings['petAutoRoam'] = {}
         path = self.settings_path()
         if not os.path.isfile(path):
             return settings
@@ -450,11 +481,13 @@ class PetStore:
             for key, value in stored.items():
                 if key in DEFAULT_SETTINGS:
                     settings[key] = value
-        # 三个结构化项必须逐条清洗：
+        # 结构化项必须逐条清洗：
         # 手工编辑过 / 旧版本写坏的值不能让整个设置读不出来。
         settings['petScales'] = self._clean_scale_map(settings.get('petScales'))
         settings['petPixelated'] = self._clean_bool_map(settings.get('petPixelated'))
         settings['petSchedules'] = self._clean_schedule_map(settings.get('petSchedules'))
+        settings['petAnimSpeeds'] = self._clean_anim_speed_map(settings.get('petAnimSpeeds'))
+        settings['petAutoRoam'] = self._clean_bool_map(settings.get('petAutoRoam'))
         # 隐藏开关必须是**真布尔**：手工写了 `"false"`（字符串）时
         # `bool("false")` 是 `True`，宠物会莫名其妙消失。
         settings['petHidden'] = settings.get('petHidden') is True
@@ -471,6 +504,25 @@ class PetStore:
             if not pet_id or not isinstance(value, bool):
                 continue
             cleaned[pet_id] = value
+        return cleaned
+
+    @staticmethod
+    def _clean_anim_speed_map(raw) -> dict:
+        """把 `{pet_id: 动画速度倍率}` 清洗成「合法 id → 夹过的倍率」。
+
+        与 `_clean_scale_map` 同一套取舍：脏值**夹住**而不是丢弃整项——
+        一个坏值不该让「打开设置面板」整件事失败。
+        """
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for key, value in raw.items():
+            pet_id = sanitize_pet_id(key, fallback='')
+            if not pet_id:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            cleaned[pet_id] = clamp_anim_speed(value)
         return cleaned
 
     @staticmethod
@@ -570,6 +622,10 @@ class PetStore:
                     settings[key] = self._clean_bool_map(value)
                 elif key == 'petSchedules':
                     settings[key] = self._clean_schedule_map(value)
+                elif key == 'petAnimSpeeds':
+                    settings[key] = self._clean_anim_speed_map(value)
+                elif key == 'petAutoRoam':
+                    settings[key] = self._clean_bool_map(value)
                 else:
                     settings[key] = value
             self._write_json(self.settings_path(), settings)
@@ -583,13 +639,16 @@ class PetStore:
         优先级（用户明确要求「不同形象需要的大小不同」）：
         1. **用户设置** `settings.petScales[<id>]` —— 用户在面板上拖的滑块；
         2. **包内声明** `pet.json` 的 `scale` —— 作者认为这个形象适合多大；
-        3. **宿主表单默认值** `host_default`（manifest 的 `scale`）—— 全局兜底。
+        3. **默认值** `DEFAULT_SCALE`（1.0）。
+
+        ⚠️ 第 3 条过去是「宿主表单的全局 `scale`」。用户要求
+        「不要搞全局的，在同一个地方调整的数值却分成全局和形象绑定两种情况，
+        用户可能会困惑」，因此 `scale` 已从 `config_schema` 移出，
+        这个 `host_default` 参数只为兼容旧调用方保留（传了也**不生效**）。
 
         Args:
             pet_id: 形象 id。
-            host_default: 宿主 `config_schema` 里的 `scale` 值；`None` 时用
-                `DEFAULT_SCALE`。**由调用方传入**是因为标量配置的唯一来源是宿主，
-                store 不该自己去读（它没有 api）。
+            host_default: **已废弃**，忽略。
 
         Returns:
             float: 夹在 `SCALE_RANGE` 内的倍率。
@@ -601,12 +660,12 @@ class PetStore:
         try:
             pack = self.load_pack(pet_id)
             declared = float(pack.scale)
-            # 包内声明了非 1.0 的值就用它；1.0 视为「没意见」，继续往全局兜底
+            # 包内声明了非 1.0 的值就用它；1.0 视为「没意见」，用默认值
             if declared != DEFAULT_SCALE:
                 return clamp_scale(declared)
         except PetError:
             pass
-        return clamp_scale(host_default if host_default is not None else DEFAULT_SCALE)
+        return clamp_scale(DEFAULT_SCALE)
 
     def set_pet_scale(self, pet_id: str, value) -> float:
         """写入某形象的倍率覆盖（不校验形象是否存在——由调用方决定）。"""
@@ -669,6 +728,93 @@ class PetStore:
                 return False
             del flags[pet_id]
             settings['petPixelated'] = flags
+            self._write_json(self.settings_path(), settings)
+        return True
+
+    # ------------------------------------------------------------ 逐形象行为参数
+    #
+    # 用户明确要求：「不要搞全局的，在同一个地方调整的数值却分成全局和
+    # 形象绑定两种情况，用户可能会困惑」。因此「动画速度」与「自动漫游」
+    # 从宿主的 config_schema **移出**，改成与倍率 / 渲染方式同一套：
+    # **用户设置 > 包内声明 > 默认值**。
+    #
+    # 这样面板里「触发时间 / 外观」那一片全部是按形象的，不再混着全局值。
+
+    def effective_anim_speed(self, pet_id: str) -> float:
+        """算出某形象**实际生效**的动画速度倍率（越大越慢）。
+
+        优先级：用户设置 > 包内声明（`pet.json` 的 `animSpeed`）> `DEFAULT_ANIM_SPEED`。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        stored = self.get_settings().get('petAnimSpeeds') or {}
+        if pet_id in stored:
+            return clamp_anim_speed(stored[pet_id])
+        try:
+            return clamp_anim_speed(self.load_pack(pet_id).anim_speed)
+        except PetError:
+            return DEFAULT_ANIM_SPEED
+
+    def set_pet_anim_speed(self, pet_id: str, value) -> float:
+        """写入某形象的动画速度覆盖。"""
+        pet_id = sanitize_pet_id(pet_id)
+        speed = clamp_anim_speed(value)
+        with self._lock:
+            settings = self.get_settings()
+            speeds = dict(settings.get('petAnimSpeeds') or {})
+            speeds[pet_id] = speed
+            settings['petAnimSpeeds'] = speeds
+            self._write_json(self.settings_path(), settings)
+        return speed
+
+    def clear_pet_anim_speed(self, pet_id: str) -> bool:
+        """删掉某形象的动画速度覆盖（回落到包内声明 / 默认）。"""
+        pet_id = sanitize_pet_id(pet_id)
+        with self._lock:
+            settings = self.get_settings()
+            speeds = dict(settings.get('petAnimSpeeds') or {})
+            if pet_id not in speeds:
+                return False
+            del speeds[pet_id]
+            settings['petAnimSpeeds'] = speeds
+            self._write_json(self.settings_path(), settings)
+        return True
+
+    def effective_auto_roam(self, pet_id: str) -> bool:
+        """算出某形象**实际生效**的「是否参与自动漫游」。
+
+        优先级：用户设置 > 包内声明（`pet.json` 的 `autoRoam`）> `DEFAULT_AUTO_ROAM`。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        stored = self.get_settings().get('petAutoRoam') or {}
+        if pet_id in stored:
+            return bool(stored[pet_id])
+        try:
+            return bool(self.load_pack(pet_id).auto_roam)
+        except PetError:
+            return DEFAULT_AUTO_ROAM
+
+    def set_pet_auto_roam(self, pet_id: str, value) -> bool:
+        """写入某形象的自动漫游开关。"""
+        pet_id = sanitize_pet_id(pet_id)
+        flag = bool(value)
+        with self._lock:
+            settings = self.get_settings()
+            flags = dict(settings.get('petAutoRoam') or {})
+            flags[pet_id] = flag
+            settings['petAutoRoam'] = flags
+            self._write_json(self.settings_path(), settings)
+        return flag
+
+    def clear_pet_auto_roam(self, pet_id: str) -> bool:
+        """删掉某形象的自动漫游覆盖（回落到包内声明 / 默认）。"""
+        pet_id = sanitize_pet_id(pet_id)
+        with self._lock:
+            settings = self.get_settings()
+            flags = dict(settings.get('petAutoRoam') or {})
+            if pet_id not in flags:
+                return False
+            del flags[pet_id]
+            settings['petAutoRoam'] = flags
             self._write_json(self.settings_path(), settings)
         return True
 
@@ -978,8 +1124,14 @@ class PetStore:
             # 列表也要带上生效值，否则面板切形象时得等详情接口回来才知道大小
             'scale': self.effective_scale(pet_id),
             'pixelated': self.effective_pixelated(pet_id),
+            # 动画速度与自动漫游同样**按形象**（用户要求不要搞全局的）。
+            # 前端直接用这里的生效值，不再去读宿主的 config。
+            'animSpeed': self.effective_anim_speed(pet_id),
+            'autoRoam': self.effective_auto_roam(pet_id),
             'declaredScale': clamp_scale(pack.scale),
             'declaredPixelated': bool(pack.pixelated),
+            'declaredAnimSpeed': clamp_anim_speed(pack.anim_speed),
+            'declaredAutoRoam': bool(pack.auto_roam),
             # 标准图像是否由作者显式声明（`False` = 回落 idle 首帧）。
             # 面板据此提示「建议显式设一张标准图像」，因为回落值在
             # idle 挂了两套动画时可能是个怪姿势。
@@ -1307,9 +1459,16 @@ class PetStore:
             # 不再自己判断优先级，避免两边规则不一致。
             'scale': self.effective_scale(pet_id, host_default=host_default_scale),
             'pixelated': self.effective_pixelated(pet_id),
+            # 动画速度与自动漫游同样**按形象**（用户要求不要搞全局的）。
+            # 前端直接用这里的生效值，不再去读宿主的 config——
+            # 否则会出现「同一个面板里有的设置是全局的、有的是按形象的」。
+            'animSpeed': self.effective_anim_speed(pet_id),
+            'autoRoam': self.effective_auto_roam(pet_id),
             # 包内声明值，供面板显示「作者建议 / 已覆盖」的对比
             'declaredScale': clamp_scale(pack.scale),
             'declaredPixelated': bool(pack.pixelated),
+            'declaredAnimSpeed': clamp_anim_speed(pack.anim_speed),
+            'declaredAutoRoam': bool(pack.auto_roam),
             'writable': not self._is_builtin_only(pet_id),
             # `pet.json` 的 `id` 与**目录名**不一致时带上提示（见 `_describe`）。
             # 两者是同一个东西的两个来源，而目录名才是生效的那个。

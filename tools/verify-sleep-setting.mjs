@@ -93,15 +93,19 @@ try {
     `idle=${JSON.stringify(shape.schedule.idle)} roam=${JSON.stringify(shape.schedule.roam)}`,
   );
   record(
-    '② ★ 没设时是 `null`（= 跟随宿主全局），不是写死的默认值',
+    '② ★ 没设时是 `null`（= 用默认值），不是某个全局值',
     sleepSpec.afterMs === null,
-    `afterMs=${JSON.stringify(sleepSpec.afterMs)}`
-    + `；宿主全局 sleep_after=${JSON.stringify(shape.hostSleepAfter)} 秒`,
+    `afterMs=${JSON.stringify(sleepSpec.afterMs)}`,
   );
+  // ★ 这条原本查的是「后端把宿主的全局 sleep_after 一并下发」。
+  // 用户后来要求「不要搞全局的，在同一个地方调整的数值却分成全局和
+  // 形象绑定两种情况」——因此宿主那个 `sleep_after` 已从 config_schema
+  // 移除，`hostSleepAfter` 也不再下发。这里改为**反向钉死**：
+  // 它必须**不在**，否则「两个入口」的问题会从后门回来。
   record(
-    '② 后端把宿主的全局 `sleep_after` 一并下发（面板要显示它）',
-    Number.isFinite(Number(shape.hostSleepAfter)),
-    `hostSleepAfter=${JSON.stringify(shape.hostSleepAfter)}`,
+    '② ★ 不再下发 `hostSleepAfter`（打盹已是纯按形象，没有全局入口）',
+    !('hostSleepAfter' in shape),
+    `preview 里有没有 hostSleepAfter: ${'hostSleepAfter' in shape}`,
   );
 
   // ============================================ ③ 面板上渲染出来了
@@ -137,7 +141,8 @@ try {
       sleepMax: sliders.length ? sliders[0].max : null,
       sleepStep: sliders.length ? sliders[0].step : null,
       hints: Array.from(document.querySelectorAll('.plugin-stm-pet .pet-field-hint'))
-        .map((n) => n.textContent.trim()).filter((t) => t.includes('打盹') || t.includes('宿主')),
+        .map((n) => n.textContent.trim())
+        .filter((t) => t.includes('打盹') || t.includes('睡着') || t.includes('宿主') || t.includes('全局')),
     };
   })()`);
 
@@ -157,9 +162,9 @@ try {
     `min=${panel.sleepMin} max=${panel.sleepMax} step=${panel.sleepStep}`,
   );
   record(
-    '③ 初值 = 宿主全局值（120 秒），且提示里说明「跟随宿主设置」',
+    '③ 初值是**默认值**（120 秒），不再提「跟随宿主设置」',
     Number(panel.sleepValue) === 120000
-      && panel.hints.some((h) => h.includes('跟随宿主设置')),
+      && panel.hints.every((h) => !h.includes('跟随宿主') && !h.includes('全局值优先')),
     `初值=${panel.sleepValue}ms；提示=${JSON.stringify(panel.hints)}`,
   );
 

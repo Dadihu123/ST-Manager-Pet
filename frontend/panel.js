@@ -76,14 +76,14 @@ const SCHEDULE_BEHAVIORS = [
   {
     key: 'roam',
     label: '自动漫游',
-    hint: '闲着的时候自己在屏幕底部走一走。关掉「自动漫游」开关后这项不生效。',
+    hint: '闲着的时候自己在屏幕底部走一走。关掉上面「外观」里的「自动漫游」后这项不生效。',
   },
   {
     key: 'sleep',
     label: '打盹',
     isThreshold: true,
     hint: '多久没人理它就睡着（睡着后任何操作都会把它唤醒）。'
-      + '比宿主设置里的全局值优先。',
+      + '睡着动画会在当前动作播完之后才开始，不会打断它。',
   },
 ];
 
@@ -124,14 +124,51 @@ const SCALE_MAX = 4;
 const SCALE_STEP = 0.05;
 
 /**
- * 预览速度倍率的区间（与桌面宠物的 `anim_speed` 同区间、同语义：越大越慢）。
+ * 动画速度倍率的区间（越大越慢）。
  *
- * 这里刻意**不复用**宿主的 `anim_speed`：那个是「全局生效」的设置，
- * 在预览器里顺手改它会让用户以为自己只是试了一下，桌面上的宠物却真的变慢了。
- * 预览的速度只影响预览。
+ * 与后端 `pack.ANIM_SPEED_RANGE` **必须一致**——它同时是「按形象的设置」
+ * 与「形象包能声明的字段」的合法区间。
+ *
+ * 这里同时用于两处：
+ * - **按形象的动画速度**（`detail.animSpeed`，落在 `settings.json`）；
+ * - **预览器的播放速度**（只影响预览，不写盘）。
+ *
+ * 预览速度刻意与按形象的那个**分开存**：在预览器里顺手拖一下，
+ * 不应该把桌面上的宠物真的改慢——用户会以为那只是「试了一下」。
  */
 const SPEED_MIN = 0.25;
 const SPEED_MAX = 4;
+/** 滑块步长：0.05 已经够细（0.25~4 之间共 75 档），再细拖起来反而难对准。 */
+const SPEED_STEP = 0.05;
+
+/** 把速度倍率夹到合法区间（与后端 `clamp_anim_speed` 同一套语义）。 */
+function clampSpeed(value) {
+  const number = Number(value);
+  const base = Number.isFinite(number) && number > 0 ? number : 1;
+  return Math.min(Math.max(base, SPEED_MIN), SPEED_MAX);
+}
+
+/** 速度读数的显示格式：`1×` / `1.5×`（去掉多余的小数位）。 */
+function formatSpeed(value) {
+  const number = clampSpeed(value);
+  // ⚠️ 这里**不能**用 `formatNumber`：它定义在 `createSettingsPanel` 内部，
+  // 模块级的这个函数看不到它（踩过：面板整片渲染失败，报
+  // `ReferenceError: formatNumber is not defined`）。
+  const text = Number.isInteger(number) ? String(number) : number.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return `${text}×`;
+}
+
+/**
+ * 速度那一行的说明文字。
+ *
+ * 说清「越大越慢」并给出实际时长——倍率是个抽象数字，
+ * 「一次待机动画大约播多久」才是用户真正在意的。
+ */
+function buildSpeedHint(value, declared) {
+  const base = '越大越慢：1× 按形象包声明的帧率播放，2× 表示播放时间翻倍。';
+  const tail = declared !== 1 ? `形象包建议 ${formatSpeed(declared)}。` : '';
+  return base + tail;
+}
 
 export function createSettingsPanel({
   api, getConfig, getOwnSettings, onConfigChanged, onPetChanged,
@@ -1529,6 +1566,80 @@ export function createSettingsPanel({
     ));
     section.appendChild(renderField);
 
+    // ---- 动画速度（**按形象**）
+    //
+    // 用户要求「不要搞全局的，在同一个地方调整的数值却分成全局和
+    // 形象绑定两种情况」。它原本在宿主表单里（全局 `anim_speed`），
+    // 现在移到这里，与大小倍率 / 渲染方式同一套「按形象记住」。
+    //
+    // 为什么值得按形象：同一份素材在不同用途下想要的快慢不同——
+    // 100 帧的平滑循环按原速播可能太赶，4 帧的像素猫按原速播又可能太慢。
+    const speedCurrent = clampSpeed(Number(detail.animSpeed) || 1);
+    const speedDeclared = clampSpeed(Number(detail.declaredAnimSpeed) || 1);
+    const speedField = el('div', 'pet-field');
+    const speedHead = el('div', 'pet-slider-head');
+    speedHead.appendChild(el('span', 'pet-field-label', '动画速度'));
+    const speedReadout = el('span', 'pet-slider-value', formatSpeed(speedCurrent));
+    speedHead.appendChild(speedReadout);
+    speedField.appendChild(speedHead);
+    const speedHint = el('div', 'pet-field-hint', buildSpeedHint(speedCurrent, speedDeclared));
+    const speedRow = createSliderRow({
+      min: SPEED_MIN,
+      max: SPEED_MAX,
+      step: SPEED_STEP,
+      value: speedCurrent,
+      label: '动画速度',
+      format: (value) => String(value),
+      onInput: (value) => {
+        speedReadout.textContent = formatSpeed(value);
+        speedHint.textContent = buildSpeedHint(value, speedDeclared);
+      },
+      onCommit: (value) => updateAppearance({ animSpeed: value }),
+    });
+    speedRow.slider.classList.add('pet-slider-speed');
+    speedField.appendChild(speedRow.row);
+    speedField.appendChild(speedHint);
+    const speedRange = el('div', 'pet-slider-range');
+    speedRange.appendChild(el('span', null, formatSpeed(SPEED_MIN)));
+    speedRange.appendChild(el('span', null, formatSpeed(SPEED_MAX)));
+    speedField.appendChild(speedRange);
+    speedField.appendChild(button('恢复默认速度', 'is-icon', () => {
+      updateAppearance({ animSpeed: null });
+    }));
+    section.appendChild(speedField);
+
+    // ---- 自动漫游（**按形象**）
+    //
+    // 同样是「按形象」的：不是每个形象都「会走」——坐着的猫、躺着的玩偶
+    // 自己溜达起来很出戏。作者能在包里声明，用户也能在这里覆盖。
+    const roamField = el('div', 'pet-field');
+    roamField.appendChild(el('div', 'pet-field-label', '自动漫游'));
+    const roamChoice = el('div', 'pet-choice-row');
+    for (const option of [
+      { value: true, label: '允许走动', hint: '闲着时会在屏幕底部走一走' },
+      { value: false, label: '原地不动', hint: '不参与自动漫游，只做待机小动作' },
+    ]) {
+      const isActive = (detail.autoRoam !== false) === option.value;
+      const node = el(
+        'button',
+        `pet-choice ${isActive ? 'is-active' : ''}`.trim(),
+        option.label,
+      );
+      node.type = 'button';
+      node.dataset.marqueeIgnore = 'true';
+      node.title = option.hint;
+      node.addEventListener('click', () => updateAppearance({ autoRoam: option.value }));
+      roamChoice.appendChild(node);
+    }
+    roamField.appendChild(roamChoice);
+    roamField.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '关掉之后这个形象不会自己走动（走动的间隔仍在下面「触发时间」里调）。'
+      + (detail.declaredAutoRoam === false ? '（形象包声明为不漫游）' : ''),
+    ));
+    section.appendChild(roamField);
+
     return section;
   }
 
@@ -1623,13 +1734,11 @@ export function createSettingsPanel({
       const base = Number.isFinite(number) && number > 0 ? number : fallback;
       return Math.round(Math.min(Math.max(base, low), high) / 1000) * 1000;
     };
-    // ★ 没有按形象的值时，显示**宿主全局**的那个（秒 → 毫秒）。
-    // 不能拿一个写死的默认值顶上：宿主表单里那个全局值正是给这种情况用的，
-    // 顶掉它会让用户看到「我在宿主设置里改了却没反应」。
-    const hostMs = clamp((Number(detail.hostSleepAfter) || 120) * 1000);
+    // 打盹阈值是**纯按形象**的（用户要求不要搞全局的），因此没设时
+    // 显示的是**默认值**，而不是某个宿主全局值。
     const declared = Number(current.afterMs);
-    const followsHost = !(Number.isFinite(declared) && declared > 0);
-    const afterMs = followsHost ? hostMs : clamp(declared);
+    const usesDefault = !(Number.isFinite(declared) && declared > 0);
+    const afterMs = usesDefault ? fallback : clamp(declared);
 
     const field = el('div', 'pet-field');
     const head = el('div', 'pet-slider-head');
@@ -1684,7 +1793,6 @@ export function createSettingsPanel({
       'div',
       'pet-field-hint',
       behavior.hint
-      + (followsHost ? `当前跟随宿主设置（${formatMs(hostMs)}）。` : '')
       + (Number(suggested.afterMs) > 0
         ? `形象包建议 ${formatMs(suggested.afterMs)}。`
         : ''),
@@ -1702,7 +1810,7 @@ export function createSettingsPanel({
       'div',
       'pet-field-hint',
       '只有「由时间自己发生」的行为能设间隔。点击、下落、播报这些由事件触发，'
-      + '没有「多久一次」可言。这两项是按形象记住的。',
+      + '没有「多久一次」可言。这三项都是按形象记住的，换形象会自动切回它自己的设置。',
     ));
 
     const effective = detail.schedule || {};
@@ -2043,7 +2151,7 @@ export function createSettingsPanel({
     side.appendChild(el(
       'div',
       'pet-field-hint',
-      '数值越大越慢。桌面上的宠物请用「设置 → 插件」里的「动画速度」统一调。',
+      '数值越大越慢。这里只影响预览；桌面上的宠物请在「外观 → 动画速度」里按形象调。',
     ));
 
     // ---- 帧读数

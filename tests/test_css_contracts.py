@@ -418,10 +418,16 @@ def test_frontend_scale_range_matches_backend():
         assert declared(source, 'SCALE_MIN') == low, f'{filename} 的 SCALE_MIN 应为 {low}'
         assert declared(source, 'SCALE_MAX') == high, f'{filename} 的 SCALE_MAX 应为 {high}'
 
+    # ★ 权威区间**只**在 `pack.py` 里，不再要求 manifest 声明一份。
+    #
+    # 用户要求「不要搞全局的」：`scale` 已从宿主 config_schema 移出，
+    # 改成纯按形象设置（`settings.json` 的 `petScales`）。
+    # 同一份区间声明在三个地方（pack / manifest / 前端）时，改一处就会
+    # 出现「滑块能拖但后端拒绝」；现在只剩 pack 与前端两处，且由这条测试钉住。
     with open(os.path.join(REPO_ROOT, 'manifest.json'), encoding='utf-8') as handle:
-        schema = _json.load(handle)['config_schema']['properties']['scale']
-    assert float(schema['minimum']) == low and float(schema['maximum']) == high, (
-        'manifest 的 scale 区间要与 SCALE_RANGE 一致'
+        schema = _json.load(handle)['config_schema']['properties']
+    assert 'scale' not in schema, (
+        'scale 是按形象的设置，不该再出现在宿主 config_schema 里'
     )
 
 

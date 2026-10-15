@@ -160,55 +160,12 @@ def _read_upload(field: str = 'file', *, limit: int = MAX_IMAGE_BYTES) -> bytes:
     return data
 
 
-def _host_default_scale(api) -> float:
-    """读宿主 `config_schema` 里的全局 `scale`，作为倍率的**兜底默认值**。
-
-    标量配置的唯一来源是宿主的插件设置表单（`api.get_config()`），
-    store 层不自己读它（它没有 api），所以由路由层取出来传进去。
-
-    读不到时返回 `None`，让 store 用自己的默认值——不能在这里抛错：
-    配置读取失败不该让「打开设置面板」这件事整个失败。
-    """
-    try:
-        config = api.get_config() or {}
-    except Exception:  # noqa: BLE001 - 配置读取失败不该阻断形象列表
-        logger.warning('读取宿主配置失败，倍率回落到默认值', exc_info=True)
-        return None
-    value = config.get('scale')
-    if value is None:
-        return None
-    return clamp_scale(value)
-
-
-def _host_sleep_after(api):
-    """读宿主 `config_schema` 里的全局 `sleep_after`（**秒**）。
-
-    它是「多久没交互就睡觉」的全局兜底：`schedule.sleep.afterMs` 为 `null`
-    时生效的就是它。面板要把它显示出来（而不是拿一个写死的默认值顶上——
-    那会让用户看到「我在宿主设置里改了却没反应」）。
-
-    读不到时返回 `None`，由前端用自己的默认值（120 秒）。
-    """
-    try:
-        config = api.get_config() or {}
-    except Exception:  # noqa: BLE001 - 配置读取失败不该阻断形象列表
-        logger.warning('读取宿主配置失败，打盹阈值回落到默认值', exc_info=True)
-        return None
-    value = config.get('sleep_after')
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def register_routes(api, store: PetStore) -> None:
     """注册全部路由。"""
 
     def runtime(pet_id: str = '') -> dict:
         """统一的运行期定义出口（自动带上宿主的倍率默认值）。"""
-        return store.runtime_pack(pet_id, host_default_scale=_host_default_scale(api))
+        return store.runtime_pack(pet_id)
 
     # ---------------------------------------------------------------- 形象
 
@@ -612,14 +569,18 @@ def register_routes(api, store: PetStore) -> None:
     @api.route('/pets/<pet_id>/appearance', ['POST'])
     @_handle
     def update_appearance(pet_id):
-        """调整某形象的**大小倍率**与**渲染方式**（逐形象保存）。
+        """调整某形象的**大小倍率 / 渲染方式 / 动画速度 / 自动漫游**（逐形象保存）。
 
         用户要求「大小开放给用户调节，以应对不同分辨率与不同形象」，
-        因此这两项都是**按形象**存的：换形象自动恢复各自的设置，
-        不必每次重调。传 `null` 表示清除覆盖、回落到包内声明 / 全局默认。
+        因此这些都是**按形象**存的：换形象自动恢复各自的设置，不必每次重调。
+        传 `null` 表示清除覆盖、回落到包内声明 / 默认值。
 
-        内置形象**允许**调大小与渲染方式——那两项是「怎么看」而不是「是什么」，
+        内置形象**允许**调这些——它们都是「怎么看 / 怎么动」而不是「是什么」，
         改的是 `data/` 里的用户设置，从不碰随包资源。
+
+        ⚠️ `animSpeed` 与 `autoRoam` 原本在宿主的 `config_schema` 里（全局），
+        现已移到这里。理由（用户明确要求）：「不要搞全局的，在同一个地方
+        调整的数值却分成全局和形象绑定两种情况，用户可能会困惑」。
         """
         pet_id = sanitize_pet_id(pet_id)
         store.load_pack(pet_id)  # 不存在会抛 404
@@ -644,6 +605,26 @@ def register_routes(api, store: PetStore) -> None:
                         user_msg='渲染方式只能是开或关。',
                     )
                 store.set_pet_pixelated(pet_id, flag)
+
+        if 'animSpeed' in payload:
+            value = payload.get('animSpeed')
+            if value is None or value == '':
+                store.clear_pet_anim_speed(pet_id)
+            else:
+                store.set_pet_anim_speed(pet_id, value)
+
+        if 'autoRoam' in payload:
+            flag = payload.get('autoRoam')
+            if flag is None or flag == '':
+                store.clear_pet_auto_roam(pet_id)
+            else:
+                if not isinstance(flag, bool):
+                    raise PetError(
+                        CODE_IMAGE_INVALID,
+                        f'autoRoam 应为布尔值，实际 {type(flag).__name__}',
+                        user_msg='自动漫游只能是开或关。',
+                    )
+                store.set_pet_auto_roam(pet_id, flag)
 
         return jsonify({'success': True, 'pet': runtime(pet_id)})
 
@@ -856,6 +837,12 @@ def register_routes(api, store: PetStore) -> None:
             'pixelated': pack.get('pixelated'),
             'declaredScale': pack.get('declaredScale'),
             'declaredPixelated': pack.get('declaredPixelated'),
+            # 动画速度与自动漫游（**按形象**）。面板要拿它们渲染滑块 /
+            # 开关，并显示「作者建议 / 已覆盖」的对比。
+            'animSpeed': pack.get('animSpeed'),
+            'autoRoam': pack.get('autoRoam'),
+            'declaredAnimSpeed': pack.get('declaredAnimSpeed'),
+            'declaredAutoRoam': pack.get('declaredAutoRoam'),
             'writable': pack.get('writable', True),
             # `pet.json` 的 `id` 与**目录名**不一致（见 `store._describe`）。
             #
@@ -877,13 +864,11 @@ def register_routes(api, store: PetStore) -> None:
             'schedule': pack.get('schedule'),
             'declaredSchedule': pack.get('declaredSchedule'),
             'scheduleOverridden': pack.get('scheduleOverridden', False),
-            # 宿主全局的「多久没交互就睡觉」（**秒**，来自 manifest 的
-            # `sleep_after`）。
+            # ★ 不再下发 `hostSleepAfter`。
             #
-            # 为什么要下发：`schedule.sleep.afterMs` 为 `null` 时表示
-            # 「这个形象没设打盹阈值」，此时生效的是**宿主全局**那个值。
-            # 面板要把那个值显示出来（而不是拿一个写死的默认值顶上——
-            # 那会让用户看到「我在宿主设置里改了却没反应」）。
-            'hostSleepAfter': _host_sleep_after(api),
+            # 打盹阈值现在是**纯按形象**的（用户要求「不要搞全局的」）：
+            # `schedule.sleep.afterMs` 为 `null` 表示「用默认值 120 秒」，
+            # 而不是「跟随宿主全局」——宿主那个 `sleep_after` 已从
+            # `config_schema` 移除。
             'actions': summary,
         })

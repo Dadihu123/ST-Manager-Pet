@@ -73,36 +73,6 @@
         "title": "播报时弹轻提示",
         "description": "关闭后宠物只换动作，不弹宿主轻提示。",
         "default": false
-      },
-      "auto_roam": {
-        "type": "boolean",
-        "title": "自动漫游",
-        "description": "空闲时宠物会自己在屏幕底部走动。走动的间隔在「桌面宠物设置 → 触发时间」里按形象调。",
-        "default": true
-      },
-      "scale": {
-        "type": "number",
-        "title": "宠物大小倍率（默认值）",
-        "description": "全局兜底值。每个形象还能在「桌面宠物设置」里单独调大小与渲染方式，那些设置优先于这里；形象包自己声明的倍率也优先于这里。",
-        "default": 1,
-        "minimum": 0.25,
-        "maximum": 4
-      },
-      "sleep_after": {
-        "type": "integer",
-        "title": "打盹等待（秒）",
-        "description": "无任何互动超过该时长后宠物睡着；任何输入或核心事件都会唤醒它。",
-        "default": 120,
-        "minimum": 10,
-        "maximum": 3600
-      },
-      "anim_speed": {
-        "type": "number",
-        "title": "动画速度（越大越慢）",
-        "description": "统一放慢或加快所有动作的播放。1 为形象自带的速度；2 表示播放时间翻倍（更慢）。每个形象的动画节奏仍由形象包决定，这里只做整体缩放。",
-        "default": 1,
-        "minimum": 0.25,
-        "maximum": 4
       }
     }
   }

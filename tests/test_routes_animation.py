@@ -338,29 +338,47 @@ def test_thumbnail_url_is_reachable(env):
 # ------------------------------------------------------------ 配置项
 
 
-def test_anim_speed_is_declared_in_manifest_config_schema():
-    """★ 「动画速度」必须在 manifest 的 config_schema 里声明。
+def test_anim_speed_is_per_pet_not_global():
+    """★ 「动画速度」是**按形象**的设置，**不该**出现在宿主的 config_schema 里。
 
-    标量配置的唯一来源是宿主的插件设置表单（§2.8）：不声明的话
-    前端读到的 `anim_speed` 恒为 undefined，用户就没有任何办法统一调速。
+    用户明确要求：「不要搞全局的，在同一个地方调整的数值却分成全局和
+    形象绑定两种情况，用户可能会困惑」。同一份设置既能在宿主表单里改、
+    又能在面板里按形象改，就会出现「我改了全局的却没反应」这类困惑。
+
+    因此 `anim_speed` / `scale` / `sleep_after` / `auto_roam` 这四个
+    「宠物自身的行为参数」全部**从 config_schema 移出**，只按形象存
+    （`settings.json` 的 `petAnimSpeeds` / `petScales` / `petAutoRoam`
+    与 `petSchedules`）。
+
+    宿主表单里**只留**真正全局的东西：播报开关与勿扰——那些是
+    「这个应用要不要弹提示」，与是哪只宠物无关。
     """
     with open(os.path.join(REPO_ROOT, 'manifest.json'), encoding='utf-8') as handle:
         manifest = json.load(handle)
     schema = manifest['config_schema']['properties']
-    assert 'anim_speed' in schema, 'manifest 缺少 anim_speed'
-    spec = schema['anim_speed']
-    assert spec['type'] == 'number'
-    assert spec['default'] == 1
-    assert float(spec['minimum']) > 0
-    assert float(spec['maximum']) > float(spec['minimum'])
+    for key in ('anim_speed', 'scale', 'sleep_after', 'auto_roam'):
+        assert key not in schema, (
+            f'{key} 是按形象的设置，不该再出现在宿主 config_schema 里'
+            f'（那会让同一项设置有两个入口）'
+        )
+    # 真正全局的那几个要留着
+    for key in ('quiet_mode', 'announce_cards', 'announce_jobs', 'show_toast'):
+        assert key in schema, f'{key} 是真正全局的，应当保留'
 
 
-def test_frontend_anim_speed_range_matches_manifest():
-    """前端夹取区间必须与 manifest 一致，否则会出现「拖到了却不生效」。"""
+def test_frontend_anim_speed_range_matches_backend():
+    """前端夹取区间必须与后端 `ANIM_SPEED_RANGE` 一致。
+
+    权威值现在在 `backend/core/pack.py`（不再是 manifest）——因为
+    「动画速度」既是**用户按形象的设置**，也是**形象包能声明的字段**
+    （`pet.json` 的 `animSpeed`），两处共用同一套区间。
+    """
     import re
+    import sys as _sys
 
-    with open(os.path.join(REPO_ROOT, 'manifest.json'), encoding='utf-8') as handle:
-        schema = json.load(handle)['config_schema']['properties']['anim_speed']
+    _sys.path.insert(0, REPO_ROOT)
+    from backend.core.pack import ANIM_SPEED_RANGE
+
     with open(os.path.join(REPO_ROOT, 'frontend', 'petview.js'), encoding='utf-8') as handle:
         source = handle.read()
 
@@ -369,20 +387,22 @@ def test_frontend_anim_speed_range_matches_manifest():
         assert found, f'petview.js 里找不到 {name}'
         return float(found.group(1))
 
-    assert declared('ANIM_SPEED_MIN') == float(schema['minimum']), (
-        '前端的 ANIM_SPEED_MIN 必须与 manifest 的 minimum 一致'
+    assert declared('ANIM_SPEED_MIN') == ANIM_SPEED_RANGE[0], (
+        '前端的 ANIM_SPEED_MIN 必须与后端 ANIM_SPEED_RANGE 一致'
     )
-    assert declared('ANIM_SPEED_MAX') == float(schema['maximum']), (
-        '前端的 ANIM_SPEED_MAX 必须与 manifest 的 maximum 一致'
+    assert declared('ANIM_SPEED_MAX') == ANIM_SPEED_RANGE[1], (
+        '前端的 ANIM_SPEED_MAX 必须与后端 ANIM_SPEED_RANGE 一致'
     )
 
 
-def test_panel_preview_speed_range_matches_manifest():
-    """面板预览器的速度区间也应当与 manifest 同区间（同语义：越大越慢）。"""
+def test_panel_preview_speed_range_matches_backend():
+    """面板预览器的速度区间也应当与后端同区间（同语义：越大越慢）。"""
     import re
+    import sys as _sys
 
-    with open(os.path.join(REPO_ROOT, 'manifest.json'), encoding='utf-8') as handle:
-        schema = json.load(handle)['config_schema']['properties']['anim_speed']
+    _sys.path.insert(0, REPO_ROOT)
+    from backend.core.pack import ANIM_SPEED_RANGE
+
     with open(os.path.join(REPO_ROOT, 'frontend', 'panel.js'), encoding='utf-8') as handle:
         source = handle.read()
 
@@ -391,8 +411,8 @@ def test_panel_preview_speed_range_matches_manifest():
         assert found, f'panel.js 里找不到 {name}'
         return float(found.group(1))
 
-    assert declared('SPEED_MIN') == float(schema['minimum'])
-    assert declared('SPEED_MAX') == float(schema['maximum'])
+    assert declared('SPEED_MIN') == ANIM_SPEED_RANGE[0]
+    assert declared('SPEED_MAX') == ANIM_SPEED_RANGE[1]
 
 
 def test_backend_and_frontend_weight_ranges_agree():

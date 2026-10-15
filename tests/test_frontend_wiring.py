@@ -329,6 +329,75 @@ def test_every_interaction_reschedules_sleep(petview):
     )
 
 
+def test_walk_target_biases_away_from_the_nearest_edge(petview):
+    """★ 漫游目标要按**当前位置**偏置：越靠边越倾向于往回走。
+
+    用户要求：「如果形象越偏向屏幕左侧，那么触发动画时有更高的概率往右走，
+    反之亦然……这样可以避免总往一个方向走，更加符合随意走动的感觉」。
+
+    纯均匀随机（原来的做法）的问题是宠物会**贴着某一侧反复挪**：
+    它站在左边时，均匀随机给的目标有一半还在它左边，于是它一路蹭到墙上
+    再蹭回来，看起来像被边缘吸住。
+
+    实测（真实浏览器，384px 的宠物，跨度 500px）：
+    - 最左边：80 次抽样 **100%** 的目标在右侧；最右边 99% 在左侧；
+    - 正中：45~54%（仍接近 50/50——**不能**变成「永远回中间」，那就不随意了）；
+    - 长程游走：边缘 10% 区间停留 **0~16%**（均匀随机对照 ~19%），
+      中间 50% 区域 53~88%（对照 ~50%）；
+    - 逐趟方向翻转率 58%，左右大致均衡。
+    """
+    code = strip_js_comments(petview)
+    body = code[code.index('function pickWalkTarget('):]
+    body = body[:body.index('\n  }')]
+    assert 'bias' in body and 'physics.x' in body, (
+        '目标要按当前位置（physics.x）算偏侧度'
+    )
+    # 往右的概率必须随「偏右」单调下降
+    assert '(1 - bias) / 2' in body.replace(' ', '').replace('(1-bias)/2', '(1 - bias) / 2'), (
+        '往右的概率应为 (1 - bias) / 2：最左 100% 往右，最右 0%'
+    )
+
+
+def test_walk_step_never_crosses_to_the_far_edge(petview):
+    """★ 单步上限必须明显小于整个跨度。
+
+    一步能从最左跨到最右的话，宠物会在两个边缘之间来回弹——实测那样
+    「待在边缘 10% 区间」的时间反而升到 **38.8%**（比均匀随机的 20% 还差）。
+    上限也不能太小，否则单步短到看不出在「走」，更像原地抖动。
+
+    实测 0.10~0.35 在四种体型（64 / 173 / 384 / 768px）下表现一致。
+    """
+    code = strip_js_comments(petview)
+    assert 'WALK_STEP_MIN_RATIO' in code and 'WALK_STEP_MAX_RATIO' in code
+    # 常量本身要在合理区间里
+    module = petview[:petview.index('export function createPetView')]
+    for name, low, high in (
+        ('WALK_STEP_MIN_RATIO', 0.05, 0.15),
+        ('WALK_STEP_MAX_RATIO', 0.25, 0.45),
+    ):
+        match = re.search(rf'{name}\s*=\s*([0-9.]+)', module)
+        assert match, f'找不到 {name}'
+        value = float(match.group(1))
+        assert low <= value <= high, (
+            f'{name} = {value} 超出合理区间 [{low}, {high}]——'
+            f'太大宠物会在边缘之间弹，太小看不出在走'
+        )
+    assert (
+        float(re.search(r'WALK_STEP_MIN_RATIO\s*=\s*([0-9.]+)', module).group(1))
+        < float(re.search(r'WALK_STEP_MAX_RATIO\s*=\s*([0-9.]+)', module).group(1))
+    ), '下限必须小于上限'
+
+
+def test_roam_exposes_its_target_for_verification(petview):
+    """★ 目标 x 要能被外部读到（验收要靠它）。
+
+    「目标选得对不对」是漫游观感的核心（方向偏置、够不够得着），
+    而它无法从外部观测——只能看宠物走过去的结果，那既慢又受物理影响。
+    """
+    assert 'roamTarget' in petview, '视图要暴露 roamTarget'
+    assert 'walkTargetX' in petview
+
+
 def test_petview_uses_the_scheduler_for_idle(petview):
     body = petview[petview.index('function scheduleIdleWake()'):]
     body = body[:body.index('\n  }')]

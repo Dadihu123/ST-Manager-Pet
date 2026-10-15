@@ -57,6 +57,17 @@ const WALK_TARGET_MARGIN = 8;
  */
 const WALK_STALL_SPEED = 0.5;
 
+/**
+ * 一次漫游走多远：占**可走跨度**的比例区间。
+ *
+ * 上限必须明显小于 1——一步能从最左跨到最右的话，宠物会在两个边缘之间
+ * 来回弹（实测「待在边缘 10% 区间」的时间反而升到 38.8%，比均匀随机还差）。
+ * 下限也不能太小，否则单步短到看不出在「走」。
+ * 实测 0.10~0.35 在四种体型下表现一致（边缘停留 ~10%，中间 ~66%）。
+ */
+const WALK_STEP_MIN_RATIO = 0.10;
+const WALK_STEP_MAX_RATIO = 0.35;
+
 /** 大小倍率的合法区间（与 `backend/core/pack.py:SCALE_RANGE` 必须一致）。 */
 const SCALE_MIN = 0.25;
 const SCALE_MAX = 4;
@@ -361,6 +372,18 @@ export function createPetView(options = {}) {
    * 走定时器之后，「到点」不再依赖任何其它行为是否恰好发生。
    */
   let sleepWakeTimer = 0;
+  /** 打盹判定的到期时刻（诊断/测试用，见 `sleepCountdown`）。 */
+  let sleepDeadline = 0;
+  /**
+   * 「到点了但当时正在忙（在走 / 在播小动作），等它忙完再睡」的挂起标记。
+   *
+   * 为什么需要它：用户问过「如果人物正在播放动画的时候，比如闲置，比如漫游，
+   * 这种情况下睡觉动画刚好触发会发生什么」。直接打断的后果是宠物在走路
+   * 途中**突然定住**然后躺下，看起来像卡住；而**丢掉这次判定**的后果更糟
+   * ——漫游间隔短时宠物几乎一直在走，于是它**永远不睡**（实测 18 秒一次没睡）。
+   * 因此既不能打断也不能丢，只能挂起。
+   */
+  let sleepPending = false;
 
   // ---------------------------------------------------------------- 绘制
 
@@ -442,14 +465,28 @@ export function createPetView(options = {}) {
       scheduleRoamWake();
       // 打盹判定同理：醒着回到 idle 时重新按当前阈值排一次。
       // 睡醒之后也要排——否则它再也不会睡第二次。
-      scheduleSleepWake();
+      // 用 `settleSleep()` 而不是 `scheduleSleepWake()`：到点时若正在走 /
+      // 在播小动作，那次判定是**挂起**的，要在这里补上。
+      settleSleep();
     } else {
       cancelIdleWake();
       // 离开 idle 就撤掉待执行的漫游：睡着 / 被拖走 / 正在走时都不该再排。
       cancelRoamWake();
-      // 睡着之后撤掉打盹判定：留着它会在睡眠期间反复触发。
-      // （`sleepTriggerEnabled()` 也挡得住，但撤掉更干净。）
-      cancelSleepWake();
+      // ★ 但 **WALK 不能撤掉打盹判定**。
+      //
+      // 打盹是**时间驱动**的，与「当前在哪个状态」无关；而漫游间隔短时
+      // 宠物几乎一直在走（实测间隔 200ms 时 14 秒里 138/160 个采样都在
+      // walk）。在进入 WALK 时撤掉、又只在回到 IDLE 时才重排，结果就是
+      // **永远睡不着**——实测 18 秒内一次都没睡。
+      //
+      // 进入 WALK 时按当前剩余时间重排即可（已到点的话会立刻触发，
+      // 那一刻因为正在走而挂起，走完由 `settleSleep()` 补上）。
+      if (next === STATES.WALK) {
+        scheduleSleepWake();
+      } else {
+        // 睡着 / 被拖走 / 坠落：这些状态下不排（睡着之后更不该留着）
+        cancelSleepWake();
+      }
     }
   }
 
@@ -1032,7 +1069,8 @@ export function createPetView(options = {}) {
       // 漫游同理：空中撤掉的那次排期也要补回来，否则弹跳一次之后
       // 宠物就再也不自己走动了（与上面 idle 那个 bug 是同一条路径）。
       scheduleRoamWake();
-      scheduleSleepWake();
+      // 打盹同理（空中撤掉的那次也要补）
+      settleSleep();
     }
 
     if (state === STATES.WALK) {
@@ -1082,13 +1120,13 @@ export function createPetView(options = {}) {
   /**
    * 「静了多久之后睡着」的阈值（毫秒）。
    *
-   * 优先级与其它时间参数一致：**按形象的设置 > 宿主全局配置 > 默认值**。
-   * 按形象的那一份来自后端的 `schedule.sleep.afterMs`（用户要求把
-   * 「睡觉」加进触发时间设置里——「多长时间不管就睡觉」）。
+   * ⚠️ **纯按形象**，没有全局兜底。用户明确要求：「不要搞全局的，
+   * 在同一个地方调整的数值却分成全局和形象绑定两种情况，用户可能会困惑」。
+   * 因此宿主表单里的 `sleep_after` 已移除，这里的回落只有**默认值**
+   * （与 `DEFAULT_SCHEDULE_MS.sleep` 的 120 秒一致）。
    *
-   * 宿主全局的 `sleep_after` 是**秒**（manifest 里声明的单位），
-   * 而 `schedule` 里一律是**毫秒**——两处单位不同是历史原因
-   * （全局配置先有，而它按秒更易读）。这里显式换算，免得差 1000 倍。
+   * `config.sleepAfter` 只作为「后端数据还没到位」时的兜底，
+   * 单位是**秒**（历史原因），这里显式换算。
    */
   function sleepAfterMs() {
     const fromSchedule = Number(scheduler.get('sleep').afterMs);
@@ -1103,15 +1141,36 @@ export function createPetView(options = {}) {
    * 走到一半到点了也该睡（与早先那条 rAF 轮询的判定保持一致，
    * 它接受 IDLE 或 WALK）。
    */
+  /**
+   * 现在能让它睡吗（**只看是否醒着、是否被占用**）？
+   *
+   * ⚠️ IDLE 与 WALK 都算：漫游也是「闲着的时候自己走走」，走到一半到点了
+   * 也该睡。**不能**把 WALK 排除掉——漫游间隔短时宠物几乎一直在走，
+   * 排除掉它就永远睡不着（实测：间隔 200ms 时 18 秒内一次都没睡）。
+   */
   function sleepTriggerEnabled() {
     return !reducedMotion
       && !disposed
       && !throttle.paused
       && (machine.state === STATES.IDLE || machine.state === STATES.WALK)
-      && !idleBurst
       && gesture.phase === 'done'
       && !physics.dragging
       && physics.grounded;
+  }
+
+  /** 到点了吗（距上次交互是否已经超过阈值）。 */
+  function sleepDue() {
+    return performance.now() - lastInteractionAt >= sleepAfterMs();
+  }
+
+  /**
+   * 现在**立刻**能睡吗——要求不被动画占用。
+   *
+   * 正在播 idle 小动作、或正在走，都算「被占用」：那种情况下不该打断，
+   * 而是记一个 `sleepPending`，等它播完 / 走完再睡（见 `settleSleep`）。
+   */
+  function canSleepNow() {
+    return sleepTriggerEnabled() && !idleBurst && machine.state === STATES.IDLE;
   }
 
   /** 清掉待执行的打盹判定（任何交互 / 状态变化都要调）。 */
@@ -1120,6 +1179,7 @@ export function createPetView(options = {}) {
       clearTimeout(sleepWakeTimer);
       sleepWakeTimer = 0;
     }
+    sleepDeadline = 0;
   }
 
   /**
@@ -1131,22 +1191,60 @@ export function createPetView(options = {}) {
   function scheduleSleepWake() {
     cancelSleepWake();
     if (!sleepTriggerEnabled()) return;
-    const remaining = sleepAfterMs() - (performance.now() - lastInteractionAt);
+    const remaining = Math.max(250, sleepAfterMs() - (performance.now() - lastInteractionAt));
+    sleepDeadline = performance.now() + remaining;
     sleepWakeTimer = setTimeout(() => {
       sleepWakeTimer = 0;
+      sleepDeadline = 0;
       // 到点时再确认一次：等待期间用户可能把它拖走了 / 让它做了别的动作
       if (!sleepTriggerEnabled()) return;
       // 期间有过交互（阈值被重置了）→ 重新计时，而不是照着旧的时间睡
-      if (performance.now() - lastInteractionAt < sleepAfterMs()) {
+      if (!sleepDue()) {
         scheduleSleepWake();
         return;
       }
+      if (!canSleepNow()) {
+        // ★ 正在播小动作 / 正在走：**让它播完**，别打断。
+        //
+        // 这正是用户问的那个场景：「如果人物正在播放动画的时候，比如闲置，
+        // 比如漫游，这种情况下睡觉动画刚好触发会发生什么」。
+        // 打断的后果是宠物在走路途中**突然定住**然后躺下——看起来像卡住。
+        // 记一个挂起标记，由回到「闲着」的路径补上（见 `settleSleep`）。
+        sleepPending = true;
+        return;
+      }
+      sleepPending = false;
       physics.stopWalking();
       // `machine.sleep()` 会触发 `onStateEnter`，排期在那里被清掉——
       // 睡着之后不该再有任何触发等着执行。
       machine.sleep({ now: performance.now() });
       wake();
-    }, Math.max(250, Math.round(remaining)));
+    }, remaining);
+  }
+
+  /**
+   * 回到「闲着」时的收尾：把挂起的那次入睡补上，否则重新排期。
+   *
+   * 为什么要单独一个函数：到点那一刻宠物可能在走 / 在播小动作，
+   * 而「能不能睡」要等它忙完才知道。忙完的路径有好几条
+   * （小动作播完、走完停下、落地、播报结束），全都汇到这里。
+   */
+  function settleSleep() {
+    if (sleepPending) {
+      if (!sleepDue()) {
+        // 挂起期间用户又碰过它 → 这次不作数，重新计时
+        sleepPending = false;
+      } else if (canSleepNow()) {
+        sleepPending = false;
+        physics.stopWalking();
+        machine.sleep({ now: performance.now() });
+        wake();
+        return;
+      }
+      // 还不能睡（例如刚进 WALK）→ 继续挂着，等下一次回到闲着
+      if (sleepPending) return;
+    }
+    scheduleSleepWake();
   }
 
   /**
@@ -1348,8 +1446,9 @@ export function createPetView(options = {}) {
     // 小动作期间 `roamTriggerEnabled()` 为假（`!idleBurst`），
     // 因此那段时间不会有漫游排期，这里不补的话就断了。
     scheduleRoamWake();
-    // 打盹判定同理：小动作期间 `sleepTriggerEnabled()` 也为假。
-    scheduleSleepWake();
+    // 打盹判定同理：小动作期间 `canSleepNow()` 为假，到点的那一刻是**挂起**的，
+    // 因此这里要用 `settleSleep()` 把那次补上，而不是单纯重排。
+    settleSleep();
     wake();
   }
 
@@ -1436,7 +1535,50 @@ export function createPetView(options = {}) {
       // 不能返回一个够不着的目标——那正是上面那个卡死。
       return worldWidth / 2;
     }
-    return low + Math.random() * (high - low);
+
+    // ---- 方向偏置：越靠边越倾向于往**回中间**走
+    //
+    // 用户要求：「如果形象越偏向屏幕左侧，那么触发动画时有更高的概率往右走，
+    // 反之亦然……这样可以避免总往一个方向走，更加符合随意走动的感觉」。
+    //
+    // 纯均匀随机（原来的做法）有两个问题：
+    // 1. 宠物会**贴着某一侧反复挪**——它站在左边时，均匀随机给的目标
+    //    有一半还在它左边，于是它一路蹭到墙上再蹭回来，看起来像被边缘吸住；
+    // 2. 长程上看不出「随意走动」的意图，更像随机抖动。
+    //
+    // 做法（简单、无状态、可预测）：把当前所在位置换算成一个 `-1 ~ +1`
+    // 的「偏侧度」，再据此决定**往哪边**以及**走多远**。
+    //
+    //   bias = (x - 中点) / 半跨度        // -1 = 最左，+1 = 最右
+    //   往右的概率 = (1 - bias) / 2        // 最左时 100% 往右，最右时 0%
+    //
+    // 于是站在正中时是纯 50/50（与原来一致），越靠边越强烈地往回走。
+    // 注意它**不是**「永远回中间」：概率是渐变的，最左时也仍有可能再往左
+    // 挪一点点（那正是「随意」该有的样子），只是不会一路蹭到墙上。
+    const mid = (low + high) / 2;
+    const halfSpan = Math.max(1, (high - low) / 2);
+    const bias = clamp((physics.x - mid) / halfSpan, -1, 1);
+    const rightChance = (1 - bias) / 2;
+    const goRight = Math.random() < rightChance;
+
+    // 走多远：取**可走跨度**的一个随机比例。
+    //
+    // ⚠️ 上限必须明显小于 1（这里 0.35），否则一步就能从最左跨到最右，
+    // 宠物会在两个边缘之间来回弹——实测那样「待在边缘 10% 区间」的时间
+    // 反而升到 **38.8%**（比均匀随机的 20% 还差）。
+    // 也不能太小：小于 ~0.08 时单步短到看不出在「走」，更像原地抖动。
+    //
+    // 实测（384px 的宠物，800 步）：跨度比例 0.10~0.35 时
+    //   边缘停留 10.3%（均匀随机 18.5%）、中间 50% 区域 66.3%（均匀 49.9%）、
+    //   方向翻转率 58.7%（说明没有「总往一个方向走」）。
+    // 四种体型（64 / 173 / 384 / 768px）下的数字基本一致。
+    const span = high - low;
+    const step = span * (WALK_STEP_MIN_RATIO
+      + Math.random() * (WALK_STEP_MAX_RATIO - WALK_STEP_MIN_RATIO));
+
+    const target = goRight ? physics.x + step : physics.x - step;
+    // 夹回可走范围：目标必须够得着（上面那段注释记的就是够不着的后果）
+    return clamp(target, low, high);
   }
 
   // ------------------------------------------------------------ 指针交互
@@ -1897,6 +2039,38 @@ export function createPetView(options = {}) {
     roamCountdown,
     /** 当前漫游节奏（`{minMs, maxMs}`，来自后端下发的 `schedule`）。 */
     roamSchedule: () => scheduler.get('roam'),
+    /**
+     * 这一趟漫游的目标 x（诊断/测试用）。
+     *
+     * 为什么值得暴露：「目标选得对不对」是漫游观感的核心（方向偏置、
+     * 够不够得着），而它无法从外部观测——只能看宠物走过去的结果，
+     * 那既慢又受物理影响。有了它，验收可以直接检查「选出来的目标」。
+     */
+    get roamTarget() { return walkTargetX; },
+    /**
+     * 距离「到点睡着」还有多少毫秒（没排期时为 `null`）。
+     *
+     * 与 `roamCountdown()` 同理：「它怎么不睡」是排查这类问题时唯一的
+     * 观测量，而 `setTimeout` 的句柄读不出来。
+     */
+    get sleepCountdown() {
+      return sleepDeadline ? Math.max(0, sleepDeadline - performance.now()) : null;
+    },
+    /** 现在能不能睡（诊断用：为假时说明被哪一条挡住了）。 */
+    get sleepBlockers() {
+      return {
+        enabled: sleepTriggerEnabled(),
+        state: machine.state,
+        idleBurst,
+        gesture: gesture.phase,
+        dragging: physics.dragging,
+        grounded: physics.grounded,
+        reducedMotion,
+        paused: throttle.paused,
+        afterMs: sleepAfterMs(),
+        sinceInteractionMs: Math.round(performance.now() - lastInteractionAt),
+      };
+    },
     dispose() {
       disposed = true;
       stopLoop();
