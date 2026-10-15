@@ -196,6 +196,57 @@
   overflow: hidden;
 }
 
+/* ★ 固定预览：**真正加一列**（而不是 `position: fixed`）。
+ *
+ * 用户要求「让预览框固定到模态框外面，比如右侧，滚动里面不会影响它的显示」。
+ * 本仓库的契约测试**禁止** `position: fixed` 与 `sticky`（宿主自带全屏
+ * ambient 容器，插件在容器内不该自己逃出文档流），而「多一列」更简单也更稳：
+ * 详情栏自己滚（`overflow-y: auto`），这一列不动，于是改参数时预览一直在。
+ *
+ * 列的宽度给得比详情栏小：它是「顺带看一眼」的东西，不该抢主区域。
+ * 窄屏（< 900px 时宿主不挂宠物，但面板仍可能在窄窗口里打开）下让这一列
+ * 折到下面去，避免把详情栏挤成一条缝。 */
+.plugin-stm-pet .pet-panel-body.has-float {
+  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr) minmax(180px, 220px);
+}
+
+@media (max-width: 1180px) {
+  .plugin-stm-pet .pet-panel-body.has-float {
+    grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .plugin-stm-pet .pet-panel-float {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}
+
+.plugin-stm-pet .pet-panel-float {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+  border-radius: 10px;
+  background: var(--surface-container-raised, rgba(0, 0, 0, 0.02));
+}
+
+/* 预览框被挪走之后，原地那个 stage 只剩空壳——不要留一块空白 */
+.plugin-stm-pet .pet-preview-stage.is-emptied {
+  display: none;
+}
+
+.plugin-stm-pet .pet-preview-float-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
 .plugin-stm-pet .pet-panel-list {
   display: flex;
   flex-direction: column;
@@ -637,6 +688,17 @@
 .plugin-stm-pet .pet-section.is-collapsible {
   padding: 0;
   overflow: hidden;
+  /* ★ 必须显式禁止收缩，否则整块会被压成 0 高（内容全被裁掉）。
+   *
+   * 这是一个 CSS 规范的细节：`min-height: auto`（flex 项目的自动最小尺寸）
+   * **只在 `overflow: visible` 时生效**。这里为了把 hover 背景裁进圆角而写了
+   * `overflow: hidden`，于是自动最小尺寸退化成 0——在 `.pet-panel-detail`
+   * 这个 flex 竖列里，项目就被压扁了。
+   *
+   * 实测：toggle 自己量出来 38px 高，而父节点只有 **2px**，于是「触发时间」
+   * 整块看起来凭空消失了（用户报的正是这个）。同一份样式在普通
+   * `.pet-section`（overflow: visible）上没问题，所以只有折叠块中招。 */
+  flex-shrink: 0;
 }
 
 .plugin-stm-pet .pet-section-toggle {
@@ -876,6 +938,31 @@
  * 用警告色会让人以为出了问题。左侧加一道强调条，中性但看得见。 */
 .plugin-stm-pet .pet-notice.is-info {
   border-left: 3px solid var(--color-accent, #4a7dff);
+}
+
+/* ---------------------------------------------------------------- 面板内的对话框
+ *
+ * 输入（加一套动画要填帧数）与确认（删一套、拆页）都走这一块，
+ * **不用**原生 prompt / confirm：宿主的插件面板跑在 modal 里，原生对话框
+ * 会盖住整个应用；而且在无头浏览器里 prompt 恒返回 null、confirm 恒返回
+ * false —— 验收脚本会因此永远走不到「确认」那条路，功能就测不到。
+ */
+.plugin-stm-pet .pet-prompt {
+  border-left-width: 3px;
+  border-left-style: solid;
+}
+
+.plugin-stm-pet .pet-prompt .pet-panel-toolbar {
+  margin-top: 6px;
+}
+
+/* 多套动画的增删工具行（加一套 / 删除第 N 套） */
+.plugin-stm-pet .pet-editor-variant-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 2px;
 }
 
 /* 通知里的标题/正文：标题加粗一行，正文跟在后面。

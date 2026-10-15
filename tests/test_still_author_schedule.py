@@ -15,6 +15,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import zipfile
 
@@ -882,8 +883,16 @@ def test_sleep_rejects_interval_fields(tmp_path):
         )
 
 
-def test_schedule_user_override_beats_pack_declaration(tmp_path):
-    """优先级：**用户设置 > 包内声明 > 默认值**（与倍率同一套规则）。"""
+def test_schedule_for_a_writable_pet_is_written_into_pet_json(tmp_path):
+    """★ **自建形象**的节奏写进 `pet.json`（不是本机设置）。
+
+    用户要求：「我注意到你说这个内置形象的更新在 settings 里面……我理解
+    既然是跟随形象走的，应该保存到 pet.json 里面」。
+
+    为什么这件事重要：写进 `pet.json` 才会**随导出走**。早先一律写本机
+    `settings.json`，后果是「导出形象包时这个设置丢了」——换个机器导入
+    就回到默认值，而用户以为自己设过了。
+    """
     builtin = tmp_path / 'resources' / 'pets'
     data = tmp_path / 'data'
     builtin.mkdir(parents=True)
@@ -897,14 +906,67 @@ def test_schedule_user_override_beats_pack_declaration(tmp_path):
 
     # 包内声明生效
     assert store.effective_schedule('mine')['idle']['minIntervalMs'] == 1000
-    # 用户覆盖后以用户为准
+
     store.set_pet_schedule('mine', {'idle': {'minIntervalMs': 4000, 'maxIntervalMs': 5000}})
+    # ① 生效值变了
     schedule = store.effective_schedule('mine')
     assert schedule['idle']['minIntervalMs'] == 4000
     assert schedule['idle']['maxIntervalMs'] == 5000
-    # 清除覆盖 → 回到包内声明
+    # ② **写进了 pet.json**（这条是本次改动的核心）
+    manifest = json.loads(
+        open(os.path.join(store.user_pet_dir('mine'), 'pet.json'), encoding='utf-8').read()
+    )
+    # 写的是**规范形式** `minIntervalMs`/`maxIntervalMs`（`intervalMs` 也合法，
+    # 但 `Trigger.to_dict()` 统一成规范形式——两种写法等价，读回来一样）
+    assert manifest['schedule']['idle']['minIntervalMs'] == 4000, manifest['schedule']
+    assert manifest['schedule']['idle']['maxIntervalMs'] == 5000
+    # ③ **没有**留在本机设置里（一处真相，否则旧覆盖会盖住新值）
+    assert not (store.get_settings().get('petSchedules') or {}).get('mine')
+
+    # ④ 只改一项时，另一项要保住（合并而不是替换）
+    store.set_pet_schedule('mine', {'roam': {'minIntervalMs': 300, 'maxIntervalMs': 600}})
+    manifest = json.loads(
+        open(os.path.join(store.user_pet_dir('mine'), 'pet.json'), encoding='utf-8').read()
+    )
+    assert manifest['schedule']['idle']['minIntervalMs'] == 4000, '改 roam 不该动 idle'
+    assert manifest['schedule']['idle']['maxIntervalMs'] == 5000
+    assert manifest['schedule']['roam']['minIntervalMs'] == 300
+    assert manifest['schedule']['roam']['maxIntervalMs'] == 600
+
+    # ⑤ 恢复默认 = 删掉包内声明 → 回到**内置默认值**（不是原作者的旧值）
     store.clear_pet_schedule('mine')
-    assert store.effective_schedule('mine')['idle']['minIntervalMs'] == 1000
+    manifest = json.loads(
+        open(os.path.join(store.user_pet_dir('mine'), 'pet.json'), encoding='utf-8').read()
+    )
+    assert 'schedule' not in manifest, '清除应当删掉这个字段'
+    assert store.effective_schedule('mine')['idle']['minIntervalMs'] == 6000
+
+
+def test_schedule_for_a_builtin_pet_stays_in_settings(tmp_path):
+    """★ **内置形象**只能写本机设置（随包文件动不了）。
+
+    内置形象恰恰是大多数用户唯一会用的形象，因此它必须**仍然可调**。
+    """
+    builtin = tmp_path / 'resources' / 'pets'
+    data = tmp_path / 'data'
+    builtin.mkdir(parents=True)
+    data.mkdir(parents=True)
+    store = PetStore(str(data), str(builtin))
+    shutil.copytree(
+        os.path.join(REPO_ROOT, 'resources', 'pets', 'xiaoka'),
+        str(builtin / 'xiaoka'),
+    )
+
+    store.set_pet_schedule('xiaoka', {'idle': {'minIntervalMs': 3000, 'maxIntervalMs': 5000}})
+    assert store.effective_schedule('xiaoka')['idle']['minIntervalMs'] == 3000
+    # 落在本机设置里
+    stored = (store.get_settings().get('petSchedules') or {}).get('xiaoka')
+    assert stored and stored['idle']['minIntervalMs'] == 3000
+    # 随包文件**一个字节都没动**
+    manifest = json.loads(
+        open(os.path.join(str(builtin), 'xiaoka', 'pet.json'), encoding='utf-8').read()
+    )
+    assert manifest['schedule']['idle']['intervalMs'] == [6000, 18000], '内置包不该被改'
 
 
 def test_schedule_is_editable_for_builtin_pets(tmp_path):
@@ -1040,29 +1102,35 @@ def test_deleting_a_pet_clears_its_schedule(tmp_path):
 
 
 def test_schedule_survives_a_corrupt_settings_file(tmp_path):
-    """设置文件里的一项坏值不该让**所有**形象的节奏一起失效。"""
+    """设置文件里的一项坏值不该让**所有**形象的节奏一起失效。
+
+    ⚠️ 用**内置形象**来验：自建形象的节奏现在写在 `pet.json` 里，
+    根本不碰本机设置（见 `test_schedule_for_a_writable_pet_is_written_into_pet_json`）。
+    本机设置那条路是内置形象专用的，所以「设置文件脏了会怎样」要在它身上验。
+    """
     builtin = tmp_path / 'resources' / 'pets'
     data = tmp_path / 'data'
     builtin.mkdir(parents=True)
     data.mkdir(parents=True)
     store = PetStore(str(data), str(builtin))
-    write_pack(store.user_pets_dir(), 'good', payload={
-        'id': 'good', 'animations': {'idle': 'idle.png'},
-    }, sheets={'idle.png': 1})
+    shutil.copytree(
+        os.path.join(REPO_ROOT, 'resources', 'pets', 'xiaoka'),
+        str(builtin / 'xiaoka'),
+    )
 
-    store.set_pet_schedule('good', {'idle': {'minIntervalMs': 1234}})
+    store.set_pet_schedule('xiaoka', {'idle': {'minIntervalMs': 1234}})
     # 手工往设置文件里塞脏值
     path = store.settings_path()
     with open(path, encoding='utf-8') as handle:
         settings = json.load(handle)
     settings['petSchedules']['bad'] = 'not-an-object'
-    settings['petSchedules']['good']['idle']['minIntervalMs'] = 'oops'
-    settings['petSchedules']['good']['idle']['maxIntervalMs'] = 4321
+    settings['petSchedules']['xiaoka']['idle']['minIntervalMs'] = 'oops'
+    settings['petSchedules']['xiaoka']['idle']['maxIntervalMs'] = 4321
     with open(path, 'w', encoding='utf-8') as handle:
         json.dump(settings, handle, ensure_ascii=False)
 
-    schedule = store.effective_schedule('good')
-    # 脏的 min 被丢掉 → 回落默认；干净的 max 保留。
+    schedule = store.effective_schedule('xiaoka')
+    # 脏的 min 被丢掉 → 回落包内声明（小卡是 6000）；干净的 max 保留。
     # 回落值（6000）比用户给的 max（4321）大 → 触发「调正写反的区间」，
     # 于是得到 4321~6000 这个**合法**区间（与包解析同一套宽容策略）。
     assert schedule['idle']['maxIntervalMs'] == 6000

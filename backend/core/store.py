@@ -44,6 +44,8 @@ import threading
 import zipfile
 from datetime import datetime, timezone
 
+from PIL import Image
+
 from .errors import (
     CODE_ARCHIVE_INVALID,
     CODE_BUILTIN_NO_EXPORT,
@@ -64,6 +66,7 @@ from .imports import (
     MAX_PACK_BYTES,
     animated_frame_count,
     check_size,
+    encode_image,
     load_image,
     prepare_sheet,
     process_upload,
@@ -81,6 +84,7 @@ from .pack import (
     MAX_IDLE_PLAYS,
     MAX_FRAMES,
     MAX_FRAME_SIZE,
+    MAX_VARIANTS,
     MAX_SCHEDULE_MS,
     MIN_SCHEDULE_MS,
     ONE_SHOT_ACTIONS,
@@ -99,6 +103,7 @@ from .pack import (
     decode_bytes,
     loads as loads_pack,
     motion_transform_origin,
+    page_capacity,
     parse_animation_patch,
     parse_physics_patch,
     parse_schedule,
@@ -864,91 +869,164 @@ class PetStore:
         return result
 
     def set_pet_schedule(self, pet_id: str, patch: dict) -> dict:
-        """写入某形象的节奏覆盖（**合并**而不是替换：面板一次只改一个行为）。
+        """写入某形象的节奏（**合并**而不是替换：面板一次只改一个行为）。
 
-        传 `None` 或空串表示**清除该行为**的覆盖，回落到包内声明 / 默认值。
+        传 `None` 或空串表示**清除该行为**，回落到包内声明 / 默认值。
+
+        ★ 写到**哪里**取决于这个形象能不能改：
+
+        - **自建形象**（`pet.json` 可写）→ 写进 `pet.json` 的 `schedule`。
+          用户就是作者，这个设置属于**这个形象**：导出形象包时它会一起走，
+          换台机器导入后设置还在。用户明确要求过这一点：
+          「我理解既然是跟随形象走的，应该保存到 pet.json 里面」。
+        - **内置形象**（随包资源，不可写）→ 写进 `settings.json` 的
+          `petSchedules`（我们无权改随包文件）。面板会说明「这是本机覆盖」。
+
+        两条路都**只有一处真相**：写进包时会顺手清掉 `settings.json` 里
+        同名条目，否则那份旧覆盖会一直盖住包里的新值（`effective_schedule`
+        里用户设置优先），表现为「改了没反应」。
         """
         pet_id = sanitize_pet_id(pet_id)
         if not isinstance(patch, dict):
             raise PetError(CODE_WRITE_FAILED, '节奏补丁应为对象', user_msg='设置格式不对。')
 
+        # 先做一遍**字段校验**（两条路共用），顺便算出「要写进包里的那份」
+        declared = self._merge_schedule_patch(
+            pet_id, self._declared_schedule_for_patch(pet_id), patch,
+        )
+
+        if not self._is_builtin_only(pet_id):
+            # 自建形象：写进 pet.json（导出时随包走）
+            self.update_pet_meta(pet_id, schedule=declared or {})
+            # 顺手清掉可能存在的本机覆盖——两处并存时它会盖住包里的值
+            self._drop_stored_schedule(pet_id)
+            return self.effective_schedule(pet_id)
+
+        # 内置形象：只能写本机设置
         with self._lock:
             settings = self.get_settings()
             stored = dict(settings.get('petSchedules') or {})
-            per_pet = dict(stored.get(pet_id) or {})
-
-            for behavior, spec in patch.items():
-                name = str(behavior or '').strip()
-                if name not in SCHEDULE_BEHAVIORS:
-                    raise PetError(
-                        CODE_WRITE_FAILED,
-                        f'不是可设置触发时间的行为: {name}',
-                        user_msg=f'「{name}」不能设触发时间。',
-                        hint='只有「待机小动作」（idle）、「自动漫游」（roam）'
-                             '与「打盹」（sleep）能设触发时间——它们由时间驱动。'
-                             '点击、下落、播报这类动作由事件触发，'
-                             '没有「多久一次」可言。',
-                    )
-                if spec is None or spec == '':
-                    per_pet.pop(name, None)
-                    continue
-                if not isinstance(spec, dict):
-                    raise PetError(
-                        CODE_WRITE_FAILED, f'{name} 的节奏应为对象',
-                        user_msg='设置格式不对。',
-                    )
-                entry = dict(per_pet.get(name) or {})
-                # 只处理这个行为**支持**的字段（见 `pack.BEHAVIOR_FIELDS`）。
-                # `sleep` 只有 `afterMs`（阈值），没有区间也没有 plays。
-                for field_name in BEHAVIOR_FIELDS.get(name, ()):
-                    if field_name not in spec or spec[field_name] in (None, ''):
-                        continue
-                    if field_name == 'afterMs':
-                        entry['afterMs'] = clamp_sleep_after_ms(spec[field_name])
-                    elif field_name in ('minIntervalMs', 'maxIntervalMs'):
-                        entry[field_name] = clamp_schedule_ms(spec[field_name])
-                    elif field_name == 'plays':
-                        try:
-                            plays = int(spec['plays'])
-                        except (TypeError, ValueError):
-                            plays = 1
-                        entry['plays'] = int(min(max(plays, 1), MAX_IDLE_PLAYS))
-                    elif field_name == 'mode':
-                        entry['mode'] = (
-                            'loop' if str(spec[field_name]).strip().lower() == 'loop'
-                            else 'random'
-                        )
-                if (entry.get('minIntervalMs') is not None
-                        and entry.get('maxIntervalMs') is not None
-                        and entry['maxIntervalMs'] < entry['minIntervalMs']):
-                    entry['minIntervalMs'], entry['maxIntervalMs'] = (
-                        entry['maxIntervalMs'], entry['minIntervalMs'],
-                    )
-                if entry:
-                    per_pet[name] = entry
-                else:
-                    per_pet.pop(name, None)
-
-            if per_pet:
-                stored[pet_id] = per_pet
-            else:
+            stored[pet_id] = declared
+            if not declared:
                 stored.pop(pet_id, None)
             settings['petSchedules'] = stored
             self._write_json(self.settings_path(), settings)
         return self.effective_schedule(pet_id)
 
-    def clear_pet_schedule(self, pet_id: str) -> bool:
-        """删掉某形象**全部**节奏覆盖（回落到包内声明 / 默认值）。"""
-        pet_id = sanitize_pet_id(pet_id)
+    def _declared_schedule_for_patch(self, pet_id: str) -> dict:
+        """取「写进包里」的起点：包内声明（自建）或本机覆盖（内置）。
+
+        起点必须是**当前生效的那一份**，否则「只改一项」会把别的项抹掉。
+        """
+        if not self._is_builtin_only(pet_id):
+            try:
+                pack = self.load_pack(pet_id)
+                return {
+                    name: (pack.schedule_for(name).to_dict() if pack.schedule_for(name) else {})
+                    for name in SCHEDULE_BEHAVIORS
+                }
+            except PetError:
+                return {}
+        stored = (self.get_settings().get('petSchedules') or {}).get(pet_id) or {}
+        return {name: dict(value or {}) for name, value in stored.items()}
+
+    def _merge_schedule_patch(self, pet_id: str, base: dict, patch: dict) -> dict:
+        """把面板提交的节奏补丁**合并**到 `base` 上，返回规范化后的结果。
+
+        这是 `set_pet_schedule` 的核心：字段校验 + 夹取 + 区间调正。
+        两条写入路径（包内 / 本机）共用它，因此规则只有一份。
+        """
+        per_pet = {name: dict(value or {}) for name, value in (base or {}).items()}
+
+        for behavior, spec in patch.items():
+            name = str(behavior or '').strip()
+            if name not in SCHEDULE_BEHAVIORS:
+                raise PetError(
+                    CODE_WRITE_FAILED,
+                    f'不是可设置触发时间的行为: {name}',
+                    user_msg=f'「{name}」不能设触发时间。',
+                    hint='只有「待机小动作」（idle）、「自动漫游」（roam）'
+                         '与「打盹」（sleep）能设触发时间——它们由时间驱动。'
+                         '点击、下落、播报这类动作由事件触发，'
+                         '没有「多久一次」可言。',
+                )
+            if spec is None or spec == '':
+                per_pet.pop(name, None)
+                continue
+            if not isinstance(spec, dict):
+                raise PetError(
+                    CODE_WRITE_FAILED, f'{name} 的节奏应为对象',
+                    user_msg='设置格式不对。',
+                )
+            entry = dict(per_pet.get(name) or {})
+            # 只处理这个行为**支持**的字段（见 `pack.BEHAVIOR_FIELDS`）。
+            # `sleep` 只有 `afterMs`（阈值），没有区间也没有 plays。
+            for field_name in BEHAVIOR_FIELDS.get(name, ()):
+                if field_name not in spec or spec[field_name] in (None, ''):
+                    continue
+                if field_name == 'afterMs':
+                    entry['afterMs'] = clamp_sleep_after_ms(spec[field_name])
+                elif field_name in ('minIntervalMs', 'maxIntervalMs'):
+                    entry[field_name] = clamp_schedule_ms(spec[field_name])
+                elif field_name == 'plays':
+                    try:
+                        plays = int(spec['plays'])
+                    except (TypeError, ValueError):
+                        plays = 1
+                    entry['plays'] = int(min(max(plays, 1), MAX_IDLE_PLAYS))
+                elif field_name == 'mode':
+                    entry['mode'] = (
+                        'loop' if str(spec[field_name]).strip().lower() == 'loop'
+                        else 'random'
+                    )
+            if (entry.get('minIntervalMs') is not None
+                    and entry.get('maxIntervalMs') is not None
+                    and entry['maxIntervalMs'] < entry['minIntervalMs']):
+                entry['minIntervalMs'], entry['maxIntervalMs'] = (
+                    entry['maxIntervalMs'], entry['minIntervalMs'],
+                )
+            if entry:
+                per_pet[name] = entry
+            else:
+                per_pet.pop(name, None)
+        return per_pet
+
+    def _drop_stored_schedule(self, pet_id: str) -> bool:
+        """清掉 `settings.json` 里这个形象的本机节奏覆盖。
+
+        Returns:
+            bool: 真的删掉了东西就是 `True`（调用方据此判断「有没有改动」）。
+        """
         with self._lock:
             settings = self.get_settings()
             stored = dict(settings.get('petSchedules') or {})
             if pet_id not in stored:
                 return False
-            del stored[pet_id]
+            stored.pop(pet_id, None)
             settings['petSchedules'] = stored
             self._write_json(self.settings_path(), settings)
-        return True
+            return True
+
+    def clear_pet_schedule(self, pet_id: str) -> bool:
+        """把某形象的节奏**恢复默认**（删掉全部自定义）。
+
+        与 `set_pet_schedule` 一样按「能不能改」分两条路：
+
+        - **自建形象** → 删掉 `pet.json` 里的 `schedule`（回到默认值）。
+          同时清掉本机覆盖，避免它继续盖着。
+        - **内置形象** → 只删本机覆盖（随包文件动不了）。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        removed = False
+        if not self._is_builtin_only(pet_id):
+            pack = self.load_pack(pet_id)
+            if pack.schedules:
+                # `schedule={}` 在 `update_pet_meta` 里是「删掉这个字段」
+                self.update_pet_meta(pet_id, schedule={})
+                removed = True
+            removed = self._drop_stored_schedule(pet_id) or removed
+            return removed
+        return self._drop_stored_schedule(pet_id)
 
     # ------------------------------------------------------------ 显示开关
 
@@ -3139,6 +3217,500 @@ class PetStore:
             'animated': bool(processed.get('animatedFrames', 1) > 1),
             'animatedFrames': int(processed.get('animatedFrames', 1) or 1),
             'url': self.frame_url(pet_id, action, target),
+        }
+
+    def add_action_variant(
+        self,
+        pet_id: str,
+        action: str,
+        data: bytes,
+        *,
+        frames: int = 1,
+        weight: float = 1.0,
+        frame_size: tuple = None,
+        output_format: str = 'png',
+    ) -> dict:
+        """给某个动作**再加一套**动画（`variants` 里追加一项）。
+
+        用户报障：「每个动作我可以点击换图来进行动画帧图的更新，但是只能更新啊，
+        我如果像增加一套闲置动作，入口在哪里」——这就是那个入口。
+
+        与「换图」的区别：换图是**替换这一套的图**（覆盖到 `overrides/`），
+        这个是**新增一套互相替代的动画**（每次触发按权重随机选一套）。
+
+        ★ 新图写在**形象目录里**（不是 `overrides/`），原因有两个：
+
+        1. `overrides/<action>.<ext>` 的语义是「这个动作换成我的图」，
+           只作用于**第一套的第 0 页**（见 `resolve_frame_path` 的说明）。
+           把第二套的图放进去会被第一套的覆盖抢掉，或者反过来盖住第一套；
+        2. 新的一套是**包的一部分**（作者行为），它应当随导出走。
+
+        文件名用 `<action>-v<N>.<ext>`（N 从 2 开始），并自动避让已存在的名字。
+
+        Returns:
+            dict: `{'petId', 'action', 'variant', 'sheet', 'frames', 'weight'}`。
+        """
+        pet_id = self.assert_writable(pet_id)
+        action = str(action or '').strip()
+        if not is_action_name(action):
+            raise PetError(
+                CODE_IMAGE_INVALID, f'动作名非法: {action!r}',
+                user_msg='动作名不合法。',
+            )
+        pack = self.load_pack(pet_id)
+        spec = pack.animations.get(action)
+        if spec is None:
+            raise PetError(
+                CODE_PACK_ANIMATION_MISSING,
+                f'包里没有动作 {action}',
+                user_msg=f'这个形象没有「{action}」这个动作。',
+                http_status=404,
+            )
+        existing = len(spec.variants or [])
+        if existing >= MAX_VARIANTS:
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'{action} 已有 {existing} 套，上限 {MAX_VARIANTS}',
+                user_msg=f'「{action}」最多挂 {MAX_VARIANTS} 套动画。',
+                hint='套数太多时面板会变得很难用，而且每套都要单独加载一张图。',
+            )
+
+        # 动图容器动作**不能**加帧序列套：两条路线是互斥的
+        if any(v.layout == LAYOUT_ANIMATED for v in spec.variants or []):
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'{action} 是动图容器，不能再加帧序列套',
+                user_msg=f'「{action}」现在用的是动图容器（浏览器播放 Gif / WebP），'
+                         '不能再挂一套帧序列动画。',
+                hint='一个动作只能选一条路线：要么动图容器，要么帧序列。'
+                     '想改成帧序列的话，先把这一套的图换成 spritesheet。',
+            )
+
+        uploaded_frames = animated_frame_count(data)
+        if uploaded_frames > 1:
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'新增一套动画不接受动图（{uploaded_frames} 帧）',
+                user_msg=f'你上传的是一个 {uploaded_frames} 帧的动图。',
+                hint='新增的套与其它套必须走同一条路线（帧序列）。'
+                     '请把动画拼成 spritesheet 再上传；'
+                     '想用动图请把整个动作改成动图容器。',
+            )
+
+        count = max(1, int(frames or 1))
+        processed = process_upload(
+            data, what=f'「{action}」第 {existing + 1} 套的图',
+            output_format=output_format,
+            frame_size=frame_size or self._frame_size_of(pack),
+        )
+        # 校验帧数放得下（复用排布校验：默认横排一行）
+        per_page = page_capacity(count, 1, 0, 0)
+        if per_page < 1:
+            raise PetError(
+                CODE_IMAGE_INVALID, f'帧数非法: {count}',
+                user_msg='帧数不合法。',
+            )
+
+        directory = self.user_pet_dir(pet_id)
+        with self._lock:
+            # 找一个没被占用的文件名（`<action>-v2`、`-v3`…）
+            index = existing + 1
+            sheet = ''
+            for attempt in range(index, index + 64):
+                candidate = f'{action}-v{attempt}{processed["extension"]}'
+                if not os.path.exists(os.path.join(directory, candidate)):
+                    sheet = candidate
+                    break
+            if not sheet:
+                raise PetError(
+                    CODE_WRITE_FAILED, '找不到可用的文件名',
+                    user_msg='保存失败：文件名都被占用了。',
+                )
+            write_bytes_atomic(os.path.join(directory, sheet), processed['data'])
+
+        def mutate(manifest):
+            node = self._action_manifest_node(manifest, action)
+            variants = node.get('variants')
+            if not isinstance(variants, list) or not variants:
+                # 原来是**单套写法**（字符串或单对象）→ 就地升级成 variants
+                single = dict(node)
+                node.clear()
+                node['variants'] = [single]
+                variants = node['variants']
+            entry = {'sheet': sheet, 'frames': count}
+            if float(weight or 1) != 1.0:
+                entry['weight'] = float(weight)
+            variants.append(entry)
+
+        self._patch_manifest(pet_id, mutate)
+        logger.info('形象 %s 的动作 %s 新增第 %d 套（%s）',
+                    pet_id, action, existing + 1, sheet)
+        return {
+            'petId': pet_id, 'action': action, 'variant': existing,
+            'sheet': sheet, 'frames': count, 'weight': float(weight or 1),
+        }
+
+    def remove_action_variant(self, pet_id: str, action: str, variant: int) -> dict:
+        """删掉某动作的**一套**动画（最后一页也不留时把整个动作删掉）。
+
+        至少保留一套：全删掉的话这个动作就没有动画了，而那属于
+        「这个动作不存在」——应当用「恢复」把图还原，而不是删套。
+        """
+        pet_id = self.assert_writable(pet_id)
+        action = str(action or '').strip()
+        pack = self.load_pack(pet_id)
+        spec = pack.animations.get(action)
+        if spec is None:
+            raise PetError(
+                CODE_PACK_ANIMATION_MISSING, f'包里没有动作 {action}',
+                user_msg=f'这个形象没有「{action}」这个动作。', http_status=404,
+            )
+        total = len(spec.variants or [])
+        if total <= 1:
+            raise PetError(
+                CODE_WRITE_FAILED,
+                f'{action} 只有一套动画，不能删',
+                user_msg=f'「{action}」只有一套动画。',
+                hint='删掉它这个动作就没有动画了。想换成别的图请用「换图」，'
+                     '想清掉自定义请用「恢复」。',
+            )
+        index = min(max(0, int(variant or 0)), total - 1)
+        removed_sheet = spec.variants[index].sheet
+
+        def mutate(manifest):
+            node = self._action_manifest_node(manifest, action)
+            variants = node.get('variants')
+            if not isinstance(variants, list) or len(variants) <= index:
+                raise PetError(
+                    CODE_WRITE_FAILED, '这个动作的写法不支持删套',
+                    user_msg='删不了：这个动作的配置格式不对。',
+                )
+            variants.pop(index)
+
+        self._patch_manifest(pet_id, mutate)
+
+        # 顺手删掉不再被引用的图（只删包目录里的，且确认没有别处引用它）
+        if removed_sheet:
+            still_used = any(
+                to_posix(v.sheet) == to_posix(removed_sheet)
+                for name, one in self.load_pack(pet_id).animations.items()
+                for v in one.variants
+            )
+            if not still_used:
+                target = os.path.join(self.user_pet_dir(pet_id), removed_sheet)
+                try:
+                    if os.path.isfile(target):
+                        os.remove(target)
+                except OSError as exc:
+                    logger.warning('删除不再引用的图失败 %s: %s', target, exc)
+        logger.info('形象 %s 的动作 %s 删掉了第 %d 套', pet_id, action, index + 1)
+        return {'petId': pet_id, 'action': action, 'removed': index}
+
+    def split_action_variant_pages(
+        self, pet_id: str, action: str, pages: int, *, variant: int = 0,
+    ) -> dict:
+        """把某一套动画的图**拆成 N 页**（降低解码峰值显存）。
+
+        用户问「我如果想设置多页的动作，入口又在哪里」——这就是那个入口。
+
+        为什么要拆：显存占用是「帧数 × 宽 × 高 × 4」，与图片文件多大无关。
+        一张 8×8 网格的 64 帧 sheet 解出来就是 64 倍单帧的内存；拆成 4 页后
+        峰值降到 1/4（同一时刻只解一页）。这是多页唯一的用途。
+
+        做法：读这一套当前的图，按**行**切成 N 段（每段仍是同一个网格排布），
+        写成 `<原名>-p0/-p1/….png`，再把 `sheet` 换成 `sheets` 数组。
+
+        ⚠️ 只对**包内的图**有效。若这一套的图来自 `overrides/`（用户「换图」
+        上传的），那它只作用于第一套第 0 页，拆页会与覆盖语义打架——
+        此时明确报错并说明该怎么办，而不是产出一个「拆完看起来没变」的结果。
+        """
+        pet_id = self.assert_writable(pet_id)
+        action = str(action or '').strip()
+        pack = self.load_pack(pet_id)
+        spec = pack.animations.get(action)
+        if spec is None:
+            raise PetError(
+                CODE_PACK_ANIMATION_MISSING, f'包里没有动作 {action}',
+                user_msg=f'这个形象没有「{action}」这个动作。', http_status=404,
+            )
+        index = min(max(0, int(variant or 0)), len(spec.variants or []) - 1)
+        one = spec.variants[index]
+        if one.layout == LAYOUT_ANIMATED:
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'{action} 是动图容器，没有「页」的概念',
+                user_msg='动图容器由浏览器整段播放，拆页对它没有意义。',
+                hint='拆页是为了降低**帧序列**的解码峰值显存。'
+                     '想省内存的话，动图容器可以换成帧序列 + 多页。',
+            )
+
+        target_pages = int(pages or 1)
+        if target_pages < 1:
+            raise PetError(CODE_WRITE_FAILED, '页数至少是 1', user_msg='页数至少是 1。')
+        frames = one.frames
+        if target_pages > frames:
+            raise PetError(
+                CODE_WRITE_FAILED,
+                f'{action} 只有 {frames} 帧，拆不成 {target_pages} 页',
+                user_msg=f'这一套只有 {frames} 帧，最多拆成 {frames} 页。',
+                hint='每页至少要放 1 帧。',
+            )
+        if len(one.sheets) > 1 and target_pages == 1:
+            # 合并回一页
+            pass
+
+        path, source = self.resolve_frame_path(pet_id, action, variant=index)
+        if not path:
+            raise PetError(
+                CODE_IMAGE_INVALID, f'{action} 第 {index + 1} 套没有可拆的图',
+                user_msg='这一套没有图，拆不了。',
+            )
+        if source == 'override':
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'{action} 第 {index + 1} 套的图来自覆盖（overrides/），不能拆页',
+                user_msg='这一套用的是你「换图」上传的图，拆页会与覆盖打架。',
+                hint='覆盖只作用于第一套第 0 页。想用多页的话：'
+                     '先「恢复」掉覆盖，或者把 spritesheet 直接放进形象包。',
+            )
+
+        # ---- ★ 已经多页了怎么办
+        #
+        # 踩过的坑：不做这层判断时，对已经拆过页的套再拆一次，`resolve_frame_path`
+        # 只给出**第 0 页**那张图（它按 `page=0` 解析），于是拆出来的是
+        # 「第 0 页的第 0/1 半」，而 `sheets` 被替换成这两张——**其余几页的帧
+        # 静默消失**（`frames` 还写着总数，于是播放时那几帧会取到空图）。
+        # 因此：想改页数必须**先合并回一页**。
+        pages_now = len(one.sheets)
+        if pages_now > 1 and target_pages > 1:
+            raise PetError(
+                CODE_WRITE_FAILED,
+                f'{action} 第 {index + 1} 套已经是 {pages_now} 页，不能再拆',
+                user_msg=f'这一套已经是 {pages_now} 页了。',
+                hint='要改页数请先填 1 合并回一页，再按新页数拆。'
+                     '（直接再拆会把第 0 页以外的那几页丢掉。）',
+            )
+
+        directory = self.user_pet_dir(pet_id)
+        extension = '.png'
+        written = []
+
+        if target_pages == 1 and pages_now > 1:
+            # ---- 合并回一页：**逐帧搬运**（与拆页对称，理由见拆页那一段）
+            #
+            # 每一页的形状相同（cols × rowsPerPage），帧序是「页优先、页内行
+            # 优先」，因此按帧号顺序把各页的帧抠出来、依次贴回一张大图即可。
+            # 大图的行数取「装下总帧数」所需的值（可能有空格子，那是合法的）。
+            cols, rows_per_page = max(1, one.cols), max(1, one.rows)
+            page_images = []
+            for page in range(pages_now):
+                page_path, page_source = self.resolve_frame_path(
+                    pet_id, action, variant=index, page=page,
+                )
+                if not page_path or page_source == 'override':
+                    raise PetError(
+                        CODE_IMAGE_INVALID,
+                        f'{action} 第 {index + 1} 套的第 {page} 页解析不出来',
+                        user_msg='这一套有几页读不出来，没法合并。',
+                    )
+                with open(page_path, 'rb') as handle:
+                    page_images.append(load_image(
+                        handle.read(), what=f'「{action}」第 {page + 1} 页',
+                    ))
+                extension = os.path.splitext(page_path)[1] or '.png'
+            first = page_images[0]
+            if first.width % cols or first.height % rows_per_page:
+                raise PetError(
+                    CODE_IMAGE_INVALID,
+                    f'页图 {first.width}×{first.height} 与网格 {cols}×{rows_per_page} 对不上',
+                    user_msg='页图的尺寸与声明的网格对不上，没法合并。',
+                )
+            frame_w = first.width // cols
+            frame_h = first.height // rows_per_page
+            rows_merged = -(-frames // cols)
+            merged = Image.new(
+                'RGBA', (cols * frame_w, rows_merged * frame_h), (0, 0, 0, 0),
+            )
+            for frame_index in range(frames):
+                src_page = frame_index // max(1, one.per_page)
+                slot = frame_index % max(1, one.per_page)
+                if src_page >= len(page_images):
+                    break
+                src_col = slot % cols
+                src_row = slot // cols
+                piece = page_images[src_page].crop((
+                    src_col * frame_w, src_row * frame_h,
+                    (src_col + 1) * frame_w, (src_row + 1) * frame_h,
+                ))
+                dst_col = frame_index % cols
+                dst_row = frame_index // cols
+                merged.paste(piece, (dst_col * frame_w, dst_row * frame_h))
+            base = os.path.splitext(os.path.basename(one.sheets[0]))[0]
+            # 去掉 `-p0` 之类的页码后缀，合并出来的名字才干净
+            base = re.sub(r'-p\d+$', '', base)
+            name = f'{base}{extension}'
+            with self._lock:
+                encoded, _ext = encode_image(
+                    merged, extension.lstrip('.').lower() or 'png',
+                )
+                write_bytes_atomic(os.path.join(directory, name), encoded)
+            written = [name]
+
+            def mutate(manifest):
+                node = self._action_manifest_node(manifest, action)
+                target = node
+                if isinstance(node.get('variants'), list) and node['variants']:
+                    target = node['variants'][min(index, len(node['variants']) - 1)]
+                target.pop('sheets', None)
+                target['sheet'] = name
+                # ★ 合并出来的图行数是「装下总帧数」所需的值，因此要写回去。
+                #
+                # 踩过的坑：只改 `sheet` 不改几何，于是 `cols=2, rows=1`
+                # （2 格）配 4 帧，包校验直接拒绝：
+                # 「2×1 装不下 4 帧（只有 2 格）」——合并整个失败。
+                target['cols'] = cols
+                target['rows'] = rows_merged
+                target['frames'] = frames
+
+            # 先改 pet.json（改成引用合并出来的那一张），**再**清理旧页文件。
+            #
+            # 顺序很重要：清理时要查「还有谁在引用它」，而那必须基于**改完之后**
+            # 的包。反过来（先删再改）会把这一套自己也算成「还在引用」，
+            # 于是永远清不掉。
+            self._patch_manifest(pet_id, mutate)
+
+            # ⚠️ 必须**真的查一遍**有没有别处还在引用它：形象包里的多个动作
+            # 常常共用同一张图（内置形象 12 个动作就全用同一对页文件）。
+            # 第一版直接 `os.remove`，于是合并 idle 时把 walk-left / fall 等
+            # 动作还在用的 `idle-1.png` 一起删了——包立刻变成坏的
+            # （`pet.json` 里还写着它，磁盘上却没有）。
+            still_referenced = set()
+            for _other_name, other in self.load_pack(pet_id).animations.items():
+                for variant in other.variants:
+                    for sheet in variant.sheets:
+                        still_referenced.add(to_posix(sheet))
+            for old in one.sheets:
+                if old == name or to_posix(old) in still_referenced:
+                    continue
+                try:
+                    stale = os.path.join(directory, old)
+                    if os.path.isfile(stale):
+                        os.remove(stale)
+                except OSError as exc:
+                    logger.warning('清理旧页文件失败 %s: %s', old, exc)
+
+            logger.info('形象 %s 的动作 %s 第 %d 套从 %d 页合并回 1 页',
+                        pet_id, action, index + 1, pages_now)
+            return {
+                'petId': pet_id, 'action': action, 'variant': index,
+                'pages': 1, 'perPage': frames, 'sheets': written,
+            }
+
+        # ---- 拆页：读这一套当前的图，按行等分
+        path, source = self.resolve_frame_path(pet_id, action, variant=index)
+        if not path:
+            raise PetError(
+                CODE_IMAGE_INVALID, f'{action} 第 {index + 1} 套没有可拆的图',
+                user_msg='这一套没有图，拆不了。',
+            )
+        if source == 'override':
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'{action} 第 {index + 1} 套的图来自覆盖（overrides/），不能拆页',
+                user_msg='这一套用的是你「换图」上传的图，拆页会与覆盖打架。',
+                hint='覆盖只作用于第一套第 0 页。想用多页的话：'
+                     '先「恢复」掉覆盖，或者把 spritesheet 直接放进形象包。',
+            )
+
+        with open(path, 'rb') as handle:
+            raw = handle.read()
+        try:
+            image = load_image(raw, what=f'「{action}」第 {index + 1} 套的图')
+        except Exception as exc:  # noqa: BLE001
+            raise PetError(
+                CODE_IMAGE_INVALID, f'读不出这一套的图: {exc}',
+                user_msg='这一套的图读不出来，无法拆页。',
+            ) from exc
+
+        # ---- 拆页：**逐帧搬运**，而不是从原图上切横条
+        #
+        # 为什么不切横条：切横条只在「每一页正好占整数行、且原图行数恰好
+        # 等于 页数 × 每页行数」时才成立。而 spritesheet 常常有**空格子**
+        # （例如 4×4 网格只放 13 帧），那时原图行数少于所需行数，横条切法
+        # 要么切错、要么直接失败。
+        #
+        # 逐帧搬运则与排布无关：按原网格把第 i 帧抠出来，再按**新网格**
+        # 贴到目标页上。帧序天然保持（页优先、页内行优先）。
+        cols, rows = max(1, one.cols), max(1, one.rows)
+        per_page = max(1, frames // target_pages)
+        if per_page * target_pages != frames:
+            raise PetError(
+                CODE_WRITE_FAILED,
+                f'{frames} 帧不能均分成 {target_pages} 页',
+                user_msg=f'这一套有 {frames} 帧，没法平均分成 {target_pages} 页。',
+                hint='每页的帧数必须相同（播放顺序靠「页优先」推出来，'
+                     '各页帧数不同就没法算）。请选一个能整除的页数。',
+            )
+        # 每页的形状：列数不变，行数 = 装下「每页帧数」所需的行数
+        rows_per_page = -(-per_page // cols)
+        if image.width % cols or image.height % rows:
+            raise PetError(
+                CODE_IMAGE_INVALID,
+                f'图 {image.width}×{image.height} 不能被 {cols}×{rows} 整除',
+                user_msg='这张图的尺寸与声明的网格对不上，拆不了。',
+                hint='请先在「排布」里把列数 / 行数改成与实际网格一致。',
+            )
+        frame_w = image.width // cols
+        frame_h = image.height // rows
+
+        base = os.path.splitext(os.path.basename(path))[0]
+        extension = os.path.splitext(path)[1] or '.png'
+        with self._lock:
+            for page in range(target_pages):
+                canvas = Image.new(
+                    'RGBA', (cols * frame_w, rows_per_page * frame_h), (0, 0, 0, 0),
+                )
+                for slot in range(per_page):
+                    frame_index = page * per_page + slot
+                    if frame_index >= frames:
+                        break
+                    src_col = frame_index % cols
+                    src_row = frame_index // cols
+                    piece = image.crop((
+                        src_col * frame_w, src_row * frame_h,
+                        (src_col + 1) * frame_w, (src_row + 1) * frame_h,
+                    ))
+                    dst_col = slot % cols
+                    dst_row = slot // cols
+                    canvas.paste(piece, (dst_col * frame_w, dst_row * frame_h))
+                name = f'{base}-p{page}{extension}'
+                encoded, _ext = encode_image(
+                    canvas, extension.lstrip('.').lower() or 'png',
+                )
+                write_bytes_atomic(os.path.join(directory, name), encoded)
+                written.append(name)
+
+        def mutate(manifest):
+            node = self._action_manifest_node(manifest, action)
+            target = node
+            if isinstance(node.get('variants'), list) and node['variants']:
+                target = node['variants'][min(index, len(node['variants']) - 1)]
+            target.pop('sheet', None)
+            target['sheets'] = list(written)
+            # ★ 每页的形状变了：列数不变，行数降到「装下每页帧数」所需的值。
+            #
+            # 不改几何的话包校验会直接拒绝：「声明了 2 页，但 4 帧只需要 1 页
+            # （每页 4 格）」——因为 `cols × rows` 还是原来单页的容量。
+            target['cols'] = cols
+            target['rows'] = rows_per_page
+            target['frames'] = frames
+
+        self._patch_manifest(pet_id, mutate)
+        logger.info('形象 %s 的动作 %s 第 %d 套拆成 %d 页（每页 %d 帧，%d×%d）',
+                    pet_id, action, index + 1, target_pages, per_page, cols, rows_per_page)
+        return {
+            'petId': pet_id, 'action': action, 'variant': index,
+            'pages': target_pages, 'perPage': per_page, 'sheets': written,
         }
 
     def delete_action_override(self, pet_id: str, action: str) -> bool:

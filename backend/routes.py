@@ -741,6 +741,71 @@ def register_routes(api, store: PetStore) -> None:
         )
         return jsonify({'success': True, 'override': payload})
 
+    @api.route('/pets/<pet_id>/actions/<action>/variants', ['POST'])
+    @_handle
+    def add_action_variant(pet_id, action):
+        """给某个动作**再加一套**动画（多套互相替代，按权重随机选一套）。
+
+        用户报障：「每个动作我可以点击换图来进行动画帧图的更新，但是只能更新啊，
+        我如果像增加一套闲置动作，入口在哪里」——这是那个入口。
+
+        与「换图」的区别：换图**替换**这一套的图（写进 `overrides/`），
+        这个**新增一套**（写进形象目录、成为包的一部分，随导出走）。
+
+        表单字段：`file`（必填）、`frames`（默认 1）、`weight`（默认 1）、
+        `format`（`png` / `webp`）。
+        """
+        if not _ACTION_PATTERN.match(str(action or '')) or not is_action_name(action):
+            raise PetError(
+                CODE_IMAGE_INVALID, f'动作名非法: {action}',
+                user_msg='动作名不合法。',
+            )
+        data = _read_upload('file')
+        output_format = str(request.form.get('format') or 'png').lower()
+        if output_format not in ('png', 'webp'):
+            output_format = 'png'
+        try:
+            frames = int(request.form.get('frames') or 1)
+        except (TypeError, ValueError):
+            frames = 1
+        try:
+            weight = float(request.form.get('weight') or 1)
+        except (TypeError, ValueError):
+            weight = 1.0
+
+        payload = store.add_action_variant(
+            pet_id, action, data,
+            frames=frames, weight=weight, output_format=output_format,
+        )
+        return jsonify({'success': True, 'variant': payload, 'pet': runtime(pet_id)})
+
+    @api.route('/pets/<pet_id>/actions/<action>/variants/<int:variant>', ['DELETE'])
+    @_handle
+    def delete_action_variant(pet_id, action, variant):
+        """删掉某动作的**一套**动画（至少保留一套）。"""
+        payload = store.remove_action_variant(pet_id, action, variant)
+        return jsonify({'success': True, 'removed': payload, 'pet': runtime(pet_id)})
+
+    @api.route('/pets/<pet_id>/actions/<action>/variants/<int:variant>/pages', ['POST'])
+    @_handle
+    def split_action_variant_pages(pet_id, action, variant):
+        """把某一套动画的图**拆成 N 页**（降低解码峰值显存）。
+
+        用户问「我如果想设置多页的动作，入口又在哪里」——这是那个入口。
+
+        请求体：`{"pages": 2}`。拆出来的是按**行**等分的 N 张图，
+        每页仍是同一个网格排布，帧序不变（页优先、页内行优先）。
+        """
+        payload = _json_body()
+        try:
+            pages = int(payload.get('pages') or 1)
+        except (TypeError, ValueError):
+            pages = 1
+        result = store.split_action_variant_pages(
+            pet_id, action, pages, variant=variant,
+        )
+        return jsonify({'success': True, 'split': result, 'pet': runtime(pet_id)})
+
     @api.route('/pets/<pet_id>/actions/<action>', ['DELETE'])
     @_handle
     def delete_action_image(pet_id, action):

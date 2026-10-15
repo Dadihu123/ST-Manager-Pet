@@ -120,14 +120,26 @@ try {
   );
 
   // ============================================ ② 内置更新不覆盖用户设置 + 能看出差别
+  //
+  // ⚠️ 这一段必须用**内置形象**来验。
+  //
+  // 「用户设置」与「包内建议」是**两个不同的值**这件事只对内置形象成立：
+  // 随包文件是只读资源，用户的改动只能落在本机设置里，因此两份值会分叉，
+  // 面板也才有必要把「你在用 X、形象包当前建议 Y」摆出来。
+  //
+  // 而**自建形象**下用户就是作者，设置直接写进 `pet.json`
+  // （用户要求「既然是跟随形象走的，应该保存到 pet.json 里面」，
+  // 这样导出形象包时才会一起走）——那时两份值本来就是同一个，
+  // 拿自建形象来断言「是两个不同的值」必然失败。
   const scheduleNote = await page.evaluate(`(async () => {
-    // 给这个形象设一个与包内建议不同的间隔
-    await window.__petApi.api('/pets/' + ${JSON.stringify(createdId)} + '/schedule', {
+    // 给内置形象设一个与包内建议不同的间隔
+    await window.__petApi.api('/pets/xiaoka/schedule', {
       method: 'POST',
       body: { schedule: { idle: { minIntervalMs: 3000, maxIntervalMs: 5000 } } },
     });
-    const res = await window.__petApi.api('/pets/' + ${JSON.stringify(createdId)} + '/preview', { method: 'GET' });
+    const res = await window.__petApi.api('/pets/xiaoka/preview', { method: 'GET' });
     return {
+      writable: res.writable,
       effective: res.schedule.idle,
       declared: res.declaredSchedule ? res.declaredSchedule.idle : null,
       overridden: res.scheduleOverridden,
@@ -135,13 +147,33 @@ try {
   })()`);
   record(
     '② ★ 用户设置与包内建议**是两个不同的值**（更新包不会覆盖用户那份）',
-    scheduleNote.effective && scheduleNote.effective.minIntervalMs === 3000
+    scheduleNote.writable === false
+      && scheduleNote.effective && scheduleNote.effective.minIntervalMs === 3000
       && scheduleNote.declared && scheduleNote.declared.minIntervalMs !== 3000,
     `生效=${JSON.stringify(scheduleNote.effective)}；`
     + `包内建议=${JSON.stringify(scheduleNote.declared)}；已覆盖=${scheduleNote.overridden}`,
   );
+  // ★ 自建形象下应当**没有**这个提示（两份值是同一个，比较没有意义），
+  // 而面板要说明「改动会写进 pet.json」——否则用户不知道会不会随导出走。
   await openPet(createdId);
   const overrideNote = await page.evaluate(`(() => {
+    const detail = document.querySelector('.plugin-stm-pet .pet-panel-detail');
+    const box = [...document.querySelectorAll('.plugin-stm-pet .pet-notice')]
+      .find((n) => n.textContent.includes('你改过这里的设置'));
+    return {
+      shown: Boolean(box),
+      mentionsPetJson: detail ? detail.textContent.includes('pet.json') : false,
+    };
+  })()`);
+  record(
+    '② ★ 自建形象不显示「你改过 vs 包内建议」（用户就是作者，两份值相同）',
+    !overrideNote.shown && overrideNote.mentionsPetJson,
+    `提示出现=${overrideNote.shown}；说明了写在 pet.json 里=${overrideNote.mentionsPetJson}`,
+  );
+
+  // 内置形象才要显示那个对比提示
+  await openPet('xiaoka');
+  const builtinNote = await page.evaluate(`(() => {
     const box = [...document.querySelectorAll('.plugin-stm-pet .pet-notice')]
       .find((n) => n.textContent.includes('你改过这里的设置'));
     return {
@@ -151,9 +183,10 @@ try {
   })()`);
   record(
     '② ★ 面板把「你在用 X、形象包当前建议 Y」摆出来（否则用户永远看不到作者改过）',
-    overrideNote.shown && overrideNote.text.includes('形象包当前建议'),
-    overrideNote.text.slice(0, 120),
+    builtinNote.shown && builtinNote.text.includes('形象包当前建议'),
+    builtinNote.text.slice(0, 120),
   );
+  await openPet(createdId);
 
   // ============================================ ③ 多套动画：选套器 + 正确权重
   await openEditor('待机');

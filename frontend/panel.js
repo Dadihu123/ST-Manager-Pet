@@ -404,6 +404,15 @@ export function createSettingsPanel({
    */
   let pendingConfirm = null;
   /**
+   * 面板内的**输入 / 确认对话框**：`{kind, title, label, value, onDone}` 或 `null`。
+   *
+   * 为什么不用原生 `prompt` / `confirm`：宿主的面板本身跑在 modal 里，原生
+   * 对话框会盖住整个应用；而且在无头浏览器里 `prompt` 恒返回 null、
+   * `confirm` 恒返回 false —— 验收脚本会因此永远走不到「确认」那条路，
+   * 「加了套」这种功能就**测不到**（而不是测不过）。
+   */
+  let pendingPrompt = null;
+  /**
    * 新建表单的**标准图像**声明。
    *
    * 三种状态：
@@ -477,6 +486,21 @@ export function createSettingsPanel({
    * 早已不存在的草稿（用户以为改生效了，其实没有）。
    */
   let previewOverride = null;
+  /**
+   * 预览框是否**固定在面板右侧**（浮在滚动容器之外）。
+   *
+   * 用户要求：「让这个预览框可以点击一下就固定到当前模态框的外面，
+   * 比如右侧，滚动里面不会影响它的显示」。这是「调参数时要来回滚」的解法。
+   */
+  let previewFloating = false;
+  /**
+   * 最近一次装载进预览器的 spec（见 `mountPreviewPlayer`）。
+   *
+   * 固定预览要把预览框挪进另一列，挪完必须按**新宽度**重新装载一次
+   * （`load()` 会据此算单帧尺寸），而 `movePreviewIntoFloat()` 在
+   * `renderPreview()` 的作用域之外，拿不到那份 spec。
+   */
+  let loadedPreviewSpec = null;
   /**
    * 预览器是否处于「播放」状态。
    *
@@ -1591,6 +1615,27 @@ export function createSettingsPanel({
 
     // ---- 右栏：选中形象的详情（或新建表单）
     body.appendChild(creating ? renderCreate() : (showingHelp ? renderHelp() : renderDetail()));
+
+    // ---- ★ 第三栏：**固定预览**
+    //
+    // 用户要求：「让这个预览框可以点击一下就固定到当前模态框的外面，
+    // 比如右侧，滚动里面不会影响它的显示」。
+    //
+    // 做法是把它做成**真正的一列**（而不是 `position: fixed`）：
+    // 本仓库的契约测试**禁止** `position: fixed` 与 `sticky`
+    // （宿主自带 ambient 全屏容器，插件在容器内不该自己逃出文档流）。
+    // 而「第三列」更简单也更稳：详情栏自己滚（`overflow-y: auto`），
+    // 这一列不动，于是改参数时预览一直看得见——正是用户要的效果。
+    //
+    // 预览框本身**不搬家**（它是 `player` 的容器，搬走会重建播放器、
+    // 丢掉当前帧）：这里放一个**占位**，挂载完播放器之后再把那个框挪进来。
+    if (previewFloating && !creating && !showingHelp) {
+      const float = el('div', 'pet-panel-float');
+      float.dataset.previewFloatHost = 'true';
+      float.appendChild(el('div', 'pet-section-title', '预览（已固定）'));
+      body.appendChild(float);
+      body.classList.add('has-float');
+    }
     root.appendChild(body);
 
     // 缩略图几何依赖「帧数」，而帧数在 `detail` 里 —— 必须在 DOM 挂上、
@@ -1598,8 +1643,64 @@ export function createSettingsPanel({
     applyThumbGeometry();
     // 动画预览器同理：要在 DOM 挂上之后才知道预览框的真实宽度
     if (!creating) mountPreviewPlayer();
+    // 把预览框挪进固定栏（在 `mountPreviewPlayer` **之后**：
+    // 播放器要按预览框当时的宽度算几何，挪动会改变宽度，因此挪完要重算）
+    movePreviewIntoFloat();
     // 最后还原滚动位置：必须在 DOM 挂上之后（游离节点的 scrollTop 无效）
     restoreScroll(savedScroll);
+  }
+
+  /**
+   * 把预览框（含它右侧的元信息）挪进**固定栏**，或从固定栏挪回原处。
+   *
+   * 为什么是「挪 DOM」而不是「渲染两遍」：预览框是 `player` 的容器，
+   * 渲染两遍会创建两个播放器、两个 rAF 循环（而本插件对「静止时 rAF 必须
+   * 停掉」有硬要求）。挪动只改父节点，播放器持有的元素引用仍然有效。
+   *
+   * 挪完必须**重新量一次几何**（`player.load()` 按预览框宽度算单帧尺寸），
+   * 否则固定之后画面会按旧宽度缩放，看起来「变扁了」。
+   */
+  function movePreviewIntoFloat() {
+    const host = root && root.querySelector('[data-preview-float-host="true"]');
+    const stage = root && root.querySelector('.pet-preview-stage');
+    if (!stage) return;
+    const box = stage.querySelector('.pet-preview-box');
+    const side = stage.querySelector('.pet-preview-side');
+
+    // ★ 先判断**到底要不要挪**，不需要就立刻返回。
+    //
+    // 第一版无条件走一遍「挪 + 重新装载」，于是每次 render 都会多调一次
+    // `player.load()`。而 `load()` 会先 `stop()` 再 `draw()`，在刚渲染出来、
+    // 还没量到宽度的框上调用它 → 背景图算不出来（`background-image: none`），
+    // 预览**整个变空白**（实测：任何形象、任何动作都是 `0% 0%` + 无图，
+    // 与固定预览无关，是每次 render 都踩）。
+    const needsMove = host
+      ? (!host.contains(box) || !host.contains(side))
+      : (!stage.contains(box) || !stage.contains(side));
+    if (!needsMove) {
+      if (host) stage.classList.add('is-emptied');
+      return;
+    }
+
+    if (host) {
+      if (box) host.appendChild(box);
+      if (side) host.appendChild(side);
+      stage.classList.add('is-emptied');
+    } else if (box) {
+      stage.appendChild(box);
+      if (side) stage.appendChild(side);
+      stage.classList.remove('is-emptied');
+    }
+    // 挪完必须**重新装载一次**：`load()` 会按预览框当前的宽度算单帧尺寸，
+    // 不重算的话固定之后画面会按旧宽度缩放，看起来「变扁了」。
+    // 同一帧、同一节奏，只是几何重算。
+    if (player && loadedPreviewSpec) {
+      try {
+        player.load(loadedPreviewSpec, { autoplay: previewPlaying });
+      } catch {
+        // 装载失败不该让整片面板崩掉（下一次 render 会重建播放器）
+      }
+    }
   }
 
   /**
@@ -1899,6 +2000,14 @@ export function createSettingsPanel({
     wrap.appendChild(header);
 
     wrap.appendChild(renderAppearance());
+
+    // ---- 面板内的输入 / 确认对话框（不用原生 prompt / confirm）
+    //
+    // 放在**最上面**：它是「正在等你回答」的东西，混在设置项中间会被
+    // 滚动位置藏起来（用户会以为按钮点了没反应）。
+    if (pendingPrompt) {
+      wrap.appendChild(renderPromptBox());
+    }
 
     // ---- 触发时间（唯一由时间驱动的两个行为：idle 小动作 / 自动漫游）
     wrap.appendChild(renderSchedule());
@@ -2675,10 +2784,20 @@ export function createSettingsPanel({
     if (detail.scheduleOverridden) {
       row.appendChild(button('恢复默认触发时间', 'is-icon', () => resetSchedule()));
     }
+    // ★ 说明这些值**存到哪里**——用户问过「既然是跟随形象走的，
+    // 应该保存到 pet.json 里面」，而答案取决于这个形象能不能改：
+    // 自建形象的节奏写进 `pet.json`（**导出时随包走**），
+    // 内置形象只能写本机设置（随包文件是只读资源）。
     row.appendChild(el(
       'span',
       'pet-card-meta',
-      detail.scheduleOverridden ? '已自定义' : '正在用默认 / 形象包的设置',
+      detail.writable
+        ? (detail.scheduleOverridden
+          ? '已自定义（存在这个形象的 pet.json 里，导出时一起走）'
+          : '正在用内置默认值（改动会写进 pet.json，导出时一起走）')
+        : (detail.scheduleOverridden
+          ? '已自定义（插件自带的形象改不了包，这个值存在本机设置里）'
+          : '正在用形象包声明的节奏'),
     ));
 
     // ★ 「你改过的」与「形象包现在建议的」并排显示。
@@ -2686,14 +2805,16 @@ export function createSettingsPanel({
     // 用户问：「触发时间目前已经绑定形象了……后续如果内置形象更新了，
     // 会发生什么，应该是会覆盖掉吧」。
     //
-    // 实测答案：**不会覆盖**。用户设置存在 `data/settings.json` 的
-    // `petSchedules` 里，形象包是另一个文件（内置的在 `resources/pets/`），
-    // 插件更新只替换后者，因此用户的选择一定保留（优先级也是用户设置更高）。
+    // 答案分两种情况（这正是这里要讲清楚的事）：
     //
-    // 但这个担心指向了一个**真实**的问题：用户改过之后，官方若调整了推荐值，
-    // 用户**永远看不到**——他保留着自己那份旧设置，不知道作者现在建议别的。
-    // 因此这里在「已覆盖」时把两边都摆出来，让用户自己决定要不要跟随新建议。
-    if (detail.scheduleOverridden) {
+    // - **内置形象**：用户设置存在 `data/settings.json`，形象包在
+    //   `resources/pets/`，插件更新只替换后者 → 用户的选择**一定保留**。
+    //   但作者若调整了推荐值，用户**永远看不到**（他保留着自己那份旧设置），
+    //   因此这里在「已覆盖」时把两边都摆出来，让他自己决定要不要跟随。
+    // - **自建形象**：用户**就是作者**，设置直接写进 `pet.json`
+    //   （见 `store.set_pet_schedule`）。此时「你改的」与「包内声明的」
+    //   本来就是同一个东西，比较没有意义，因此不显示这个提示。
+    if (detail.scheduleOverridden && !detail.writable) {
       const diffs = [];
       for (const behavior of SCHEDULE_BEHAVIORS) {
         const theirs = declared[behavior.key];
@@ -2758,6 +2879,38 @@ export function createSettingsPanel({
     box.dataset.previewBox = 'true';
     // 单帧 / 无图时也要有内容，因此图由 `player.load()` 写进 style
     stage.appendChild(box);
+
+    // ★ **固定预览**（浮动）：把预览框挪到面板外面，滚动设置时它不动。
+    //
+    // 用户要求：「对于已经设置好的动作而言，当前的预览框位置是合适的，
+    // 我不需要滚动页面就可以切换动作来进行预览，但是如果我要编辑动作，
+    // 那么我要先滚动下去操作完，然后点击应用预览，再滚回去查看预览，
+    // 这样仍旧不够方便，和之前相比区别不大。我有个很粗糙的想法，
+    // 就是让这个预览框可以点击一下就固定到当前模态框的外面，比如右侧，
+    // 滚动里面不会影响它的显示」。
+    //
+    // 做法：预览框**本身不搬家**（它是 `player` 的容器，搬走会重建播放器、
+    // 丢掉当前帧），而是给它加一个 `is-floating` 类，用 `position: fixed`
+    // 把它固定在面板右侧。滚动容器里的位置由占位块撑着，因此布局不跳。
+    const floatToggle = el('div', 'pet-preview-float-toggle');
+    const floatBtn = button(
+      previewFloating ? '取消固定' : '固定预览到右侧',
+      'is-icon',
+      () => {
+        previewFloating = !previewFloating;
+        render();
+      },
+    );
+    floatBtn.dataset.previewFloat = 'true';
+    floatToggle.appendChild(floatBtn);
+    floatToggle.appendChild(el(
+      'span',
+      'pet-card-meta',
+      previewFloating
+        ? '预览已固定——滚动设置时它不会跟着走，可以边调边看'
+        : '固定之后预览会浮在右侧，改参数时不必来回滚动',
+    ));
+    if (previewFloating) stage.classList.add('is-floating');
 
     const side = el('div', 'pet-preview-side');
     side.appendChild(el('div', 'pet-preview-name', ACTION_LABELS[previewAction] || previewAction));
@@ -2958,6 +3111,7 @@ export function createSettingsPanel({
     side.appendChild(readout);
 
     stage.appendChild(side);
+    section.appendChild(floatToggle);
     section.appendChild(stage);
 
     // ---- 动作选择：点一下就能播
@@ -3040,6 +3194,11 @@ export function createSettingsPanel({
     });
     // 尊重「暂停」状态：暂停时只画第 0 帧，不自动播
     if (pending.spec) player.load(pending.spec, { autoplay: previewPlaying });
+    // 记下这一份 spec：`movePreviewIntoFloat()` 把预览框挪到固定栏之后
+    // 要**重新装载一次**（按新宽度重算单帧尺寸），而那时它已经不在
+    // `renderPreview()` 的作用域里了（踩过：`spec is not defined`，
+    // 面板每次 render 都抛一次，固定预览就再也画不出来）。
+    loadedPreviewSpec = pending.spec || null;
   }
 
   /** 倍率的短格式（去掉多余的 0）。 */
@@ -3429,7 +3588,41 @@ export function createSettingsPanel({
       }
       picker.appendChild(el('div', 'pet-field-hint', names.join('　·　')));
       box.appendChild(picker);
+    } else {
+      // 只有一套时也把「这一套是什么样」写出来——否则用户看不出
+      // 「这个动作现在挂的是一套什么动画」，也就无从判断要不要再加一套。
+      box.appendChild(el(
+        'div',
+        'pet-field-hint',
+        describeVariant(variantEntryAt(entry, 0), 0)
+        + '（目前只有这一套。想让这个动作随机播几种不同反应，用下面的「加一套动画」）',
+      ));
     }
+
+    // ---- ★ 多套动画的**增删入口**
+    //
+    // 用户报障：「每个动作我可以点击换图来进行动画帧图的更新，但是只能更新啊，
+    // 我如果像增加一套闲置动作，入口在哪里……我目前测试下来根本无法设置」。
+    //
+    // 「换图」与「加一套」是两件事，因此必须各有入口：
+    // - 换图 = **替换**这一套的图（写进 overrides/，不动包）；
+    // - 加一套 = **新增**一套互相替代的动画（写进形象目录，随导出走）。
+    const variantTools = el('div', 'pet-editor-variant-tools');
+    variantTools.appendChild(button('＋ 加一套动画', 'is-icon', () => addVariant(entry.action)));
+    if (count > 1) {
+      variantTools.appendChild(button(
+        `删除第 ${actionDraft.active + 1} 套`, 'is-icon is-danger',
+        () => removeVariant(entry.action, actionDraft.active),
+      ));
+    }
+    variantTools.appendChild(el(
+      'span',
+      'pet-card-meta',
+      count > 1
+        ? `这个动作有 ${count} 套，每次触发按权重随机选一套`
+        : '加一套之后，这个动作每次触发会按权重随机选一套播',
+    ));
+    box.appendChild(variantTools);
 
     const draft = actionDraft.variants[actionDraft.active];
 
@@ -3619,6 +3812,45 @@ export function createSettingsPanel({
         syncGridVisibility();
       });
       box.appendChild(gridRow);
+
+      // ---- ★ 多页（拆页 / 合并）
+      //
+      // 用户问：「我如果想设置多页的动作，入口又在哪里」。
+      //
+      // 「页」与「套」是两件不同的事：**套**是互相替代的几套动画（按权重选
+      // 一套），**页**是**同一套**的帧分散在多个文件里。多页唯一的用途是
+      // **降低解码峰值显存**——一张 8×8 的 64 帧 sheet 解出来是 64 倍单帧的
+      // 内存，拆成 4 页后同一时刻只解一页，峰值降到 1/4。
+      //
+      // 因此这里给的是「拆成 N 页」而不是「填一个页数」：页数不是能凭空设的
+      // 数字，它得真的把图切开、写出文件、改 `sheets`。填 1 就是合并回一页。
+      const pagesNow = Number(activeVariant.pageCount) || 1;
+      const pageField = el('div', 'pet-field');
+      pageField.appendChild(el('div', 'pet-field-label', '页数（省显存）'));
+      const pageRow = el('div', 'pet-editor-row');
+      const pageInput = el('input', 'pet-input');
+      pageInput.type = 'number';
+      pageInput.min = '1';
+      pageInput.max = String(Math.max(1, Number(draft.frames) || 1));
+      pageInput.step = '1';
+      pageInput.value = String(pagesNow);
+      pageInput.dataset.editorPages = 'true';
+      pageInput.dataset.marqueeIgnore = 'true';
+      pageRow.appendChild(pageInput);
+      pageRow.appendChild(button('按这个页数重新拆', 'is-icon', () => {
+        splitVariantPages(entry.action, actionDraft.active, Number(pageInput.value) || 1);
+      }));
+      pageField.appendChild(pageRow);
+      const framesNow = Math.max(1, Number(draft.frames) || 1);
+      pageField.appendChild(el(
+        'div',
+        'pet-field-hint',
+        `这一套现在有 ${pagesNow} 页、共 ${framesNow} 帧`
+        + `（每页约 ${Math.max(1, Math.round(framesNow / Math.max(1, pagesNow)))} 帧）。`
+        + '拆页只影响解码时的峰值显存，播放顺序与观感完全不变；'
+        + '填 1 就是合并回一页。',
+      ));
+      box.appendChild(pageField);
     }
 
     // ---- 权重（**多套动画时才有意义**）
@@ -3815,6 +4047,50 @@ export function createSettingsPanel({
   }
 
   /**
+   * 渲染面板内的**输入 / 确认对话框**（见 `pendingPrompt` 的说明）。
+   */
+  function renderPromptBox() {
+    const spec = pendingPrompt;
+    const box = el('div', 'pet-notice is-info pet-prompt');
+    box.dataset.prompt = spec.kind === 'confirm' ? 'confirm' : 'number';
+    box.appendChild(el('div', 'pet-notice-title', spec.title));
+    if (spec.body) box.appendChild(el('div', 'pet-notice-body', spec.body));
+
+    const row = el('div', 'pet-panel-toolbar');
+    let readValue = () => true;
+    if (spec.kind !== 'confirm') {
+      const field = el('div', 'pet-field');
+      field.appendChild(el('div', 'pet-field-label', spec.label));
+      const input = el('input', 'pet-input');
+      input.type = 'number';
+      input.min = String(spec.min ?? 1);
+      input.max = String(spec.max ?? 1024);
+      input.value = spec.value;
+      input.dataset.promptInput = 'true';
+      input.dataset.marqueeIgnore = 'true';
+      field.appendChild(input);
+      if (spec.hint) field.appendChild(el('div', 'pet-field-hint', spec.hint));
+      box.appendChild(field);
+      readValue = () => {
+        const number = Number(input.value);
+        if (!Number.isFinite(number)) return null;
+        return Math.min(Math.max(Math.round(number), spec.min ?? 1), spec.max ?? 1024);
+      };
+    }
+
+    row.appendChild(button(spec.confirmLabel || '确定', 'is-primary', () => {
+      const value = spec.kind === 'confirm' ? true : readValue();
+      if (value === null) return;
+      spec.onDone(value);
+    }));
+    row.appendChild(button('取消', '', () => {
+      spec.onDone(spec.kind === 'confirm' ? false : null);
+    }));
+    box.appendChild(row);
+    return box;
+  }
+
+  /**
    * 一个「标签 + 数字框」的小组件（编辑区里用）。
    *
    * 比滑块更适合这里：这些值要么需要精确输入（帧率 2.5、幅度 0.012），
@@ -3943,6 +4219,183 @@ export function createSettingsPanel({
       if (Object.keys(patch).length) out.push({ variant: index, patch });
     }
     return out;
+  }
+
+  /**
+   * **加一套动画**：选一张图上传，作为这个动作的新一套。
+   *
+   * 用户报障「只能换图，加一套的入口在哪里」——这是那个入口。
+   * 与「换图」的区别写在下方的提示里，避免用户以为两者是一回事。
+   */
+  async function addVariant(action) {
+    const frames = await askNumber({
+      title: `给「${ACTION_LABELS[action] || action}」加一套动画`,
+      label: '这一套有几帧？',
+      hint: '按你选的图里的帧数填。单张图填 1；横排/竖排/网格的 spritesheet '
+        + '填总帧数（排布可以在加完之后到「排布」里调）。',
+      value: 1,
+      min: 1,
+      max: 1024,
+    });
+    if (frames === null) return;
+    pickFile({
+      accept: 'image/*',
+      onPicked: async (file) => {
+        await withBusy(async () => {
+          const body = new FormData();
+          body.append('file', file);
+          body.append('frames', String(frames));
+          const data = await call(
+            `/pets/${encodeURIComponent(selectedId)}/actions/${encodeURIComponent(action)}/variants`,
+            { method: 'POST', body },
+          );
+          if (!data) return;
+          setNotice('ok', `已给「${ACTION_LABELS[action] || action}」加上第 `
+            + `${(data.variant ? data.variant.variant : 0) + 1} 套动画`);
+          // 刷新详情后把编辑区切到刚加的那一套，方便接着调
+          editingAction = action;
+          await refresh();
+          const fresh = (detail.actions || []).find((item) => item.action === action);
+          if (fresh) {
+            actionDraft = buildActionDraft(fresh);
+            actionDraft.active = Math.max(0, variantCountOf(fresh) - 1);
+            render();
+          }
+        });
+      },
+    });
+  }
+
+  /** **删掉一套动画**（至少保留一套）。 */
+  async function removeVariant(action, index) {
+    const total = variantCountOf(
+      (detail.actions || []).find((item) => item.action === action) || {},
+    );
+    if (total <= 1) {
+      setNotice('warn', '这个动作只有一套动画，删掉它就没有动画了');
+      return;
+    }
+    const ok = await askConfirm({
+      title: `删掉第 ${index + 1} 套？`,
+      body: `「${ACTION_LABELS[action] || action}」还有 ${total - 1} 套，`
+        + '删掉这一套之后这个动作会在其余几套里按权重随机播。'
+        + '不再被引用的图会一并删掉。',
+      confirmLabel: '删掉这一套',
+      danger: true,
+    });
+    if (!ok) return;
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(selectedId)}/actions/${encodeURIComponent(action)}`
+        + `/variants/${index}`,
+        { method: 'DELETE' },
+      );
+      if (!data) return;
+      setNotice('ok', `已删掉「${ACTION_LABELS[action] || action}」的第 ${index + 1} 套`);
+      editingAction = '';
+      actionDraft = null;
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+    });
+  }
+
+  /**
+   * **把某一套拆成 N 页**（或合并回 1 页）。
+   *
+   * 拆页是**真的切图**：按行等分、写成 N 个文件、把 `sheet` 换成 `sheets`。
+   * 因此它会改动形象目录里的文件，只在自建形象上可用。
+   */
+  async function splitVariantPages(action, index, pages) {
+    const target = Math.max(1, Math.round(Number(pages) || 1));
+    const entry = (detail.actions || []).find((item) => item.action === action) || {};
+    const one = variantEntryAt(entry, index);
+    const now = Number(one.pageCount) || 1;
+    if (target === now) {
+      setNotice('ok', `第 ${index + 1} 套已经是 ${now} 页了`);
+      return;
+    }
+    if (target > 1 && now > 1) {
+      setNotice('warn',
+        '这一套已经拆过页了。要改页数请先填 1 合并回一页，再按新页数拆。');
+      return;
+    }
+    const ok = await askConfirm({
+      title: target === 1
+        ? `把第 ${index + 1} 套合并回一页？`
+        : `把第 ${index + 1} 套拆成 ${target} 页？`,
+      body: target === 1
+        ? '会把各页拼回一张图，并删掉原来的页文件。播放效果不变，'
+          + '只是解码峰值显存回到原来那么多。'
+        : `会按行把这一套的图切成 ${target} 份、写成 ${target} 个文件，`
+          + '并把这一套改成多页。播放顺序与观感完全不变，'
+          + `但同一时刻只解一页，解码峰值显存降到约 1/${target}。`,
+      confirmLabel: target === 1 ? '合并' : '拆页',
+    });
+    if (!ok) return;
+    await withBusy(async () => {
+      const data = await call(
+        `/pets/${encodeURIComponent(selectedId)}/actions/${encodeURIComponent(action)}`
+        + `/variants/${index}/pages`,
+        { method: 'POST', body: { pages: target } },
+      );
+      if (!data) return;
+      setNotice('ok', target === 1
+        ? `第 ${index + 1} 套已合并回一页`
+        : `第 ${index + 1} 套已拆成 ${target} 页（每页 ${data.split.perPage} 帧）`);
+      editingAction = action;
+      if (onPetChanged) await onPetChanged(activeId);
+      await refresh();
+      const fresh = (detail.actions || []).find((item) => item.action === action);
+      if (fresh) {
+        actionDraft = buildActionDraft(fresh);
+        actionDraft.active = index;
+        render();
+      }
+    });
+  }
+
+  /**
+   * 一个**面板内的**数字输入对话框（不用原生 `prompt`）。
+   *
+   * 原生 `prompt` 在无头浏览器里恒返回 null，验收脚本会因此永远走不到
+   * 「确认」那条路（与确认框同一个理由，见 `confirmDiscardCreate`）。
+   */
+  function askNumber(options) {
+    return new Promise((resolve) => {
+      pendingPrompt = {
+        title: options.title,
+        label: options.label,
+        hint: options.hint,
+        value: String(options.value),
+        min: options.min,
+        max: options.max,
+        onDone: (value) => {
+          pendingPrompt = null;
+          render();
+          resolve(value);
+        },
+      };
+      render();
+    });
+  }
+
+  /** 一个**面板内的**确认对话框（不用原生 `confirm`）。 */
+  function askConfirm(options) {
+    return new Promise((resolve) => {
+      pendingPrompt = {
+        kind: 'confirm',
+        title: options.title,
+        body: options.body,
+        confirmLabel: options.confirmLabel || '确定',
+        danger: Boolean(options.danger),
+        onDone: (value) => {
+          pendingPrompt = null;
+          render();
+          resolve(value);
+        },
+      };
+      render();
+    });
   }
 
   /**

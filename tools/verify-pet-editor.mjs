@@ -106,11 +106,26 @@ try {
     const labels = [...document.querySelectorAll('.plugin-stm-pet .pet-field-label')]
       .map((n) => n.textContent.trim());
     const collapsibles = [...document.querySelectorAll('.plugin-stm-pet .pet-section.is-collapsible')]
-      .map((s) => ({
-        label: s.querySelector('.pet-section-toggle-label').textContent.trim(),
-        open: s.classList.contains('is-open'),
-        bodyDisplay: getComputedStyle(s.querySelector('.pet-section-body')).display,
-      }));
+      .map((s) => {
+        const toggle = s.querySelector('.pet-section-toggle');
+        const body = s.querySelector('.pet-section-body');
+        return {
+          label: s.querySelector('.pet-section-toggle-label').textContent.trim(),
+          open: s.classList.contains('is-open'),
+          bodyDisplay: getComputedStyle(body).display,
+          // ★ 必须量**真实高度**，不能只看 class 与 display。
+          //
+          // 踩过的坑：折叠块加了 overflow: hidden，而 CSS 规范里
+          // min-height: auto 只在 overflow: visible 时生效 —— 于是
+          // flex 竖列把它压成 **2px**，内容全被裁掉（「整块直接消失了」）。
+          // 那时 class 是 is-open、body 的 display 是 block，
+          // 只查这两样**完全看不出来**。
+          // （本段在模板字符串里，注释中不能用反引号。）
+          sectionH: Math.round(s.getBoundingClientRect().height),
+          toggleH: Math.round(toggle.getBoundingClientRect().height),
+          bodyH: Math.round(body.getBoundingClientRect().height),
+        };
+      });
     return { labels, collapsibles };
   })()`);
 
@@ -121,15 +136,22 @@ try {
     `可见字段=${JSON.stringify(tiers.labels)}`,
   );
   record(
+    '⑤ ★ 折叠块**真的渲染出来了**（标题行有高度、展开时内容有高度）',
+    tiers.collapsibles.length >= 2
+      && tiers.collapsibles.every((s) => s.toggleH >= 20 && s.sectionH >= s.toggleH)
+      && tiers.collapsibles.filter((s) => s.open).every((s) => s.bodyH > 40),
+    `可折叠区块=${JSON.stringify(tiers.collapsibles)}`
+    + '（判据：标题行 >= 20px；展开的那些内容 > 40px——'
+    + '只查 class/display 会漏掉「被 flex 压成 2px」这种）',
+  );
+  record(
     '⑤ ★ 进阶项**默认收起**（物理参数 / 锚点与单帧尺寸）',
     // ⚠️ 不能要求「**所有**可折叠区块都收起」：触发时间也是可折叠的，
     // 但它**默认展开**（那是用户最常回来调的一项，见 renderSchedule 的注释）。
     // 判据要针对**进阶**那两块，与这条断言的标题一致。
-    tiers.collapsibles.filter((s) => s.label.includes('进阶')
-      || s.label.includes('物理') || s.label.includes('锚点')).length >= 2
-      && tiers.collapsibles
-        .filter((s) => s.label.includes('物理') || s.label.includes('锚点'))
-        .every((s) => !s.open && s.bodyDisplay === 'none'),
+    tiers.collapsibles
+      .filter((s) => s.label.includes('物理') || s.label.includes('锚点'))
+      .every((s) => !s.open && s.bodyDisplay === 'none'),
     `可折叠区块=${JSON.stringify(tiers.collapsibles)}`,
   );
 
@@ -426,7 +448,13 @@ try {
       return {
         opened: true,
         labels: [...ed.querySelectorAll('.pet-field-label')].map((n) => n.textContent.trim()),
-        hint: (ed.querySelector('.pet-field-hint') || {}).textContent || '',
+        // 要**全部**提示拼起来看，不能只取第一条。
+        // 编辑区里提示不止一条（第一版取 .pet-field-hint 的第一条，
+        // 而后来在它前面插入了「这一套是什么样」与「加一套动画」的说明，
+        // 于是这条断言开始失败——但界面上的解释一直都在）。
+        // （本段在模板字符串里，注释中不能用反引号。）
+        hint: [...ed.querySelectorAll('.pet-field-hint')]
+          .map((n) => n.textContent).join(' | '),
       };
     })()`);
     record(

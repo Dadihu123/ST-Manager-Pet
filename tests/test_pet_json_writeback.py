@@ -445,3 +445,230 @@ def test_frame_pet_still_accepts_frame_fields(tmp_path):
     node = _manifest(store)['animations']['idle']
     assert node['fps'] == 3.0 and node['loop'] is False
     assert node['frameMs'] == [300.0, 300.0, 300.0, 600.0]
+
+
+# ==================================================== 多套动画的增删
+
+def _png(width, height, color=(200, 30, 30, 255)):
+    """造一张纯色 PNG（测试用，不依赖磁盘上的素材）。"""
+    import io as _io
+    from PIL import Image as _Image
+    buffer = _io.BytesIO()
+    _Image.new('RGBA', (width, height), color).save(buffer, format='PNG')
+    return buffer.getvalue()
+
+
+def test_add_variant_upgrades_a_single_variant_action(tmp_path):
+    """★ 用户要的入口：**给一个动作加一套动画**。
+
+    「每个动作我可以点击换图来进行动画帧图的更新，但是只能更新啊，
+    我如果像增加一套闲置动作，入口在哪里」。
+
+    单套写法（`{"sheet": ..., "frames": ...}`）必须**就地升级**成
+    `variants` 数组，而不是被覆盖掉——否则原来那一套就没了。
+    """
+    store = _store(tmp_path)
+    payload = store.add_action_variant('mine', 'idle', _png(192, 96), frames=2, weight=3)
+    assert payload['variant'] == 1
+
+    node = _manifest(store)['animations']['idle']
+    assert isinstance(node.get('variants'), list), '单套写法应当升级成 variants'
+    assert len(node['variants']) == 2
+    # 原来那一套还在
+    assert node['variants'][0]['sheet'] == 'idle.png'
+    assert node['variants'][0]['frames'] == 4
+    # 新那一套带上了权重
+    assert node['variants'][1]['weight'] == 3.0
+    # 新图落在形象目录里（不是 overrides/——那会与第一套打架）
+    new_sheet = node['variants'][1]['sheet']
+    assert not new_sheet.startswith('overrides/')
+    assert os.path.isfile(os.path.join(store.user_pet_dir('mine'), new_sheet))
+
+
+def test_added_variant_is_playable(tmp_path):
+    """加进去的那一套必须**真的能被解析出图**（否则只是写了个名字）。"""
+    store = _store(tmp_path)
+    store.add_action_variant('mine', 'idle', _png(192, 96), frames=2, weight=2)
+    resolved = store.load_pack('mine').resolve('idle')
+    assert len(resolved.variants) == 2
+    path, source = store.resolve_frame_path('mine', 'idle', variant=1)
+    assert path and os.path.isfile(path)
+    assert source in ('pack', 'builtin')
+
+
+def test_add_variant_rejects_animated_upload(tmp_path):
+    """帧序列动作不接受动图（两条路线互斥，静默压成一帧是最难查的）。"""
+    store = _store(tmp_path)
+    import io as _io
+    from PIL import Image as _Image
+    buffer = _io.BytesIO()
+    frames = [_Image.new('RGBA', (32, 32), (i * 60, 0, 0, 255)) for i in range(3)]
+    frames[0].save(buffer, format='GIF', save_all=True, append_images=frames[1:], duration=100)
+    with pytest.raises(PetError) as info:
+        store.add_action_variant('mine', 'idle', buffer.getvalue(), frames=3)
+    assert '动图' in str(info.value)
+
+
+def test_remove_variant_keeps_at_least_one(tmp_path):
+    """至少保留一套：全删掉这个动作就没有动画了。"""
+    store = _store(tmp_path)
+    store.add_action_variant('mine', 'idle', _png(192, 96), frames=2)
+    store.remove_action_variant('mine', 'idle', 1)
+    assert len(_manifest(store)['animations']['idle']['variants']) == 1
+    with pytest.raises(PetError) as info:
+        store.remove_action_variant('mine', 'idle', 0)
+    assert '只有一套' in str(info.value)
+
+
+def test_remove_variant_deletes_the_now_unused_image(tmp_path):
+    """删掉一套之后，那张不再被引用的图要一并删掉（否则留下孤儿文件）。"""
+    store = _store(tmp_path)
+    store.add_action_variant('mine', 'idle', _png(192, 96), frames=2)
+    node = _manifest(store)['animations']['idle']
+    orphan = node['variants'][1]['sheet']
+    store.remove_action_variant('mine', 'idle', 1)
+    assert not os.path.exists(os.path.join(store.user_pet_dir('mine'), orphan))
+
+
+# ==================================================== 多页（拆页 / 合并）
+
+def _vertical_store(tmp_path, frames=4):
+    """一个竖排 4 帧的形象，每帧一个颜色——用来验证帧序没被拆乱。"""
+    from PIL import Image as _Image
+    store = _store(
+        tmp_path,
+        animations={'idle': {
+            'sheet': 'idle.png', 'frames': frames, 'layout': 'vertical',
+        }},
+    )
+    colors = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255), (255, 255, 0, 255)]
+    image = _Image.new('RGBA', (96, 96 * frames))
+    for index in range(frames):
+        image.paste(_Image.new('RGBA', (96, 96), colors[index]), (0, index * 96))
+    image.save(os.path.join(store.user_pet_dir('mine'), 'idle.png'))
+    return store, colors
+
+
+def _frame_colors(store, pet_id='mine', action='idle', variant=0):
+    """按**播放顺序**把每一帧的中心像素取出来（真正验帧序）。"""
+    from PIL import Image as _Image
+    from backend.core.pack import frame_page
+    one = store.load_pack(pet_id).animations[action].variants[variant]
+    grid = (one.cols, one.rows)
+    out = []
+    for index in range(one.frames):
+        page, _local, col, row = frame_page(index, grid, one.frames)
+        path, _source = store.resolve_frame_path(pet_id, action, variant=variant, page=page)
+        assert path, f'第 {index} 帧没有图（拆页时丢帧了）'
+        image = _Image.open(path).convert('RGBA')
+        fw, fh = image.width // one.cols, image.height // one.rows
+        out.append(image.getpixel((col * fw + fw // 2, row * fh + fh // 2)))
+    return out
+
+
+def test_split_pages_preserves_frame_order(tmp_path):
+    """★ 用户问「多页的入口在哪里」——这是拆页的核心保证：**帧序不变**。
+
+    拆页唯一的用途是降低解码峰值显存，观感必须完全一样。
+    判据不看「页数对不对」，而是**按播放顺序逐帧取像素**——页数对了但
+    帧序错乱是最坏的结果（动画会跳着播）。
+    """
+    store, colors = _vertical_store(tmp_path)
+    assert _frame_colors(store) == colors
+
+    result = store.split_action_variant_pages('mine', 'idle', 2)
+    assert result['pages'] == 2 and result['perPage'] == 2
+    one = store.load_pack('mine').animations['idle'].variants[0]
+    assert len(one.sheets) == 2
+    assert one.frames == 4, '总帧数不该变'
+    assert _frame_colors(store) == colors, '拆页后帧序必须一模一样'
+
+
+def test_split_pages_refuses_when_already_split(tmp_path):
+    """★ 已经拆过页的套**不能**再拆（会丢帧）。
+
+    踩过的坑：不做这层判断时，`resolve_frame_path` 只给出第 0 页那张图，
+    于是拆出来的是「第 0 页的一半」，而 `sheets` 被替换成那两张——
+    **其余几页的帧静默消失**，`frames` 却还写着总数。
+    """
+    store, _colors = _vertical_store(tmp_path)
+    store.split_action_variant_pages('mine', 'idle', 2)
+    with pytest.raises(PetError) as info:
+        store.split_action_variant_pages('mine', 'idle', 4)
+    assert '已经是 2 页' in str(info.value)
+    # 而且确实没有把帧弄丢
+    assert _frame_colors(store) == [(255, 0, 0, 255), (0, 255, 0, 255),
+                                    (0, 0, 255, 255), (255, 255, 0, 255)]
+
+
+def test_merge_pages_back_to_one(tmp_path):
+    """合并回一页：帧序不变，且旧的页文件被清掉（不留孤儿）。"""
+    store, colors = _vertical_store(tmp_path)
+    store.split_action_variant_pages('mine', 'idle', 2)
+    store.split_action_variant_pages('mine', 'idle', 1)
+
+    one = store.load_pack('mine').animations['idle'].variants[0]
+    assert len(one.sheets) == 1
+    assert _frame_colors(store) == colors
+    left = sorted(
+        name for name in os.listdir(store.user_pet_dir('mine')) if name.endswith('.png')
+    )
+    assert left == ['idle.png'], f'页文件该被清掉，实际剩下 {left}'
+
+
+def test_split_pages_rejects_impossible_counts(tmp_path):
+    """页数超过帧数 / 帧数除不尽时明确拒绝，而不是产出一个坏包。"""
+    store, _colors = _vertical_store(tmp_path)
+    with pytest.raises(PetError) as info:
+        store.split_action_variant_pages('mine', 'idle', 8)
+    assert '拆不成' in str(info.value)
+
+
+def test_split_pages_rejects_an_override_image(tmp_path):
+    """「换图」上传的覆盖只作用于第一套第 0 页，拆页会与它打架 → 明确拒绝。"""
+    store, _colors = _vertical_store(tmp_path)
+    store.save_action_image('mine', 'idle', _png(96, 384))
+    with pytest.raises(PetError) as info:
+        store.split_action_variant_pages('mine', 'idle', 2)
+    assert '覆盖' in str(info.value)
+
+
+def test_merge_pages_keeps_images_shared_with_other_actions(tmp_path):
+    """★ 合并页时**不能**删掉别的动作还在用的图。
+
+    踩过的坑：内置形象的 12 个动作**共用同一对页文件**（`idle-0.png` /
+    `idle-1.png`）。第一版合并 idle 时无条件删掉「不再被这一套引用」的旧页，
+    于是 walk-left / fall 等动作还在用的 `idle-1.png` 被一起删了——
+    包立刻变成坏的（`pet.json` 里还写着它，磁盘上却没有），
+    而那些动作在播放时会取到空图。
+    """
+    store, _colors = _vertical_store(tmp_path)
+    # 再造一个动作，与 idle **共用**同一张图
+    store.update_action_animation('mine', 'idle', {})  # 确保 idle 已归一化
+    manifest_path = os.path.join(store.user_pet_dir('mine'), 'pet.json')
+    with open(manifest_path, encoding='utf-8') as handle:
+        manifest = json.load(handle)
+    manifest['animations']['fall'] = {
+        'sheet': 'idle.png', 'frames': 4, 'layout': 'vertical',
+    }
+    with open(manifest_path, 'w', encoding='utf-8') as handle:
+        json.dump(manifest, handle, ensure_ascii=False)
+
+    store.split_action_variant_pages('mine', 'idle', 2)
+    # 现在 idle 用 idle-p0/p1，而 fall 仍引用 idle.png —— 它必须还在
+    assert os.path.isfile(os.path.join(store.user_pet_dir('mine'), 'idle.png')), \
+        'fall 还在引用 idle.png，不该被删'
+    # fall 仍然解析得出图
+    path, _source = store.resolve_frame_path('mine', 'fall')
+    assert path and os.path.isfile(path)
+
+    # 合并回一页时同理：idle-p0/p1 若还被别的动作引用就不能删
+    manifest['animations']['fall'] = {
+        'sheets': ['idle-p0.png', 'idle-p1.png'], 'frames': 4, 'layout': 'vertical',
+    }
+    with open(manifest_path, 'w', encoding='utf-8') as handle:
+        json.dump(manifest, handle, ensure_ascii=False)
+    store.split_action_variant_pages('mine', 'idle', 1)
+    for page in ('idle-p0.png', 'idle-p1.png'):
+        assert os.path.isfile(os.path.join(store.user_pet_dir('mine'), page)), \
+            f'fall 还在引用 {page}，不该被删'

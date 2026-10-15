@@ -62,8 +62,8 @@ function runSuite(name) {
 const ALL = [
   'anim', 'still', 'preview-fix', 'grid', 'pages', 'animated', 'motion',
   'builtin-motion', 'copy-pet', 'roam', 'roam-direction', 'sleep-setting',
-  'perpet-settings', 'pet-editor', 'panel-ux2', 'upload', 'panel', 'pet',
-  'visibility', 'icon', 'dock', 'toast-icon',
+  'perpet-settings', 'pet-editor', 'panel-ux2', 'panel-ux3', 'upload', 'panel',
+  'pet', 'visibility', 'icon', 'dock', 'toast-icon',
 ];
 
 const only = (process.env.PET_ONLY || '').split(',').map((s) => s.trim()).filter(Boolean);
