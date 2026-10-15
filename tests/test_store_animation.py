@@ -82,7 +82,7 @@ def test_runtime_action_exposes_all_variants_with_weights(store):
 
 
 def test_runtime_primary_fields_match_first_variant(store):
-    """主变体透传字段必须与 `variants[0]` 一致（老前端只读这些）。"""
+    """主变体透传字段必须与 `variants[0]` 一致（缩略图/小图读这些）。"""
     entry = store.runtime_pack('anim-pet')['actions']['idle']
     primary = entry['variants'][0]
     assert entry['url'] == primary['url']
@@ -171,7 +171,7 @@ def test_fallback_action_inherits_all_variants(store):
     entry = store.runtime_pack('anim-pet')['actions']['fall']
     assert entry['source'] == 'idle'
     assert len(entry['variants']) == 2
-    # 主变体透传字段仍然与第一套一致（老前端只读它们）
+    # 主变体透传字段仍然与第一套一致（缩略图/小图读它们）
     assert entry['frames'] == entry['variants'][0]['frames']
     # 但**触发配置**不跟着来：它不是「随机待机」，而是「下落」
     assert 'idleTrigger' not in entry

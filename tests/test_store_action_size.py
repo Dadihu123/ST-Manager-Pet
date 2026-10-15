@@ -73,7 +73,7 @@ def test_action_without_size_omits_the_field(store):
 
 
 def test_pack_level_size_still_present(store):
-    """包级 `size` 仍是默认值，照旧下发（老前端只读它）。"""
+    """包级 `size` 仍是默认值，照旧下发（缩略图与动作小图读它）。"""
     payload = store.runtime_pack('mixed-shape')
     assert payload['size'] == STANDING
 

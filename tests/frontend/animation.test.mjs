@@ -216,31 +216,39 @@ test('权重：非法值被规范化成默认权重', () => {
   assert.equal(normalizeWeight(2.5), 2.5);
 });
 
-test('可播变体：优先读 variants，缺失时回退到条目自身字段', () => {
-  // 前后端可能版本错配（宿主缓存 / 用户手动换插件目录），因此必须有回退
-  const withVariants = playableVariants({
-    url: '/main',
-    frames: 4,
+test('可播变体：只读 variants（后端总是下发它，包括单套动作）', () => {
+  // 后端把单套动作也包成长度为 1 的数组（见 store._action_entry），
+  // 因此前端只有这一条路——不需要为「没有 variants」准备回退分支。
+  const two = playableVariants({
     variants: [
       { url: '/a', frames: 4, fps: 6, weight: 5 },
       { url: '/b', frames: 2, fps: 8, weight: 3 },
     ],
   });
-  assert.equal(withVariants.length, 2);
-  assert.equal(withVariants[0].url, '/a');
-  assert.equal(withVariants[1].frames, 2);
+  assert.equal(two.length, 2);
+  assert.equal(two[0].url, '/a');
+  assert.equal(two[1].frames, 2);
 
-  // 老后端：只有主变体字段
-  const legacy = playableVariants({ url: '/main', frames: 3, fps: 12, loop: false });
-  assert.equal(legacy.length, 1);
-  assert.equal(legacy[0].url, '/main');
-  assert.equal(legacy[0].frames, 3);
-  assert.equal(legacy[0].loop, false);
+  // 单套动作：后端包成一项
+  const single = playableVariants({
+    variants: [{ url: '/main', frames: 3, fps: 12, loop: false }],
+  });
+  assert.equal(single.length, 1);
+  assert.equal(single[0].url, '/main');
+  assert.equal(single[0].frames, 3);
+  assert.equal(single[0].loop, false);
+
+  // 顶层的 url / frames 是**主变体透传**（缩略图等在用），
+  // 但它**不是**播放入口：没有 variants 就播不了，不能悄悄播主变体。
+  assert.deepEqual(
+    playableVariants({ url: '/main', frames: 3, fps: 12, loop: false }),
+    [],
+    '没有 variants 时不该回退去播顶层字段',
+  );
 });
 
 test('可播变体：跳过没有 URL 的变体（声明了图但文件缺失）', () => {
   const list = playableVariants({
-    url: '/main',
     variants: [
       { url: '', frames: 4, weight: 5 },
       { url: '/b', frames: 2, weight: 3 },
@@ -251,9 +259,9 @@ test('可播变体：跳过没有 URL 的变体（声明了图但文件缺失）
 });
 
 test('可播变体：完全没有图时返回空数组', () => {
-  assert.deepEqual(playableVariants({ url: '', frames: 1 }), []);
-  assert.deepEqual(playableVariants(null), []);
   assert.deepEqual(playableVariants({ variants: [{ url: '' }] }), []);
+  assert.deepEqual(playableVariants(null), []);
+  assert.deepEqual(playableVariants({}), []);
 });
 
 // ============================================ 每动作单帧尺寸（横 / 竖构图共存）
@@ -310,7 +318,6 @@ test('单帧尺寸：非法层会继续往下找，而不是直接放弃', () =>
 
 test('可播变体：尺寸随帧参数一起流出（否则换动作会「帧换了、尺寸没换」）', () => {
   const list = playableVariants({
-    url: '/main',
     variants: [
       { url: '/a', frames: 4, size: { w: 627, h: 353 } },
       { url: '/b', frames: 2 },
@@ -318,14 +325,9 @@ test('可播变体：尺寸随帧参数一起流出（否则换动作会「帧�
   });
   assert.deepEqual(list[0].size, { w: 627, h: 353 });
   assert.equal(list[1].size, undefined, '没声明的不该被补成默认值');
-});
-
-test('可播变体：老后端只给主变体字段时，尺寸也能透出', () => {
-  const legacy = playableVariants({ url: '/main', frames: 3, size: { w: 627, h: 353 } });
-  assert.deepEqual(legacy[0].size, { w: 627, h: 353 });
   // 完全没给尺寸 → undefined，由 frameSizeOf 回落到包级
-  const older = playableVariants({ url: '/main', frames: 3 });
-  assert.equal(older[0].size, undefined);
+  const noSize = playableVariants({ variants: [{ url: '/main', frames: 3 }] });
+  assert.equal(noSize[0].size, undefined);
 });
 
 test('动作时长：非均匀时长下逐帧求和', () => {

@@ -170,21 +170,32 @@ def test_auto_roam_is_per_pet(tmp_path):
 
 # ==================================================== 倍率不再有全局兜底
 
-def test_scale_ignores_host_default(tmp_path):
-    """★ 倍率不再有「宿主全局兜底」那一层。
+def test_scale_has_no_host_default_layer(tmp_path):
+    """★ 倍率的兜底只有「包内声明 → 默认值」，**没有**「宿主全局」这一层。
 
-    `host_default` 参数只为兼容旧调用方保留，传了也**不生效**——
-    否则「同一项设置两个入口」的问题会从后门回来。
+    用户要求「不要搞全局的，在同一个地方调整的数值却分成全局和形象绑定
+    两种情况，用户可能会困惑」，因此 `scale` 已从 `config_schema` 移出。
+
+    这条断言验的是**接口本身没有那个入口**：`effective_scale` 不接受任何
+    「宿主默认值」参数。留着那个参数（哪怕不生效）等于给「同一项设置两个
+    入口」留一条后门——插件尚未发布，没有旧调用方需要照顾。
     """
+    import inspect
+
     store = _store(tmp_path)
     _pack(store, 'mine')
     assert store.effective_scale('mine') == 1.0
-    assert store.effective_scale('mine', host_default=3.0) == 1.0, (
-        'host_default 已废弃，不该再影响结果'
-    )
     # 包内声明仍然生效（那是「作者建议」，不是「全局」）
     _pack(store, 'other', scale=0.5)
     assert store.effective_scale('other') == 0.5
+
+    signature = inspect.signature(store.effective_scale)
+    assert list(signature.parameters) == ['pet_id'], (
+        f'effective_scale 只该接受 pet_id，实际 {list(signature.parameters)}'
+    )
+    assert 'host_default' not in inspect.signature(store.runtime_pack).parameters, (
+        'runtime_pack 不该再接受宿主默认倍率'
+    )
 
 
 # ==================================================== 运行期下发

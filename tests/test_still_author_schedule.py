@@ -236,7 +236,7 @@ def test_still_without_any_size_stays_absent(env):
     """完全没有尺寸信息时**不写** `size` 字段（前端回落到包级）。
 
     凭空补一个包级尺寸进 payload 会让「作者到底声明了没有」变得不可知，
-    也会让老前端的输出对比测试全部失效。
+    也会让「输出对比」类测试全部失效。
     """
     _app, store, _client, _api = env
     write_pack(store.user_pets_dir(), 'plain', payload={

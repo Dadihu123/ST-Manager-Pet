@@ -145,7 +145,7 @@ export const DEFAULT_FRAME_SIZE = { w: 64, h: 64 };
  * 与后端 `pack.frame_grid` 是同一套规则的两份实现，**必须保持一致**。
  * 之所以两边各写一份而不是让前端只读后端算好的值：运行期定义里已经有
  * `cols` / `rows`（后端算好的），但前端还有几条**自己造** spec 的路径
- * （老后端不下发网格、单帧兜底、测试夹具），那些地方没有后端结论可用。
+ * （编辑区草稿、预览覆盖、单帧兜底、测试夹具），那些地方没有后端结论可用。
  *
  * 归一化的价值在于「只有一个几何模型」：`horizontal` 与 `vertical` 不是
  * 另外两套算法，而是 `cols=N, rows=1` 与 `cols=1, rows=N` 两个特例。
@@ -188,7 +188,7 @@ export function frameGrid(source) {
  * 一套动画有几页（至少 1）。
  *
  * 页数的**权威来源是后端下发的 `pages` 数组长度**——「磁盘上有几张图」
- * 是客观事实。这里只在后端没给 `pages` 时退回 1（老后端 / 单页包）。
+ * 是客观事实。这里只在后端没给 `pages` 时退回 1（单页包）。
  *
  * @param {object} source 形如 `{pages: [url, ...]}`
  * @returns {number} >= 1 的整数
@@ -208,7 +208,7 @@ export function framePageCount(source) {
  *
  * 与后端 `pack.frame_page` 是同一套规则的两份实现，**必须保持一致**。
  * 之所以两边各写一份：运行期定义里已经有算好的 `cols` / `rows`，
- * 但前端还有几条**自己造** spec 的路径（老后端不下发网格、单帧兜底、
+ * 但前端还有几条**自己造** spec 的路径（编辑区草稿、单帧兜底、
  * 测试夹具），那些地方没有后端结论可用。
  *
  * @param {number} index 全局帧号（会被夹到 `[0, frames-1]`）
@@ -237,8 +237,9 @@ export function framePage(index, grid, frames) {
  * 而站立动作是 2:3 竖构图（1024×1536）。若所有动作共用包级 `size`，
  * 前端会按 `size` 去拉伸贴图，躺姿会被压扁变形。
  *
- * 逐级回落而不是只看变体，是为了**版本错配**也能跑：老后端不下发 `size`，
- * 新前端就自然用包级的值，行为与从前完全一致。
+ * 逐级回落而不是只看变体，是因为**编辑区草稿**这类前端自造的 spec
+ * 只带节奏与几何、不带图，变体级那一层可能是空的；回落到动作条目、
+ * 再回落到包级，就能保证「任何一条路径都能算出一个尺寸」。
  *
  * @param {object} variant 一套动画（可含 `size`）
  * @param {object} [spec] 动作条目（可含 `size`）
@@ -335,9 +336,9 @@ export function pickBlinkDelay(motion, random = Math.random) {
 /**
  * 把「运行期动作条目」规范化成一组可播的变体。
  *
- * 优先读 `variants`（后端多套动画的输出），缺失时回退到条目本身的
- * `url` / `frames` / `fps` —— 老版本后端只给这些字段，而前后端是**可以
- * 各自升级**的（宿主缓存、用户手动替换插件目录都会造成版本错配）。
+ * 只读 `variants` —— 后端**总是**下发它（见 `store._action_entry`：
+ * 单套动作也会包成长度为 1 的数组），因此前端不需要为「没有 variants」
+ * 准备第二条路。
  *
  * `size` 一并带上（可能为 `undefined`，表示沿用包级）：几何必须和帧参数
  * 一起流到播放处，否则换动作时会出现「帧参数换了、尺寸没换」的错位。
@@ -348,12 +349,9 @@ export function pickBlinkDelay(motion, random = Math.random) {
 export function playableVariants(entry) {
   const source = entry || {};
   const list = Array.isArray(source.variants) ? source.variants : [];
-  const playable = list.filter((item) => item && item.url);
-  if (playable.length) {
-    return playable.map((item) => normalizeVariant(item));
-  }
-  if (!source.url) return [];
-  return [normalizeVariant(Object.assign({ weight: DEFAULT_WEIGHT }, source))];
+  return list
+    .filter((item) => item && item.url)
+    .map((item) => normalizeVariant(item));
 }
 
 /**
@@ -369,7 +367,7 @@ export function playableVariants(entry) {
 function normalizeVariant(item) {
   const source = item || {};
   const url = String(source.url || '');
-  // `pages` 优先；缺失时用单个 `url` 兜底（单页包 / 老后端）。
+  // `pages` 是后端下发的每一页 URL 数组（单页时长度为 1）。
   // 过滤掉空 URL：某一页的图缺失时后端会给空串，留着它会让
   // 「第 3 页丢了」表现为「切到第 3 页时画面变空白」——不如在这里就丢掉，
   // 让 `pageCount` 反映真实可播的页数。
@@ -560,9 +558,9 @@ export function createBehaviorScheduler(options = {}) {
 }
 
 /**
- * 兼容别名：旧代码按 `createIdleScheduler` 找它。
+ * 别名：`createIdleScheduler` 是它更早的名字。
  *
- * 保留一个别名而不是让所有调用点改名的理由：这个名字出现在测试与验收脚本里，
+ * 保留一个别名而不是让所有调用点改名：这个名字出现在测试与验收脚本里，
  * 而它现在管的不止 idle（还有 roam）。新代码请用 `createBehaviorScheduler`。
  */
 export const createIdleScheduler = createBehaviorScheduler;

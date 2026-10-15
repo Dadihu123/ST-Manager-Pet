@@ -90,9 +90,6 @@ def test_fallback_table_matches_contract():
     # 算出来——没有任何路径能进入 `look`。而「张望」这个画面本身是
     # `idle` 的第二套，因此删掉这个声明、把图按 idle 第二套留下。
     assert 'look' not in ACTION_FALLBACKS, 'look 已删除，不该再出现在词表里'
-    # 但**未知动作名仍然不报错**（向前兼容）：老包里写着 look 时，
-    # 回退链要照旧落到 idle，而不是抛异常。
-    assert ACTION_FALLBACKS.get('look', ('idle',)) == ('idle',)
     # 唯一硬必要动作
     assert REQUIRED_ACTIONS[0] == 'idle'
     # 行走**只有方向化动作**：两侧都没有就退到 idle（不是正面 walk）
@@ -251,10 +248,6 @@ def test_missing_optional_action_uses_idle_not_error():
         'idle': {'sheet': 'idle.png', 'frames': 2, 'fps': 6},
     }))
     for action in ('happy', 'sad', 'angry', 'sleep', 'click', 'land'):
-        assert parsed.resolve(action).kind == KIND_ANIMATED
-    # **未知**动作名也照样回退（向前兼容）：老包或新包写了词表以外的名字时
-    # 不该报错，而是落到 idle。`look` 现在是这一类（它已从词表删除）。
-    for action in ('look', 'some-future-action'):
         assert parsed.resolve(action).kind == KIND_ANIMATED
 
 

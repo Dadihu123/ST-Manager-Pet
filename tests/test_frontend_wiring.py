@@ -992,9 +992,13 @@ def test_panel_resolves_preview_frame_size_with_the_shared_priority(panel):
     assert 'frameGrid' in names, '必须从 animation.js 导入 frameGrid'
     body = panel[panel.index('function previewSpec()'):]
     body = body[:body.index('\n  /**')]
-    assert 'frameSizeOf(base, entry, detail && detail.size)' in body, (
+    # 优先级必须是 变体 > 动作条目 > 包级：`frameSizeOf` 的三个参数就是
+    # 那三层。第一层从 `variants` 里取（后端总是下发它），
+    # 因此这里查的是「把选中的那一套当变体层传进去」。
+    assert 'frameSizeOf(pick, entry, detail && detail.size)' in body, (
         '优先级必须是 变体 > 动作条目 > 包级'
     )
+    assert 'variants[' in body, '变体层要从 variants 里取（后端总是下发它）'
     assert 'size:' in body, '解析出来的尺寸要挂进预览 spec'
 
 
@@ -1404,3 +1408,44 @@ def test_css_defines_the_preview_frame_layer(css):
     body = body[:body.index('}')]
     assert 'position: absolute' in body, '内层靠绝对定位摆在框内'
     assert 'background-repeat: no-repeat' in body, '不能平铺（否则邻帧会重复出现）'
+
+
+def test_no_compat_shims_for_unreleased_versions():
+    """★ 插件**尚未发布**，因此不该有任何「兼容旧版本」的分支。
+
+    用户指出：「说了不要考虑兼容怎么又搞了兼容，没发布就不要去兼容，
+    这样纯给后面留坑」。
+
+    这条批评是对的：任何「兼容旧调用方 / 旧后端 / 老包」的代码都在为一个
+    **不存在的场景**服务——它平时不会被执行，因此不会被测到、也不会被维护，
+    等真需要改这块时它就是第一个绊脚石。
+
+    这条断言盯的是**措辞与形状**，而不是行为：出现了这类词就说明有人又在
+    为一个假想的旧版本写代码了，应当先问「那个旧版本存在吗」。
+    """
+    sources = {}
+    for name in ('animation.js', 'panel.js', 'petview.js', 'plugin.js',
+                 'preview.js', 'statemachine.js'):
+        path = os.path.join(REPO_ROOT, 'frontend', name)
+        with open(path, encoding='utf-8') as handle:
+            sources[name] = handle.read()
+    sources['store.py'] = open(
+        os.path.join(REPO_ROOT, 'backend', 'core', 'store.py'), encoding='utf-8',
+    ).read()
+    sources['pack.py'] = open(
+        os.path.join(REPO_ROOT, 'backend', 'core', 'pack.py'), encoding='utf-8',
+    ).read()
+
+    # 「老后端 / 旧前端 / 兼容旧调用方 / 版本错配」这些说法都不该出现。
+    banned = ('老后端', '旧后端', '老前端', '旧前端', '兼容旧调用方',
+              '版本错配', '只为兼容')
+    offenders = []
+    for name, body in sources.items():
+        for line_number, line in enumerate(body.splitlines(), 1):
+            for phrase in banned:
+                if phrase in line:
+                    offenders.append(f'{name}:{line_number} 出现「{phrase}」')
+    assert not offenders, (
+        '插件未发布，不该为不存在的旧版本写兼容分支：\n  '
+        + '\n  '.join(offenders)
+    )

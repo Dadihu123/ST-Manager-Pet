@@ -38,7 +38,6 @@ const ACTION_LABELS = {
   // 但运行期没有任何路径能进入它（`REACT_ACTIONS` 只有
   // happy/sad/angry/click，其余动作名由状态机按状态算出）。
   // 那张图现在按 `idle` 的**第二套**留着（`idle-v2.png`），语义一致、素材不浪费。
-  // 老包里若还写着 `look`，它照旧回退到 `idle`（未知动作名不报错）。
   // `walk` **不是动作**，而是「行走」这条必要项的**代号**：
   // 行走只有方向化动作（`walk-left` / `walk-right`），提供任一侧即算满足。
   // 这里留着它只是为了把后端的 `missingRequired: ['walk']` 翻译成人话。
@@ -1096,46 +1095,30 @@ export function createSettingsPanel({
   function previewSpec() {
     const entry = previewEntry();
     if (!entry) return null;
+    // 后端**总是**下发 `variants`（单套动作也包成长度为 1 的数组），
+    // 因此这里只从它里面取；取不到就是「这个动作没有图」。
     const variants = entry.variants || [];
-    let pick = variants.length
-      ? variants[Math.min(Math.max(0, previewVariant), variants.length - 1)]
-      : null;
+    if (!variants.length) return null;
+    const base = variants[Math.min(Math.max(0, previewVariant), variants.length - 1)];
+    if (!base) return null;
+    let pick = base;
     if (previewOverride && previewOverride.action === previewAction
       && previewOverride.variant === previewVariant) {
       // 草稿只顶替**节奏与几何**字段，图 URL 仍用真实的那一份
       // （草稿不产生新图，它只改怎么播）。
-      pick = Object.assign({}, pick, previewOverride.entry);
+      pick = Object.assign({}, base, previewOverride.entry);
     }
-    if (!pick && !entry.url) return null;
-    // 老版本后端只给主变体字段，这里兜底构一个
-    const base = pick || {
-      url: entry.url,
-      pages: entry.pages,
-      frames: entry.frames,
-      fps: entry.fps,
-      loop: entry.loop,
-      layout: entry.layout,
-      cols: entry.cols,
-      rows: entry.rows,
-      frameMs: entry.frameMs || [],
-      // 程序化运动也要兜底带上：漏了的表现是「桌面在呼吸、面板里不动」
-      // ——而面板正是用户判断效果的地方。
-      motion: entry.motion,
-      motionOrigin: entry.motionOrigin,
-    };
-    return Object.assign({}, base, {
-      size: frameSizeOf(base, entry, detail && detail.size),
+    return Object.assign({}, pick, {
+      size: frameSizeOf(pick, entry, detail && detail.size),
       // 网格几何一并带上（`preview.js` 的播放器只认 `cols` / `rows`）。
-      // 缺失时由 `frameGrid` 按 `layout` + 帧数推——那条路径服务的是
-      // 「老后端不下发网格」，此时行为与从前完全一致。
-      cols: frameGrid(base).cols,
-      rows: frameGrid(base).rows,
-      // 多页：`pages` 是每一页的图 URL。单页时后端只给 `url`，
-      // 这里补成长度 1 的数组——播放器因此只有一种形状要处理
+      cols: frameGrid(pick).cols,
+      rows: frameGrid(pick).rows,
+      // 多页：`pages` 是每一页的图 URL（后端只在多页时才写它），
+      // 这里统一成长度至少 1 的数组——播放器因此只有一种形状要处理
       // （「有时是数组、有时是字符串」是最容易漏判的那种差异）。
-      pages: (Array.isArray(base.pages) && base.pages.length
-        ? base.pages
-        : [base.url]).filter(Boolean),
+      pages: (Array.isArray(pick.pages) && pick.pages.length
+        ? pick.pages
+        : [pick.url]).filter(Boolean),
     });
   }
 

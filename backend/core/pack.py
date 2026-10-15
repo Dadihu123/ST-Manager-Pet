@@ -75,9 +75,6 @@ WALK_DIRECTION_ACTIONS = {
 #: 而「张望」这个画面其实一直在用——它是 `idle` 的**第二套**（权重 2）。
 #: 因此删掉 `look` 这个够不着的声明、把那张图按 idle 第二套的命名留下
 #: （`idle-v2.png`），语义就一致了，素材也没浪费。
-#:
-#: 未知动作名仍然**不报错**（见下面 `_fallback_chain` 的注释，向前兼容），
-#: 因此老包里若还写着 `look`，它照旧回退到 `idle`。
 ACTION_FALLBACKS = {
     'idle': (),
     'walk-left': ('idle',),

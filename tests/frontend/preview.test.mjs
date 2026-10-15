@@ -525,7 +525,7 @@ test('★ 预览几何：网格排布的整数设备像素对齐（每个方向�
 test('frameGrid：horizontal / vertical 是网格的特例', () => {
   assert.deepEqual(frameGrid({ frames: 4, layout: 'horizontal' }), { cols: 4, rows: 1 });
   assert.deepEqual(frameGrid({ frames: 4, layout: 'vertical' }), { cols: 1, rows: 4 });
-  // 缺省（老后端不下发 layout）等价于 horizontal
+  // 缺省 layout 等价于 horizontal（前端自造 spec 时常常不写它）
   assert.deepEqual(frameGrid({ frames: 3 }), { cols: 3, rows: 1 });
   assert.deepEqual(frameGrid(null), { cols: 1, rows: 1 });
 });
@@ -623,14 +623,16 @@ test('★ pickBlinkDelay：只抽数、不管计时', () => {
 
 test('★ playableVariants 带上 motion 与 motionOrigin', () => {
   const [v] = playableVariants({
-    url: '/f', frames: 4, fps: 6,
-    motion: { breathe: { amplitude: 0.02, periodMs: 3200 } },
-    motionOrigin: '50% 88%',
+    variants: [{
+      url: '/f', frames: 4, fps: 6,
+      motion: { breathe: { amplitude: 0.02, periodMs: 3200 } },
+      motionOrigin: '50% 88%',
+    }],
   });
   assert.equal(v.motion.amplitude, 0.02);
   assert.equal(v.motionOrigin, '50% 88%');
   // 没声明时是 null / ''（前端据此完全不动样式）
-  const [plain] = playableVariants({ url: '/f', frames: 4 });
+  const [plain] = playableVariants({ variants: [{ url: '/f', frames: 4 }] });
   assert.equal(plain.motion, null);
   assert.equal(plain.motionOrigin, '');
 });
@@ -934,7 +936,7 @@ test('预览几何：帧号越界被夹到合法范围', () => {
   assert.ok(Number.isFinite(over.frame.w));
 });
 
-test('预览几何：尺寸未知时退回按框铺满（老后端不下发尺寸）', () => {
+test('预览几何：尺寸未知时退回按框铺满（标准图像这类没有单帧尺寸）', () => {
   // 兼容性：不知道单帧比例时宁可铺满，也不能把图缩成一个点或算出 NaN。
   const { frame, layer } = geom(168, 1, 'horizontal', 0, null);
   assert.ok(Number.isFinite(frame.w) && Number.isFinite(frame.h));

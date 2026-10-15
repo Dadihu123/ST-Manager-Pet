@@ -158,7 +158,7 @@ DEFAULT_SETTINGS = {
     #: 为什么不能只靠 manifest 里的全局 `scale`：用户明确要求「二次元形象和真人
     #: 形象所需的大小不同」——一个全局倍率意味着换形象就得重调。宿主表单表达不了
     #: 「每个形象一个值」（`config_schema` 只支持标量），所以落在这里。
-    #: 优先级见 `effective_scale()`：用户设置 > 包内声明 > 宿主表单默认值。
+    #: 优先级见 `effective_scale()`：用户设置 > 包内声明 > 默认值。
     'petScales': {},
     #: 逐形象的**像素风渲染**覆盖：`{pet_id: bool}`。
     #:
@@ -641,7 +641,7 @@ class PetStore:
 
     # ------------------------------------------------------------ 倍率
 
-    def effective_scale(self, pet_id: str, *, host_default: float = None) -> float:
+    def effective_scale(self, pet_id: str) -> float:
         """算出某形象**实际生效**的大小倍率。
 
         优先级（用户明确要求「不同形象需要的大小不同」）：
@@ -651,12 +651,11 @@ class PetStore:
 
         ⚠️ 第 3 条过去是「宿主表单的全局 `scale`」。用户要求
         「不要搞全局的，在同一个地方调整的数值却分成全局和形象绑定两种情况，
-        用户可能会困惑」，因此 `scale` 已从 `config_schema` 移出，
-        这个 `host_default` 参数只为兼容旧调用方保留（传了也**不生效**）。
+        用户可能会困惑」，因此 `scale` 已从 `config_schema` 移出——
+        这里**不再接受**任何「宿主默认值」参数。
 
         Args:
             pet_id: 形象 id。
-            host_default: **已废弃**，忽略。
 
         Returns:
             float: 夹在 `SCALE_RANGE` 内的倍率。
@@ -1455,7 +1454,7 @@ class PetStore:
                 return real, source
         return '', 'none'
 
-    def runtime_pack(self, pet_id: str = '', *, host_default_scale: float = None) -> dict:
+    def runtime_pack(self, pet_id: str = '') -> dict:
         """给前端的**运行期形象**：已解析好的 URL + 回退结论。
 
         前端不做回退决策——回退链是后端领域模型（§3.3 是契约），
@@ -1463,9 +1462,6 @@ class PetStore:
 
         Args:
             pet_id: 形象 id；空串表示用当前形象。
-            host_default_scale: 宿主 `config_schema` 里 `scale` 的值，作为
-                倍率的全局兜底。标量配置的唯一来源是宿主，store 不自己读，
-                因此由路由层传进来。
         """
         pet_id = sanitize_pet_id(pet_id) if pet_id else self.active_pet_id()
         if not pet_id:
@@ -1538,7 +1534,7 @@ class PetStore:
             'physics': dict(pack.physics),
             # 生效值（已按「用户设置 > 包内声明 > 默认」算好）——前端直接用，
             # 不再自己判断优先级，避免两边规则不一致。
-            'scale': self.effective_scale(pet_id, host_default=host_default_scale),
+            'scale': self.effective_scale(pet_id),
             'pixelated': self.effective_pixelated(pet_id),
             # 动画速度与自动漫游同样**按形象**（用户要求不要搞全局的）。
             # 前端直接用这里的生效值，不再去读宿主的 config——
@@ -1703,14 +1699,20 @@ class PetStore:
               "action": "click", "source": "click", "kind": "animated",
               "frames": 4, "fps": 6, "loop": false, "layout": "horizontal",
               "frameMs": [], "mirror": false, "chain": [...], "note": "",
-              "url": "...",                    # 主变体的图（兼容旧前端）
+              "url": "...",                    # 主变体的图（缩略图/动作小图在用）
               "frameSource": "builtin",
               "variants": [ {...}, {...} ],    # 每套动画各自的图与帧参数
             }
 
-        `url` / `frames` / `fps` 这一组是**主变体**的透传：老前端只认它们，
-        新前端优先读 `variants`。两套并存是有意的——运行期定义是前后端之间的
-        契约，加字段安全、改字段危险。
+        `url` / `frames` / `fps` 这一组是**主变体**的透传。它不是播放入口
+        （播放只读 `variants`），而是给那些「只需要一个代表」的地方用的：
+        缩略图、动作网格里的小图、编辑区字段的初值。这些地方要的是
+        「这个动作长什么样」，而不是「每一套分别什么样」。
+
+        ⚠️ 这不是「多余的第二份」：插件的前后端是一起发布的
+        （`manifest.json` 的 `frontend.entry` 指向同一个插件目录），
+        两边永远是同一份代码——它存在的理由就是上面那条（有一批地方
+        只需要一个代表），与版本无关。
 
         注意这里**没有** `idleTrigger`：时间驱动的节奏上移到形象级的
         `schedule` 块了（`roam` 不是动作，挂不到动作下面）。
@@ -1816,7 +1818,8 @@ class PetStore:
             # 真正决定铺哪张图的是 `pages`。
             entry['url'] = primary.get('url') or (primary.get('pages') or [''])[0]
             entry['frameSource'] = primary['frameSource']
-            # 主变体透传：老前端只读这些字段，因此它们必须与 `variants[0]` 一致。
+            # 主变体透传：缩略图、动作小图、编辑区初值读的是这些字段，
+            # 因此它们必须与 `variants[0]` 一致。
             #
             # ⚠️ 一律用 `.get` 并给**语义正确的默认值**：动图容器的变体里
             # 根本没有 `frames` / `fps` / `loop` / `frameMs` / `cols` / `rows`
