@@ -63,7 +63,7 @@
           }
         },
         {
-          "sheet": "look.png",
+          "sheet": "idle-v2.png",
           "frames": 4,
           "fps": 2.22,
           "loop": true,
@@ -195,18 +195,6 @@
         200,
         260,
         200
-      ]
-    },
-    "look": {
-      "sheet": "look.png",
-      "frames": 4,
-      "fps": 2.22,
-      "loop": true,
-      "frameMs": [
-        500,
-        400,
-        400,
-        500
       ]
     }
   }

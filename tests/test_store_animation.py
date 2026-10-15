@@ -258,10 +258,10 @@ def test_thumbnail_uses_declared_still(tmp_path):
         'animations': {
             'idle': {'variants': [
                 {'sheet': 'idle.png', 'frames': 4, 'weight': 5},
-                {'sheet': 'look.png', 'frames': 4, 'weight': 2},
+                {'sheet': 'idle-v2.png', 'frames': 4, 'weight': 2},
             ]},
         },
-    }, sheets={'idle.png': 4, 'look.png': 4, 'calm.png': 2})
+    }, sheets={'idle.png': 4, 'idle-v2.png': 4, 'calm.png': 2})
 
     store = PetStore(str(user), str(builtin))
     item = next(i for i in store.list_pets() if i['id'] == 'posed')

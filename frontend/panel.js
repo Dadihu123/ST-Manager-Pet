@@ -34,7 +34,11 @@ const ACTION_LABELS = {
   happy: '开心',
   sad: '难过',
   angry: '生气',
-  look: '张望',
+  // `look`（张望）**已删除**（2026-10）：它在包里声明过、这里也有中文名，
+  // 但运行期没有任何路径能进入它（`REACT_ACTIONS` 只有
+  // happy/sad/angry/click，其余动作名由状态机按状态算出）。
+  // 那张图现在按 `idle` 的**第二套**留着（`idle-v2.png`），语义一致、素材不浪费。
+  // 老包里若还写着 `look`，它照旧回退到 `idle`（未知动作名不报错）。
   // `walk` **不是动作**，而是「行走」这条必要项的**代号**：
   // 行走只有方向化动作（`walk-left` / `walk-right`），提供任一侧即算满足。
   // 这里留着它只是为了把后端的 `missingRequired: ['walk']` 翻译成人话。
@@ -113,7 +117,6 @@ const CREATABLE_ACTIONS = [
   { action: 'happy', required: false },
   { action: 'sad', required: false },
   { action: 'angry', required: false },
-  { action: 'look', required: false },
 ];
 
 /** 大小倍率的区间（与 `backend/core/pack.py:SCALE_RANGE` 必须一致）。 */

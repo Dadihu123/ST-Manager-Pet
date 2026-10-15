@@ -25,6 +25,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 from backend.core.pack import (  # noqa: E402
+    ACTION_FALLBACKS,
     BEHAVIOR_FIELDS,
     DEFAULT_SCHEDULE_MS,
     SCHEDULE_BEHAVIORS,
@@ -57,11 +58,12 @@ def env(tmp_path):
         'animations': {
             'idle': {'variants': [
                 {'sheet': 'idle.png', 'frames': 4, 'weight': 5},
-                # 「张望」：首帧是个抬头姿势，绝不该当静止画面
-                {'sheet': 'look.png', 'frames': 4, 'weight': 2},
+                # 第二套：首帧是个抬头姿势（原来是内置形象的「张望」），
+                # 绝不该被当成静止画面。文件名按多套命名规范写。
+                {'sheet': 'idle-v2.png', 'frames': 4, 'weight': 2},
             ]},
         },
-    }, sheets={'idle.png': 4, 'look.png': 4})
+    }, sheets={'idle.png': 4, 'idle-v2.png': 4})
 
     store = PetStore(str(data), str(builtin))
     api = FakeApi(data_dir=str(data))
@@ -86,12 +88,12 @@ def test_still_is_not_the_last_played_variant(env):
     assert len(idle_variants) == 2, '这个形象必须有两套 idle 动画才算覆盖到场景'
 
     # URL 是**不透明**的（`/frame/<pet>/<action>?vi=n`），因此要验的是它
-    # 背后解析到的文件，而不是 URL 文本里有没有「look」。
-    look_path, _source = store.resolve_frame_path('posed', 'idle', variant=1)
+    # 背后解析到的文件，而不是 URL 文本里有没有文件名。
+    second_path, _source = store.resolve_frame_path('posed', 'idle', variant=1)
     still_path, _source = store.resolve_frame_path('posed', STILL_ACTION)
-    assert look_path.endswith('look.png'), '第二套确实是「张望」'
+    assert second_path.endswith('idle-v2.png'), '第二套确实是那套抬头动画'
     assert still_path.endswith('idle.png'), (
-        '标准图像绝不能是「张望」那套——那正是卡在抬头帧的成因'
+        '标准图像绝不能是第二套那套——那正是卡在抬头帧的成因'
     )
     assert still['declared'] is True
     assert still['source'] == STILL_ACTION
@@ -323,14 +325,21 @@ def test_builtin_still_geometry_is_pixel_exact():
             return sheet.crop((at * single, 0, (at + 1) * single, sheet.height))
 
         shown = crop(frame)
-        # 与「张望」首帧对比：**必须不同**，否则就白修了
-        look_path = os.path.join(pet_dir, 'look.png')
-        assert os.path.isfile(look_path), f'{pet_id} 缺少 look.png'
-        look = Image.open(look_path).convert('RGBA')
-        look_single = look.width // frames
-        look_first = look.crop((0, 0, look_single, look.height))
-        assert shown.tobytes() != look_first.tobytes(), (
-            f'{pet_id} 的标准图像与「张望」首帧相同——正是要避免的抬头姿势'
+        # 与 **idle 第二套**（原「张望」）的首帧对比：**必须不同**，否则就白修了。
+        #
+        # ⚠️ 这里原来读的是 `look.png`。`look` 动作已于 2026-10 删除——
+        # 那个动作够不着（没有任何路径能进入它），而那张图一直是以
+        # `idle` 第二套的身份在用的。现在文件叫 `idle-v2.png`，
+        # 因此这条断言要跟着改（语义没变：仍然是「标准图像不能是抬头那一下」）。
+        second = manifest['animations']['idle']['variants'][1]['sheet']
+        other_path = os.path.join(pet_dir, second)
+        assert os.path.isfile(other_path), f'{pet_id} 缺少 {second}'
+        other = Image.open(other_path).convert('RGBA')
+        other_single = other.width // frames
+        other_first = other.crop((0, 0, other_single, other.height))
+        assert shown.tobytes() != other_first.tobytes(), (
+            f'{pet_id} 的标准图像与 idle 第二套（张望）首帧相同'
+            '——正是要避免的抬头姿势'
         )
         # 声明的就是 idle 第 0 帧：应当逐像素相同
         assert frame == 0
@@ -1298,3 +1307,64 @@ def test_pets_list_advertises_schedule_limits(env):
     assert limits['scheduleMinMs'] == MIN_SCHEDULE_MS
     assert limits['scheduleMaxMs'] == MAX_SCHEDULE_MS
     assert limits['scheduleBehaviors'] == list(SCHEDULE_BEHAVIORS)
+
+
+# ============================================================ 内置形象的动作表
+
+def test_builtin_pets_do_not_declare_unreachable_actions():
+    """★ 内置形象里**不该有够不着的动作声明**。
+
+    用户要求：「直接去掉 look 这个动作，把 look 改成 idle 的第二套动作，
+    两个都统一一下，这样语义也不会有问题，图也没有白费，也不会有歧义了」。
+
+    背景：`look`（张望）曾经在包里声明了、面板里有中文名、README 里还写着
+    「指针靠近」触发 —— 但**运行期没有任何路径能进入它**：播报类动作由
+    `REACT_ACTIONS` 白名单把关（只有 happy/sad/angry/click），其余动作名都由
+    状态机按状态算出来。实测 `view.react('look')` 之后动作仍然是 idle。
+
+    这条断言把「内置形象的动作必须都在词表里」钉住：以后谁再往包里塞一个
+    没有触发路径的动作，这里就会失败。
+    """
+    builtin = os.path.join(REPO_ROOT, 'resources', 'pets')
+    for pet_id in ('xiaoman', 'xiaoka'):
+        with open(os.path.join(builtin, pet_id, 'pet.json'), encoding='utf-8') as handle:
+            manifest = json.load(handle)
+        declared = set(manifest['animations'])
+        unknown = declared - set(ACTION_FALLBACKS)
+        assert not unknown, (
+            f'{pet_id} 声明了词表以外的动作 {sorted(unknown)}——'
+            '它们没有触发路径（状态机不会进入，播报白名单也拒绝）'
+        )
+        assert 'look' not in declared, f'{pet_id} 不该再有 look 动作'
+
+
+def test_builtin_pets_keep_the_second_idle_variant():
+    """★ 去掉 `look` 动作之后，那张图要**以 idle 第二套的身份留着**。
+
+    这是用户要求的重点：「图也没有白费」。因此不能只删动作——
+    必须确认 idle 仍有两套、第二套指向那张图、权重也还在。
+    """
+    builtin = os.path.join(REPO_ROOT, 'resources', 'pets')
+    for pet_id in ('xiaoman', 'xiaoka'):
+        pet_dir = os.path.join(builtin, pet_id)
+        with open(os.path.join(pet_dir, 'pet.json'), encoding='utf-8') as handle:
+            manifest = json.load(handle)
+        variants = manifest['animations']['idle']['variants']
+        assert len(variants) == 2, f'{pet_id} 的 idle 应当有 2 套'
+        # 第一套是主图，第二套是原来的「张望」
+        assert variants[0]['sheet'] == 'idle.png'
+        assert variants[1]['sheet'] == 'idle-v2.png', (
+            f'{pet_id} 的第二套该按多套命名规范叫 idle-v2.png，'
+            f'实际 {variants[1]["sheet"]}'
+        )
+        # 权重保持原样（5 : 2，即约 71% / 29%）
+        assert variants[0]['weight'] == 5
+        assert variants[1]['weight'] == 2
+        # 两张图都在磁盘上（改名之后不能漏掉文件）
+        for variant in variants:
+            path = os.path.join(pet_dir, variant['sheet'])
+            assert os.path.isfile(path), f'{pet_id} 缺少 {variant["sheet"]}'
+        # 旧文件名不该还在（否则就是「改了一半」）
+        assert not os.path.isfile(os.path.join(pet_dir, 'look.png')), (
+            f'{pet_id} 还留着 look.png——改名应当是一次性的'
+        )

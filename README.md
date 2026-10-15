@@ -90,7 +90,7 @@ ST-Manager 官方插件：一只常驻在界面上的桌面宠物。它会随宿
       "variants": [
         { "sheet": "idle.png", "frames": 4, "fps": 2.5,
           "frameMs": [400, 300, 300, 600], "weight": 5 },
-        { "sheet": "look.png", "frames": 4, "fps": 2.2, "weight": 2 }
+        { "sheet": "idle-v2.png", "frames": 4, "fps": 2.2, "weight": 2 }
       ]
     },
     "walk-left": { "sheet": "walk-left.png", "frames": 4, "fps": 4,
@@ -320,10 +320,23 @@ ST-Manager 官方插件：一只常驻在界面上的桌面宠物。它会随宿
 | `sleep` | 可选 | 长时间无操作 | → `idle`（降频） |
 | `click` | 可选 | 被单击 | → `idle` |
 | `happy` / `sad` / `angry` | 可选 | 事件播报时 | → `idle` |
-| `look` | 可选 | 指针靠近 | → `idle` + 容器翻转（`scaleX(-1)`） |
 
 **「必要动作」的含义不是「不给就报错」，而是「不给就退化为静态位移」。**
 没有行走图时，宠物照常走动，只是不播帧。
+
+> **`look`（张望）已在 2026-10 删除。** 它曾经在这张表里、写着「指针靠近」触发，
+> 但**那个触发从来没实现过**——`REACT_ACTIONS` 白名单只有
+> `happy` / `sad` / `angry` / `click`，而其余动作名都由状态机按状态算出来
+> （`idle` / `walk-left` / `walk-right` / `drag` / `fall` / `land` / `sleep`）。
+> 也就是说这个动作**够不着**：包里声明了、面板里有中文名、预览里能点播，
+> 但桌面上的宠物永远不会播它。
+>
+> 「张望」这个画面本身一直在用——它是 `idle` 的**第二套**（权重 2）。
+> 因此现在把它统一成 `idle` 的第二套（文件名为 `idle-v2.png`），
+> 语义一致、素材不浪费、也没有歧义。
+>
+> 未知动作名**不报错**（向前兼容，见 §3.3），因此老包里若还写着 `look`，
+> 它照旧回退到 `idle`。
 
 **行走只认方向化贴图。** 正面 `walk` 已从词表里删除（2026-10）：
 
@@ -411,13 +424,24 @@ ST-Manager 官方插件：一只常驻在界面上的桌面宠物。它会随宿
 {
   "click": {
     "variants": [
-      { "sheet": "click-a.png", "frames": 3, "frameMs": [90, 110, 260], "weight": 5 },
-      { "sheet": "click-b.png", "frames": 4, "weight": 3 },
-      { "sheet": "click-c.png", "frames": 2, "weight": 2 }
+      { "sheet": "click.png",   "frames": 3, "frameMs": [90, 110, 260], "weight": 5 },
+      { "sheet": "click-v2.png", "frames": 4, "weight": 3 },
+      { "sheet": "click-v3.png", "frames": 2, "weight": 2 }
     ]
   }
 }
 ```
+
+**文件命名规范：`<动作名>-v<第几套>.<扩展名>`**（第 1 套不加后缀，就是
+`<动作名>.<扩展名>`）。上例里第 1/2/3 套分别是 `click.png`、`click-v2.png`、
+`click-v3.png`。
+
+这不是硬性要求（`sheet` 是任意相对路径，叫什么都行），而是**面板里
+「加一套动画」实际写出的名字**——约定成同一个样子，用户加完一套之后
+在文件列表里一眼就能看出哪个是第几套。
+
+> 为什么不用 `-a` / `-b` 这种字母后缀：字母不表达顺序，而 `-v2` 与面板上的
+> 「第 2 套」直接对得上。内置形象也照这个来（`idle.png` + `idle-v2.png`）。
 
 **`weight` 是相对比例，不是百分比。** 上例的触发概率分别是
 `5/10`、`3/10`、`2/10`。这样设计的理由是：

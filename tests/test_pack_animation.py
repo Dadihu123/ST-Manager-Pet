@@ -483,14 +483,14 @@ def test_still_declared_wins_over_idle():
         'animations': {
             'idle': {'variants': [
                 {'sheet': 'idle.png', 'frames': 4, 'weight': 5},
-                {'sheet': 'look.png', 'frames': 4, 'weight': 2},
+                {'sheet': 'idle-v2.png', 'frames': 4, 'weight': 2},
             ]},
         },
     })
     still = parsed.resolve_still()
     assert still.declared is True
     assert still.source == STILL_ACTION
-    assert still.sheet == 'idle.png', '必须是作者指定的那张，而不是「张望」'
+    assert still.sheet == 'idle.png', '必须是作者指定的那张，而不是第二套那套'
 
 
 def test_still_can_point_at_a_specific_frame():

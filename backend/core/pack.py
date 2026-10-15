@@ -64,6 +64,20 @@ WALK_DIRECTION_ACTIONS = {
 #:
 #: **没有正面 `walk`**：行走只认 `walk-left` / `walk-right`，两侧都没有就退到 `idle`
 #: （只位移容器、不播帧），而不是播一张「原地踏步」的正面图。
+#:
+#: **没有 `look`**（2026-10 删除）：它曾经在词表里、面板里有中文名（张望）、
+#: README 里还写着「指针靠近」触发——但**运行期没有任何路径能进入它**。
+#: 播报类动作由 `statemachine.REACT_ACTIONS` 白名单把关（只有
+#: happy / sad / angry / click），其余动作名都由状态机按状态算出来
+#: （idle / walk-left / walk-right / drag / fall / land / sleep）。
+#: 实测 `view.react('look')` 之后动作仍然是 idle。
+#:
+#: 而「张望」这个画面其实一直在用——它是 `idle` 的**第二套**（权重 2）。
+#: 因此删掉 `look` 这个够不着的声明、把那张图按 idle 第二套的命名留下
+#: （`idle-v2.png`），语义就一致了，素材也没浪费。
+#:
+#: 未知动作名仍然**不报错**（见下面 `_fallback_chain` 的注释，向前兼容），
+#: 因此老包里若还写着 `look`，它照旧回退到 `idle`。
 ACTION_FALLBACKS = {
     'idle': (),
     'walk-left': ('idle',),
@@ -76,7 +90,6 @@ ACTION_FALLBACKS = {
     'happy': ('idle',),
     'sad': ('idle',),
     'angry': ('idle',),
-    'look': ('idle',),
 }
 
 #: 「必要动作」：缺失时**不报错**，而是退化为静态位移（见模块 docstring）。

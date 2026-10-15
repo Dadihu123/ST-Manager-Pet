@@ -88,17 +88,25 @@ def test_list_pets_marks_degraded_pack(env):
 
 
 def test_runtime_endpoint_returns_resolved_fallback(env):
-    """★ 只有单帧 idle 的包：所有动作都要有结论，且都回退到 idle。"""
+    """★ 只有单帧 idle 的包：所有动作都要有结论，且都回退到 idle。
+
+    ⚠️ 这里列的是**词表里的**动作。`look` 已于 2026-10 从词表删除
+    （它够不着，见 `test_pack.test_fallback_table_matches_contract`），
+    因此不再出现在这个名单里——它现在属于「未知动作名」那一类。
+    """
     _app, _store, client, _api = env
     payload = json_of(client.get('/api/plugins/stm-pet/pets/solo/runtime'))
     assert payload['success'] is True
     actions = payload['pet']['actions']
-    for action in ('walk-left', 'walk-right', 'drag', 'fall', 'land', 'happy', 'sleep', 'click', 'look'):
+    for action in ('walk-left', 'walk-right', 'drag', 'fall', 'land',
+                   'happy', 'sad', 'angry', 'sleep', 'click'):
         entry = actions[action]
         assert entry['source'] == 'idle', f'{action} 未回退到 idle'
         assert entry['url'], f'{action} 缺少可用图'
         assert entry['kind'] == 'animated'
         assert entry['note'], f'{action} 应说明发生了回退'
+    # 删掉的动作不该再出现在运行期定义里
+    assert 'look' not in actions, 'look 已删除，不该还在动作表里'
 
 
 def test_active_runtime_endpoint(env):
