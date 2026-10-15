@@ -580,7 +580,31 @@ async function main() {
       `标记在 ${selection.currentMeta}，activeId=${selection.activeId}`,
     );
 
-    // ================================================== ⑧ 滑块可直接输入数字
+    /**
+   * 等面板**重渲染落定**。
+   *
+   * 为什么需要：数字框的 `change` 会提交后端并 `render()` 整片面板，
+   * 而那是异步的。若紧接着就往下写下一个值，那次写会落在**即将被替换掉的**
+   * 旧节点上，于是读回来的是上一段的值——看起来像「夹取失效」，
+   * 实际是两段操作撞在了一次重渲染上（实测 9999 读回来是上一段的 2.5）。
+   *
+   * 判据：连续两次采样拿到同一个值（说明这一轮 DOM 已经稳定）。
+   */
+  async function settlePanel(page) {
+    let previous = null;
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      await sleep(150);
+      const current = await page.evaluate(`(() => {
+        const box = document.querySelector('.plugin-stm-pet .pet-slider-number');
+        return box ? box.value : '';
+      })()`);
+      if (previous !== null && current === previous) return current;
+      previous = current;
+    }
+    return previous;
+  }
+
+  // ================================================== ⑧ 滑块可直接输入数字
     //
     // 用户报障：「通过拖拽有时难以精确调整，请同步支持直接选择数字部分
     // 进行输入修改，只要限制好输入数据的范围即可」。
@@ -594,8 +618,16 @@ async function main() {
       box.value = '2.5';
       box.dispatchEvent(new Event('input', { bubbles: true }));
       box.dispatchEvent(new Event('change', { bubbles: true }));
-      await new Promise((r) => setTimeout(r, 900));
-      const after = document.querySelector('.plugin-stm-pet .pet-slider-number');
+      // 提交是**异步**的：change 会保存后端并重渲染整片面板，而重渲染会
+      // 把数字框换成新节点。死等一个固定时长在机器忙时会读到**旧节点**
+      // （实测：写 2.5 读回 1，而那 1 是上一轮的残留）——看起来像
+      // 「输入没生效」，实际是读早了。因此轮询到期望值出现为止。
+      let after = box;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise((r) => setTimeout(r, 150));
+        after = document.querySelector('.plugin-stm-pet .pet-slider-number');
+        if (after.value === '2.5') break;
+      }
       const sliderAfter = after.closest('.pet-slider-row')?.querySelector('.pet-slider');
       return {
         before, sliderBefore,
@@ -622,6 +654,9 @@ async function main() {
       `--pet-slider-progress=${numberInput.progress}`,
     );
 
+    // 等上一步的保存 + 重渲染落定，再验夹取（否则两段会撞在一起）
+    await settlePanel(page);
+
     // 超范围输入要被夹住（用户要求「只要限制好输入数据的范围即可」）
     const clampCheck = await page.evaluate(`(async () => {
       const box = document.querySelector('.plugin-stm-pet .pet-slider-number');
@@ -629,8 +664,13 @@ async function main() {
       const max = Number(box.max);
       box.value = '9999';
       box.dispatchEvent(new Event('change', { bubbles: true }));
-      await new Promise((r) => setTimeout(r, 900));
-      const after = document.querySelector('.plugin-stm-pet .pet-slider-number');
+      // 同上：轮询到夹取结果落定（期望正好是上限）
+      let after = box;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise((r) => setTimeout(r, 150));
+        after = document.querySelector('.plugin-stm-pet .pet-slider-number');
+        if (after.value === String(max)) break;
+      }
       const slider = after.closest('.pet-slider-row')?.querySelector('.pet-slider');
       return { max, shown: after.value, sliderValue: slider ? slider.value : '' };
     })()`);
@@ -663,6 +703,8 @@ async function main() {
       scheduleNumbers.map((i) => `${i.behavior}.${i.bound}=${i.numberValue}`).join(' '),
     );
 
+    await settlePanel(page);
+
     // 数字框的验证会**真的改掉**倍率（那是要提交后端的），
     // 因此收尾时必须还原——验收脚本不该留下副作用。
     const restored = await page.evaluate(`(async () => {
@@ -670,8 +712,12 @@ async function main() {
       if (!box) return { error: '没有数字输入框' };
       box.value = '1';
       box.dispatchEvent(new Event('change', { bubbles: true }));
-      await new Promise((r) => setTimeout(r, 900));
-      const after = document.querySelector('.plugin-stm-pet .pet-slider-number');
+      let after = box;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise((r) => setTimeout(r, 150));
+        after = document.querySelector('.plugin-stm-pet .pet-slider-number');
+        if (after.value === '1') break;
+      }
       return { value: after.value };
     })()`);
     record(

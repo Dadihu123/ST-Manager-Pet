@@ -1915,6 +1915,17 @@ export function createSettingsPanel({
     ));
     header.appendChild(title);
 
+    // ★ **固定预览**的开关放在最上面（标题行下面）。
+    //
+    // 用户报障：「你前面说的固定预览实现了吗，我更新了一下好像没有看到变化？」
+    // —— 功能是在的，但它的入口原来跟着预览区一起排在**第 4 个区块**，
+    // 实测距详情栏顶部 **1229px**，而详情栏只有 500px 高：要找到这个开关
+    // 得先滚过整个外观与触发时间。那恰好是它想解决的问题
+    // （「为了不滚动，先滚动过去把它打开」），所以它实际上等于不存在。
+    //
+    // 现在放在最上面：一进详情就能看见，不用滚。
+    header.appendChild(renderFloatToggle());
+
     // ---- 作者署名
     //
     // 用户要求「自定义宠物应该支持设置作者名，方便其他人制作宠物发布」。
@@ -2844,6 +2855,39 @@ export function createSettingsPanel({
    * 播放规则与桌面上的宠物**完全一致**（帧数 / 帧率 / 非均匀帧时长 /
    * 排布都按后端的运行期定义走），因此「预览里看到的」就是「桌面上会看到的」。
    */
+  /**
+   * **固定预览**的开关（详情页顶部与预览区各放一个，共用这一段）。
+   *
+   * 它的作用：把预览框挪到面板右侧的第三列，于是改参数时预览一直看得见
+   * ——用户要的就是「不必来回滚动」。
+   *
+   * ⚠️ 顶部那个不是装饰：第一版只把开关放在预览区里（第 4 个区块），
+   * 实测距详情栏顶部 **1229px** 而详情栏只有 500px 高——要找到它得先滚过
+   * 整个外观与触发时间，恰好是它想解决的问题。用户因此报
+   * 「你前面说的固定预览实现了吗，我更新了一下好像没有看到变化？」。
+   */
+  function renderFloatToggle() {
+    const row = el('div', 'pet-preview-float-toggle');
+    const toggle = button(
+      previewFloating ? '取消固定预览' : '固定预览到右侧',
+      'is-icon',
+      () => {
+        previewFloating = !previewFloating;
+        render();
+      },
+    );
+    toggle.dataset.previewFloat = 'true';
+    row.appendChild(toggle);
+    row.appendChild(el(
+      'span',
+      'pet-card-meta',
+      previewFloating
+        ? '预览已固定——滚动设置时它不会跟着走，可以边调边看'
+        : '固定之后预览会浮在面板右侧，改参数时不必来回滚动',
+    ));
+    return row;
+  }
+
   function renderPreview() {
     const section = el('div', 'pet-section');
     const title = el('div', 'pet-section-title');
@@ -2878,25 +2922,6 @@ export function createSettingsPanel({
     // 做法：预览框**本身不搬家**（它是 `player` 的容器，搬走会重建播放器、
     // 丢掉当前帧），而是给它加一个 `is-floating` 类，用 `position: fixed`
     // 把它固定在面板右侧。滚动容器里的位置由占位块撑着，因此布局不跳。
-    const floatToggle = el('div', 'pet-preview-float-toggle');
-    const floatBtn = button(
-      previewFloating ? '取消固定' : '固定预览到右侧',
-      'is-icon',
-      () => {
-        previewFloating = !previewFloating;
-        render();
-      },
-    );
-    floatBtn.dataset.previewFloat = 'true';
-    floatToggle.appendChild(floatBtn);
-    floatToggle.appendChild(el(
-      'span',
-      'pet-card-meta',
-      previewFloating
-        ? '预览已固定——滚动设置时它不会跟着走，可以边调边看'
-        : '固定之后预览会浮在右侧，改参数时不必来回滚动',
-    ));
-    if (previewFloating) stage.classList.add('is-floating');
 
     const side = el('div', 'pet-preview-side');
     side.appendChild(el('div', 'pet-preview-name', ACTION_LABELS[previewAction] || previewAction));
@@ -3097,7 +3122,11 @@ export function createSettingsPanel({
     side.appendChild(readout);
 
     stage.appendChild(side);
-    section.appendChild(floatToggle);
+    // 固定状态：预览框整体带上这个类，CSS 把它从这一列「抽走」
+    // （实际搬运由 `movePreviewIntoFloat()` 在挂载后做，见那里的说明）。
+    if (previewFloating) stage.classList.add('is-floating');
+    // 预览区里也留一个开关：用户滚到这里时能就地关掉，不必再滚回顶部。
+    section.appendChild(renderFloatToggle());
     section.appendChild(stage);
 
     // ---- 动作选择：点一下就能播

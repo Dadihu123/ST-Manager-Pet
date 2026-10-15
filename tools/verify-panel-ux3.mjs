@@ -422,6 +422,38 @@ try {
     JSON.stringify(floatBefore),
   );
 
+  // ★ 开关必须**不用滚动就能看见**。
+  //
+  // 用户报障：「你前面说的固定预览实现了吗，我更新了一下好像没有看到变化？」
+  // —— 功能是在的，但第一版只把开关放在预览区里（第 4 个区块），
+  // 实测距详情栏顶部 **1229px** 而详情栏只有 500px 高：要找到它得先滚过
+  // 整个外观与触发时间。那恰好是它想解决的问题
+  // （「为了不滚动，先滚动过去把它打开」），所以它实际上等于不存在。
+  //
+  // 因此判据不是「按钮存在」，而是**它在首屏里**。
+  const aboveFold = await page.evaluate(`(() => {
+    const detail = document.querySelector('.plugin-stm-pet .pet-panel-detail');
+    if (!detail) return { found: false };
+    const detailTop = detail.getBoundingClientRect().top;
+    const buttons = [...document.querySelectorAll('.plugin-stm-pet [data-preview-float]')];
+    return {
+      found: buttons.length > 0,
+      count: buttons.length,
+      // 详情栏没滚动时，第一个开关距顶部的距离
+      距顶部: buttons.length
+        ? Math.round(buttons[0].getBoundingClientRect().top - detailTop) : null,
+      可视高: detail.clientHeight,
+      滚动位置: detail.scrollTop,
+    };
+  })()`);
+  record(
+    '④ ★ 固定预览的开关**不用滚动就能看到**（用户报「没看到变化」的根因）',
+    aboveFold.found && aboveFold.滚动位置 === 0
+      && aboveFold.距顶部 !== null && aboveFold.距顶部 < aboveFold.可视高 / 2,
+    `开关距详情栏顶部 ${aboveFold.距顶部}px，详情栏可视高 ${aboveFold.可视高}px`
+    + `（共 ${aboveFold.count} 个开关）`,
+  );
+
   await page.evaluate(`(() => {
     const button = document.querySelector('.plugin-stm-pet [data-preview-float]');
     if (button) button.click();
