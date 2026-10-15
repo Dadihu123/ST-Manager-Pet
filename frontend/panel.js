@@ -1802,6 +1802,23 @@ export function createSettingsPanel({
       grid.appendChild(renderActionTile(entry));
     }
     section.appendChild(grid);
+
+    // ★ 动画参数编辑区**放在网格外面**（而不是卡片里面）。
+    //
+    // 网格的列宽只有 96px，编辑区塞进去会被挤成一条缝（实测截图里
+    // 「帧率」输入框只剩十几个像素宽，标签被截成「长（排布与节奏）」）。
+    // 它是**整块表单**，需要整行宽度，因此挂在网格之后、占满整行。
+    const editing = (detail.actions || []).find((entry) => entry.action === editingAction);
+    if (editing && actionDraft) {
+      const panel = el('div', 'pet-action-editor-wrap');
+      panel.appendChild(el(
+        'div',
+        'pet-section-title',
+        `「${ACTION_LABELS[editing.action] || editing.action}」的动画参数`,
+      ));
+      panel.appendChild(renderActionEditor(editing));
+      section.appendChild(panel);
+    }
     wrap.appendChild(section);
 
     return wrap;
@@ -3001,11 +3018,6 @@ export function createSettingsPanel({
       row.appendChild(el('span', 'pet-card-meta', '只读'));
     }
     tile.appendChild(row);
-
-    // 就地展开的动画参数编辑区
-    if (editingAction === entry.action && actionDraft) {
-      tile.appendChild(renderActionEditor(entry));
-    }
     return tile;
   }
 
