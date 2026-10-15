@@ -168,7 +168,15 @@ async function main() {
     //
     // 触发间隔最小 6 秒，因此连续采样 3 秒应当看不到帧位变化。
     //
-    // ⚠️ 必须先等 ④ 触发的那一轮播完：idle 小动作一轮约 1.6 秒，
+    // ⚠️ 先把**自动漫游**推到很远：漫游每 3~9 秒就发生一次，撞上时
+    // 帧位当然在变（在走路）、而且 ⑤ 读到的背景图会是 `walk-*` 而不是
+    // `still`/`idle` —— 两条断言都会随机失败。那是**测试没隔离**，
+    // 不是「静止」坏了（实测单独跑 4/4 通过，22 个套件连跑时偶发）。
+    await page.evaluate(`(() => {
+      window.__petView.setSchedule({ roam: { minIntervalMs: 600000, maxIntervalMs: 600000 } });
+      return true;
+    })()`);
+    // ⚠️ 还必须先等 ④ 触发的那一轮播完：idle 小动作一轮约 1.6 秒，
     // 而 ④ 的采样只有约 1 秒，直接接着采样会拍到还在播的那一轮（假失败）。
     await page.evaluate(`(async () => {
       const view = window.__petView;
@@ -200,6 +208,8 @@ async function main() {
     // 不再是 `idle` 的首帧——因为 idle 可以挂两套动画（「张望」），
     // 沿用「上一次抽到的那一套」会卡在一个抬头姿势上（用户报的怪现象）。
     // 因此这里接受 `still` 或 `idle`（没有标准图像的老包会回落到 idle）。
+    //
+    // 漫游已在 ④b 之前推远，因此这里读到的不该是 `walk-*`。
     const bg = await page.evaluate('window.__pet.bgImage()');
     record(
       '⑤ 用 spritesheet + background-position（不是换 <img src>）',
@@ -340,8 +350,29 @@ async function main() {
     );
 
     // ------------------------------------------------ ⑪ 松手后下坠
+    //
+    // ★ 记录器必须在**松手之前**挂上，且 ⑪ 与 ⑪b 共用这一份记录。
+    //
+    // 为什么：下落只持续 ~600ms（实测 y 从 302 到 545）。而 ⑪ 自己要先
+    // sleep(120) 再 sleep(600) 才轮到 ⑪b —— 那时宠物**早就落地了**，
+    // 于是 ⑪b 永远采不到 fall（实测 4 次里 3 次报「出现的动作: land,idle」）。
+    // 那是**采样窗口**的错，不是动画串了。
     const releaseX = startX + 240;
     const releaseY = startY - 108;
+    await page.evaluate(`(() => {
+      window.__airLog = [];
+      window.__airStop = false;
+      const tick = () => {
+        if (window.__airStop) return;
+        window.__airLog.push({
+          a: window.__pet.root().dataset.petAction,
+          y: Math.round(window.__pet.pos().y),
+        });
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+      return true;
+    })()`);
     await page.send('Input.dispatchMouseEvent', {
       type: 'mouseReleased', x: releaseX, y: releaseY, button: 'left', buttons: 0, clickCount: 1,
     });
@@ -361,22 +392,42 @@ async function main() {
     // 用户报障：「拖拽和坠落动画有时会被其他动画打断，然后在空中播放其他动画，
     // 例如左右移动，例如闲置，甚至还出现了在空中多个动画交替出现的情况」。
     //
-    // 这里在下落途中**高频采样**动作名：只要出现过任何非 fall 的动作，
-    // 就说明空中被别的动画抢走了。采样要够密——串动作往往只持续一两帧。
-    const airSamples = await page.evaluate(`(async () => {
-      const seen = [];
-      const start = performance.now();
-      while (performance.now() - start < 900) {
-        seen.push(window.__pet.root().dataset.petAction);
-        await new Promise((r) => requestAnimationFrame(r));
+    // 判据：**还在空中**的每一帧都必须是 fall。落地之后再出现 land / idle
+    // 是正常的，因此这里用**物理量**界定空中区间：y 还没到最终落点的那些帧。
+    //
+    // ⚠️ 不能用「y 还在增长的最后一段」来界定——落地时物理会弹一下
+    // （`bounce`），y 会再小幅度增长，于是窗口被拉长到包含 `land` 帧，
+    // 断言随机失败（实测连跑 22 个套件时偶发）。按「离最终落点还有距离」
+    // 判定不受弹跳影响。
+    await sleep(900);
+    const airSamples = await page.evaluate(`(() => {
+      window.__airStop = true;
+      const log = window.__airLog || [];
+      const firstFall = log.findIndex((e) => e.a === 'fall');
+      if (firstFall < 0) {
+        return { total: log.length, sawFall: false, airborneCount: 0,
+                 airborneActions: [], allActions: [...new Set(log.map((e) => e.a))] };
       }
-      return { seen: [...new Set(seen)], count: seen.length };
+      const restY = Math.max(...log.map((e) => e.y));
+      // 空中 = 离最终落点还有 1px 以上的帧（且在第一帧 fall 之后）
+      const airborne = log.slice(firstFall).filter((e) => e.y < restY - 1);
+      return {
+        total: log.length,
+        sawFall: true,
+        restY,
+        airborneCount: airborne.length,
+        airborneActions: [...new Set(airborne.map((e) => e.a))],
+        allActions: [...new Set(log.map((e) => e.a))],
+      };
     })()`);
-    const airClean = airSamples.seen.every((name) => name === 'fall' || name === 'land' || name === 'idle');
+    const stray = airSamples.airborneActions.filter((name) => name !== 'fall');
     record(
       '⑪b 下坠途中不串其他动画（只有 fall，落地后才是 land / idle）',
-      airClean && airSamples.seen.includes('fall'),
-      `采样 ${airSamples.count} 次，出现的动作: ${airSamples.seen.join(',')}`,
+      airSamples.sawFall && airSamples.airborneCount > 0 && stray.length === 0,
+      `共采样 ${airSamples.total} 次；空中区间 ${airSamples.airborneCount} 帧`
+      + `（落点 y=${airSamples.restY}），动作=${airSamples.airborneActions.join(',') || '（没采到）'}`
+      + (stray.length ? `（不该出现的: ${stray.join(',')}）` : '')
+      + `；整段出现过的动作=${airSamples.allActions.join(',')}`,
     );
 
     // ------------------------------------------------ ⑫ 最终停在地面

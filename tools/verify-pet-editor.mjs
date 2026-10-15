@@ -122,8 +122,14 @@ try {
   );
   record(
     '⑤ ★ 进阶项**默认收起**（物理参数 / 锚点与单帧尺寸）',
-    tiers.collapsibles.length >= 2
-      && tiers.collapsibles.every((s) => !s.open && s.bodyDisplay === 'none'),
+    // ⚠️ 不能要求「**所有**可折叠区块都收起」：触发时间也是可折叠的，
+    // 但它**默认展开**（那是用户最常回来调的一项，见 renderSchedule 的注释）。
+    // 判据要针对**进阶**那两块，与这条断言的标题一致。
+    tiers.collapsibles.filter((s) => s.label.includes('进阶')
+      || s.label.includes('物理') || s.label.includes('锚点')).length >= 2
+      && tiers.collapsibles
+        .filter((s) => s.label.includes('物理') || s.label.includes('锚点'))
+        .every((s) => !s.open && s.bodyDisplay === 'none'),
     `可折叠区块=${JSON.stringify(tiers.collapsibles)}`,
   );
 

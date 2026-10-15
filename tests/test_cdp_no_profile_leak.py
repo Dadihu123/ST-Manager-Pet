@@ -148,3 +148,44 @@ def test_every_verify_suite_closes_the_browser():
         if 'finally' not in body:
             missing.append(f'{name}（close 没有包在 finally 里）')
     assert missing == [], f'这些套件没有可靠地关掉浏览器: {missing}'
+
+
+def test_owner_json_read_tolerates_bom():
+    """★ 读 `owner.json` 要能容忍 UTF-8 BOM。
+
+    Windows 上手工创建的文本文件常带 BOM，而 `JSON.parse` 遇到 BOM 会抛。
+    抛了就被当成「没有 owner」→ 退化成「按时间判断」→ 要等 2 小时才清。
+    实测踩到过：造一个假残留验证清扫时，正因为 BOM 而没被清掉。
+    """
+    src = _source()
+    assert 'function readOwnerPid' in src, '没有单独的 owner 读取函数'
+    assert '\\uFEFF' in src, '没有去掉 BOM'
+    # 清扫要走这个函数，而不是自己 JSON.parse
+    body = src[src.index('function sweepStaleProfiles'):]
+    body = body[:body.index('\n}')]
+    assert 'readOwnerPid(' in body, '清扫没有用带 BOM 处理的读取函数'
+
+
+def test_closing_a_session_does_not_reject_opened():
+    """★ 关连接时不能让 `opened` 变成未处理的拒绝。
+
+    实测：`b.close()` 之后报「CDP 连接失败: ws://...」并**直接把进程打挂**。
+    原因是 socket 的 error 处理器无条件 `reject(this.opened)`，而那时
+    已经没人 await 它了——一个未处理拒绝就足以让 Node 退出。
+
+    两处都要有：
+    1. error 处理器在「已经在关」时不 reject；
+    2. `opened` 挂一个空的 catch 兜底（真正的错误仍由 `send()` 抛给调用方）。
+    """
+    src = _source()
+    assert 'this.closed = false' in src, '没有记录「是否已在关闭」'
+    # 构造函数的范围：从 constructor 到 opened 的兜底 catch 之后
+    ctor = src[src.index('export class CdpSession'):]
+    ctor = ctor[:ctor.index('\n  /**')] if '\n  /**' in ctor else ctor[:3000]
+    assert 'this.opened.catch(' in ctor, 'opened 没有兜底 catch（未处理拒绝会打挂进程）'
+    # error 处理器里有关闭守卫
+    assert 'if (this.closed)' in ctor, 'error 处理器没有「正在关闭」的守卫'
+    # close() 先置位
+    close_body = src[src.index('  close() {', src.index('export class CdpSession')):]
+    close_body = close_body[:close_body.index('\n  }')]
+    assert 'this.closed = true' in close_body, 'close() 没有先置位 closed'

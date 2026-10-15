@@ -109,6 +109,21 @@ async function main() {
     // 用户报障：idle 动画「时刻触发，看起来有点鬼畜」。
     // 正确行为是**平时静止**，每隔一段随机时间才动一下。
     // 判定：连续采样 3 秒，帧位应当**几乎不变**（触发间隔最小 6 秒）。
+    //
+    // ⚠️ 先把**自动漫游**推到很远，否则这一段会随机采到「它正在走」。
+    //
+    // 实测：默认漫游间隔是 3~9 秒，而这一段在挂载后约 4 秒就开始采样——
+    // 于是偶尔正好撞上漫游，`running` 就是 `true`（走动时 rAF 必须跑），
+    // 断言随机失败。那是**测试没隔离**，不是省电坏了
+    // （单独跑 4/4 通过，22 个套件连跑时才偶发）。
+    await page.evaluate(`(async () => {
+      // 只改**运行中**那一个视图的节奏（不写盘）：这一段要验的是
+      // 「静止时 rAF 停掉」，与用户设置无关，因此不该留下副作用。
+      // （视图对象上没有 petId，视图级 setSchedule 也不需要它。）
+      window.__petView.setSchedule({ roam: { minIntervalMs: 600000, maxIntervalMs: 600000 } });
+      return true;
+    })()`);
+    await sleep(300);
     const idleSample = await page.evaluate('window.__p.sampleFrames(3000, 250)');
     record(
       '① idle 平时静止（3 秒内帧位基本不变）',

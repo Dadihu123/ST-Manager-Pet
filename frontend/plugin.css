@@ -502,6 +502,17 @@
   opacity: 0.95;
 }
 
+/* 「判为动图容器 / 判为帧序列图」那一条。
+ *
+ * 两条路线**互斥**，而用户从文件名看不出区别（静态 WebP 与动图 WebP 的
+ * 字节头完全一样），因此把结论摆出来时给它一点分量——比普通说明显眼，
+ * 但不用警告色（这不是问题，只是一条事实）。 */
+.plugin-stm-pet .pet-preview-meta.is-route {
+  opacity: 0.95;
+  border-left: 2px solid var(--border-subtle, rgba(0, 0, 0, 0.2));
+  padding-left: 6px;
+}
+
 /* 帧读数：用等宽数字，否则数字变化时宽度会跳（看起来像在抖） */
 .plugin-stm-pet .pet-preview-frame {
   font-size: 11px;
@@ -694,6 +705,28 @@
   margin: 0;
 }
 
+/* ---------------------------------------------------------------- 新建中的占位卡
+ *
+ * 新建形象时，左侧列表最前面会插一张「新建形象」的占位卡并选中它。
+ *
+ * 为什么需要：右栏显示新建表单时，左侧若还高亮着某个已有形象，
+ * 「选中的东西」与「看到的东西」就对不上了（用户报的正是这个错乱）。
+ * 虚线边框与「＋」让它一眼看出「这不是一个已存在的形象」。
+ */
+.plugin-stm-pet .pet-card.is-drafting {
+  border-style: dashed;
+}
+
+.plugin-stm-pet .pet-card-thumb.is-drafting-thumb {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  opacity: 0.55;
+  background: transparent;
+  border: 1px dashed var(--border-subtle, rgba(0, 0, 0, 0.2));
+}
+
 /* ---------------------------------------------------------------- 帮助页 */
 .plugin-stm-pet .pet-help-entry {
   border-top: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
@@ -835,6 +868,14 @@
 
 .plugin-stm-pet .pet-notice.is-warn {
   border-color: var(--color-warning, #d9a02c);
+}
+
+/* 「你改过这里的设置」这类**纯告知**的提示（不是警告也不是错误）。
+ *
+ * 为什么单独一档：它说的是「你的设置保留着，只是作者的建议变了」——
+ * 用警告色会让人以为出了问题。左侧加一道强调条，中性但看得见。 */
+.plugin-stm-pet .pet-notice.is-info {
+  border-left: 3px solid var(--color-accent, #4a7dff);
 }
 
 /* 通知里的标题/正文：标题加粗一行，正文跟在后面。

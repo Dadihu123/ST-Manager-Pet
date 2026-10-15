@@ -1316,11 +1316,68 @@ def test_panel_marks_the_current_pet_meta(panel):
     assert "'pet-card-meta is-current'" in panel
     body = panel[panel.index('function renderPetCard(pet)'):]
     body = body[:body.index('\n  }')]
-    assert "if (pet.id === selectedId) card.classList.add('is-selected')" in body, (
-        '选中态要按 selectedId 打（不是 activeId）'
+    assert "if (pet.id === selectedId && !creating) card.classList.add('is-selected')" in body, (
+        '选中态要按 selectedId 打（不是 activeId），且**新建中不高亮任何形象**'
     )
     assert "if (pet.id === activeId) card.classList.add('is-active')" in body
     assert "'当前使用中'" in body
+
+
+def test_panel_new_pet_does_not_leave_a_stale_selection(panel):
+    """★ 新建形象时左侧不能还高亮着上一个形象。
+
+    用户报障：「我点击新建形象后，右侧的内容已经变为新建的页面了，
+    但是此时左侧还是选中之前的形象，而且我甚至可以选择别的形象，
+    而右侧却没有任何变化，这个操作逻辑有点问题」。
+
+    三件事缺一不可：
+    1. 新建中**不**给任何已有形象打选中态；
+    2. 列表最前面插一张「新建形象」的占位卡并选中它（让左右一致）；
+    3. 切走时若填过内容要**问一句**（`confirmDiscardCreate`）。
+    """
+    # 1. 选中态带 `!creating` 守卫
+    assert "pet.id === selectedId && !creating" in panel, '新建中不该高亮已有形象'
+    # 2. 占位卡
+    assert 'function renderCreatingCard' in panel, '缺少「新建形象」占位卡'
+    assert "if (creating) {" in panel and 'renderCreatingCard()' in panel, (
+        '占位卡要插进列表'
+    )
+    assert "card.dataset.petId = '__creating__'" in panel, '占位卡要有可识别的 id'
+    # 3. 切走要确认（而不是静默丢掉或静默无视）
+    assert 'function confirmDiscardCreate' in panel
+    assert 'function hasDraftContent' in panel, '要知道「填过东西没有」才谈得上问不问'
+    assert 'if (creating && hasDraftContent())' in panel, '切形象时没有走确认分支'
+    # 用面板内的确认条，**不用**原生对话框（无头浏览器里它恒为 false，
+    # 验收脚本会因此永远走不到确认那条路）
+    for native in ('window.confirm', 'window.alert', 'window.prompt'):
+        assert native not in panel, f'不要用原生 {native}（无头浏览器里没法点）'
+
+
+def test_panel_create_form_has_an_abandon_button(panel):
+    """★ 新建表单要有**放弃**入口，且放弃前问一句（填过内容时）。
+
+    用户：「我如果不想新建形象了，那还必须得先关闭模态框，然后重新打开
+    才能访问已有形象」。因此必须有一个**不用关面板**就能退出的按钮。
+    """
+    assert "button('放弃新建'" in panel, '缺少「放弃新建」按钮'
+    body = panel[panel.index('function renderCreate'):]
+    assert 'abandonCreate()' in body, '放弃要走统一的清理函数'
+    assert 'if (!hasDraftContent())' in body, '空表单应当直接丢（省一次点击）'
+    assert 'pendingConfirm' in body, '填过内容时要走确认'
+
+
+def test_panel_abandon_create_clears_every_draft_field(panel):
+    """`abandonCreate` 必须把**所有**草稿字段清干净。
+
+    漏一个的表现：下次点「新建形象」时表单里还留着上次填的名字/图，
+    而用户以为那是新的空表单——上传时才发现「怎么已经有一张图了」。
+    """
+    body = panel[panel.index('function abandonCreate'):]
+    body = body[:body.index('\n  }')]
+    for field in ('draftName', 'draftAuthor', 'draftStill', 'draftSchedule',
+                  'draftScale', 'draftPixelated', 'pendingConfirm', 'notice'):
+        assert f'{field} =' in body, f'abandonCreate 没有清理 {field}'
+    assert 'creating = false' in body
 
 
 def test_css_preview_box_is_a_large_square(css):

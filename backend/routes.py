@@ -640,18 +640,22 @@ def register_routes(api, store: PetStore) -> None:
         写的是**包本身**（`pet.json`），因此只对用户自建形象开放——
         内置形象是随包发布的资源（先「复制为我的形象」再改）。
 
-        请求体：`{"variant": 0, "patch": {"fps": 3, "loop": false, ...}}`。
+        请求体两种写法（二选一）：
+        - `{"variant": 0, "patch": {"fps": 3, "loop": false, ...}}` —— 改一套；
+        - `{"patches": [{"variant": 0, "patch": {...}}, ...]}` —— **多套一起改**。
+
+        面板用后者：一个动作可以挂多套互相替代的动画（每次触发按权重随机
+        选一套），用户在选套器上来回切着改了两套，一次保存应当一起生效。
+        分多次请求的话中途失败会留下「改了一半」的包。
+
         `patch` 里某个键传 `null` 表示**删除该字段**（回落到默认值）。
         """
         payload = _json_body()
-        patch = payload.get('patch')
-        if not isinstance(patch, dict):
-            raise PetError(
-                CODE_WRITE_FAILED, 'patch 应为对象',
-                user_msg='动画设置格式不对。',
-            )
         pack = store.update_action_animation(
-            pet_id, action, patch, variant=int(payload.get('variant') or 0),
+            pet_id, action,
+            patch=payload.get('patch') if 'patch' in payload else None,
+            variant=int(payload.get('variant') or 0),
+            patches=payload.get('patches'),
         )
         return jsonify({'success': True, 'pet': pack})
 

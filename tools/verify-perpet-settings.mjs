@@ -255,28 +255,36 @@ try {
 
     // 情况 3：走完一趟之后才睡（间隔长一点，能看清它等走完）
     //
-    // ⚠️ 这一条**本身就有随机性**：打盹到点的那一刻它可能正好在走、
-    // 也可能正好站着（站着就直接睡了）。因此判定放宽成「睡着之前
-    // 那一小段不是 walk」——那正是「不在半路定住」的意思。
-    // 要求「一定在走」是不现实的：间隔 2~2.5 秒而阈值 10 秒，
-    // 两者相位随机。
+    // ⚠️ 判据不能是「睡着前几个采样不是 walk」——实测那样会误判：
+    // WALK → IDLE → SLEEP 的三步在同一 tick 内完成（settleSleep 在
+    // 进入 IDLE 时立刻补睡），因此 50ms 采样**看不到**中间那个 idle，
+    // 最后一个采样仍然是 walk。
+    //
+    // 真正要证的是「不在半路定住」。可测的量是**睡着时离本趟目标多远**：
+    // 走到目标附近才睡 = 走完了这趟；离得很远就睡 = 半路被掐停。
+    // 实测正确实现是「距目标 4px」（目标 316、睡着时 312）。
+    // （本段在模板字符串里，注释中不能用反引号。）
     await window.__petApi.api('/pets/${PET}/schedule', { method: 'POST',
       body: { schedule: { sleep: { afterMs: 10000 },
                           roam: { minIntervalMs: 2000, maxIntervalMs: 2500 } } } });
     {
       const v = await build({ autoRoam: true, sleepAfter: 120 });
       const log = [];
-      for (let i = 0; i < 200; i += 1) {
-        log.push(v.state);
-        await new Promise((r) => setTimeout(r, 100));
+      for (let i = 0; i < 220; i += 1) {
+        log.push({ s: v.state, x: Math.round(v.physics.x), target: Math.round(v.roamTarget ?? -1) });
+        await new Promise((r) => setTimeout(r, 50));
       }
-      const idx = log.indexOf('sleep');
+      const idx = log.findIndex((e) => e.s === 'sleep');
+      const lastWalk = idx > 0
+        ? [...log.slice(0, idx)].reverse().find((e) => e.s === 'walk')
+        : null;
       out.slowRoam = {
         slept: idx >= 0,
-        at: idx >= 0 ? +(idx / 10).toFixed(1) : null,
-        // 睡着前那一段：不该是 walk（走着的话应该等它走完才切到 sleep）
-        justBefore: idx > 0 ? log.slice(Math.max(0, idx - 3), idx) : [],
-        sawWalk: log.includes('walk'),
+        at: idx >= 0 ? +((idx * 50) / 1000).toFixed(1) : null,
+        sawWalk: log.some((e) => e.s === 'walk'),
+        // 睡着时离「这一趟的目标」有多远（没有目标就记 null）
+        gapToTarget: lastWalk ? Math.abs(log[idx].x - lastWalk.target) : null,
+        span: v.physics.bounds.width,
       };
       v.dispose();
     }
@@ -301,11 +309,15 @@ try {
     + '（修复前：永远不睡——进入 WALK 会撤掉打盹定时器，而只有 IDLE 才重排）',
   );
   record(
-    '⑤ ★ 睡着时**不在走路的半路**（等这一趟走完才睡，不会定住）',
-    compat.slowRoam.slept && compat.slowRoam.justBefore.every((s) => s !== 'walk'),
-    `睡着于 ${compat.slowRoam.at}s；睡着前 3 个采样=${JSON.stringify(compat.slowRoam.justBefore)}`
-    + `；这段观察里出现过 walk=${compat.slowRoam.sawWalk}`
-    + '（相位随机：到点那刻可能正好站着，站着就直接睡——两种都不该是「走在半路定住」）',
+    '⑤ ★ 睡着时**已经走到本趟目标附近**（等这趟走完才睡，不在半路定住）',
+    compat.slowRoam.slept
+      && compat.slowRoam.gapToTarget !== null
+      && compat.slowRoam.gapToTarget <= compat.slowRoam.span * 0.15,
+    `睡着于 ${compat.slowRoam.at}s；`
+    + `距本趟目标 ${compat.slowRoam.gapToTarget}px`
+    + `（判据：<= 可走跨度的 15%，即 ${(compat.slowRoam.span * 0.15).toFixed(0)}px）；`
+    + `这段观察里出现过 walk=${compat.slowRoam.sawWalk}`
+    + '（WALK→IDLE→SLEEP 在同一 tick 内完成，因此采样看不到中间的 idle）',
   );
 
   const relevant = consoleErrors.filter((line) => !line.includes('favicon'));

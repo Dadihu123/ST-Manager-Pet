@@ -108,6 +108,80 @@ def test_edit_targets_the_requested_variant(tmp_path):
     assert variants[1]['weight'] == 9.0
 
 
+# ==================================================== 多套一起改（面板的选套器）
+#
+# 用户报障：「目前同一个类型支持绑定多套动作，但是目前的调节项中看不到这个
+# 逻辑，只能换图，还有目前只能操作第一套动作的各类参数，以小卡举例，
+# 上面显示的第一套权重为 5，第二套为 2，下面只能操作第一套的参数」。
+#
+# 面板因此加了选套器，并把**改过的几套一起提交**（`patches`）。
+
+
+def _two_variant_store(tmp_path):
+    return _store(tmp_path, animations={
+        'sleep': {'variants': [
+            {'sheet': 's1.png', 'frames': 4, 'fps': 2.5, 'weight': 5,
+             'frameMs': [400, 300, 300, 600]},
+            {'sheet': 's2.png', 'frames': 4, 'fps': 2.22, 'weight': 2,
+             'frameMs': [500, 400, 400, 500]},
+        ]},
+    })
+
+
+def test_patches_change_several_variants_at_once(tmp_path):
+    """★ 一次调用改**多套**（面板上切着改了两套，一次保存应当一起生效）。"""
+    store = _two_variant_store(tmp_path)
+    store.update_action_animation('mine', 'sleep', patches=[
+        {'variant': 0, 'patch': {'fps': 4, 'weight': 8}},
+        {'variant': 1, 'patch': {'fps': 1.5, 'weight': 3}},
+    ])
+    variants = _manifest(store)['animations']['sleep']['variants']
+    assert variants[0]['fps'] == 4.0 and variants[0]['weight'] == 8.0
+    assert variants[1]['fps'] == 1.5 and variants[1]['weight'] == 3.0
+
+
+def test_patches_are_atomic(tmp_path):
+    """★ 一次保存里第 2 套写错时，第 1 套也**不该落盘**。
+
+    否则用户看到「保存失败」却发现改了一半——那是最难解释的状态。
+    """
+    store = _two_variant_store(tmp_path)
+    before = _manifest(store)
+    with pytest.raises(PetError):
+        store.update_action_animation('mine', 'sleep', patches=[
+            {'variant': 0, 'patch': {'fps': 9}},      # 合法
+            {'variant': 1, 'patch': {'fps': 999}},    # 越界
+        ])
+    assert _manifest(store) == before, '失败时不该有任何一套被改动'
+
+
+def test_patches_reject_bad_shapes(tmp_path):
+    """`patch` / `patches` 二选一，两个都不给或都给都要明确报错。"""
+    store = _two_variant_store(tmp_path)
+    with pytest.raises(PetError):
+        store.update_action_animation('mine', 'sleep')
+    with pytest.raises(PetError):
+        store.update_action_animation(
+            'mine', 'sleep', {'fps': 1},
+            patches=[{'variant': 0, 'patch': {'fps': 1}}],
+        )
+    with pytest.raises(PetError):
+        store.update_action_animation('mine', 'sleep', patches=[])
+    with pytest.raises(PetError):
+        store.update_action_animation('mine', 'sleep', patches=[{'variant': 0}])
+    with pytest.raises(PetError):
+        store.update_action_animation('mine', 'sleep', patches='nope')
+
+
+def test_single_patch_shape_still_works(tmp_path):
+    """反向确认：旧的 `patch` + `variant` 写法照常可用（面板两种都用）。"""
+    store = _two_variant_store(tmp_path)
+    store.update_action_animation('mine', 'sleep', {'fps': 3}, variant=1)
+    variants = _manifest(store)['animations']['sleep']['variants']
+    assert variants[0]['fps'] == 2.5, '不该动第 0 套'
+    assert variants[1]['fps'] == 3.0
+
+
 def test_none_deletes_the_field(tmp_path):
     """传 `None` = **删除该字段**（回落默认值），而不是写一个 null 进去。
 

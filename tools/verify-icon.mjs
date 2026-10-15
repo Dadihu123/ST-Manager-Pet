@@ -202,36 +202,79 @@ async function main() {
 
     // ---- ⑦ 卡片缩略图只显示第 0 帧（不是把整条 spritesheet 压进小方框）
     //
-    // 这是一个真实踩过的坑：`/frame/<id>/idle` 返回**整条** 256×64 的 4 帧
-    // spritesheet，用 `background-size: contain` 塞进 40×40 的方框后
-    // 每帧只剩 10px，看起来像一团乱码。正确几何是
-    // `background-size: (方框宽 × 帧数) auto` + 左对齐。
+    // 这是一个真实踩过的坑：`/frame/<id>/idle` 返回**整条** spritesheet，
+    // 用 `background-size: contain` 塞进 40×40 的方框后每帧只剩十几像素，
+    // 看起来像一团乱码。正确几何是「单帧 cover 放大后的整条 sheet」+ 左对齐。
+    //
+    // ⚠️ 必须量**同一张卡**：早先这里量「第一张卡」的 DOM，却拿
+    // `/runtime`（当前启用的那个形象）的帧数去比——两者是不同的形象，
+    // 于是永远对不上（实测表现为「方框 40px，background-size=contain，
+    // 帧数 4」：DOM 是某个单帧/无图形象的卡，帧数却来自小卡）。
+    // 判据也改成用卡片自己的 `data-*`（它们就是渲染时用的输入）。
     const thumb = await page.evaluate(`(async () => {
-      const box = document.querySelector('.plugin-stm-pet .pet-card-thumb');
-      if (!box) return { error: '找不到缩略图' };
+      const cards = [...document.querySelectorAll('.plugin-stm-pet .pet-card')];
+      // 找一张**真的有多帧图**的卡（单帧/无图的卡合法地用 contain）
+      let box = null;
+      for (const card of cards) {
+        const candidate = card.querySelector('.pet-card-thumb');
+        if (!candidate) continue;
+        if (candidate.dataset.hasImage === 'true'
+          && Number(candidate.dataset.frames) > 1) {
+          box = candidate;
+          break;
+        }
+      }
+      if (!box) return { error: '找不到多帧的缩略图' };
       const cs = getComputedStyle(box);
-      const rect = box.getBoundingClientRect();
-      const runtime = await (await fetch('${API}/runtime')).json();
-      const idle = runtime.pet.actions.idle;
-      const size = parseFloat(cs.backgroundSize) || 0;
+      const [sizeW, sizeH] = cs.backgroundSize.split(/\\s+/).map((v) => parseFloat(v));
+      const frames = Number(box.dataset.frames) || 1;
+      const cols = Number(box.dataset.cols) || frames;
+      const rows = Number(box.dataset.rows) || 1;
+      const cellW = Number(box.dataset.cellW) || 0;
+      const cellH = Number(box.dataset.cellH) || 0;
+      // ⚠️ 参照系必须是 clientWidth / clientHeight（内边距盒），
+      // 不是 getBoundingClientRect()：缩略图有 1px 边框，用 rect 会多出
+      // 2px，把正确的实现判成失败（applyThumbGeometry 用的就是 client*）。
+      // （本段在模板字符串里，注释中不能用反引号。）
+      const boxW = box.clientWidth;
+      const boxH = box.clientHeight;
       return {
-        boxWidth: Math.round(rect.width),
+        petId: box.closest('.pet-card').dataset.petId,
+        boxWidth: boxW,
+        boxHeight: boxH,
         backgroundSize: cs.backgroundSize,
         backgroundPosition: cs.backgroundPosition,
-        frames: idle.frames,
-        layout: idle.layout,
-        scaledWidth: size,
-        ratio: rect.width > 0 ? size / rect.width : 0,
+        frames,
+        cols,
+        rows,
+        // 单帧的显示尺寸 = 整条 ÷ 列/行
+        frameW: Number.isFinite(sizeW) ? sizeW / cols : 0,
+        frameH: Number.isFinite(sizeH) ? sizeH / rows : 0,
+        // 期望：单帧按 cover 放大（两个方向都取 max），帧因此盖住方框
+        expectedFrameW: (cellW > 0 && cellH > 0)
+          ? cellW * Math.max(boxW / cellW, boxH / cellH)
+          : null,
       };
     })()`);
     const thumbOk = !thumb.error
-      && Math.abs(thumb.ratio - thumb.frames) < 0.5          // 整条宽度 = 方框宽 × 帧数
-      && String(thumb.backgroundPosition).startsWith('0');   // 左对齐 → 只露第 0 帧
+      // 单帧要盖住方框（否则小方框里会露出邻帧的一部分）
+      && thumb.frameW >= thumb.boxWidth - 2
+      && thumb.frameH >= thumb.boxHeight - 2
+      // 有单帧尺寸时，帧宽要等于 cover 缩放的结果
+      && (thumb.expectedFrameW === null
+        || Math.abs(thumb.frameW - thumb.expectedFrameW) <= 2)
+      // 左对齐 → 只露第 0 帧
+      && String(thumb.backgroundPosition).startsWith('0');
     record(
       '⑦ 卡片缩略图只显示第 0 帧（几何正确）',
       thumbOk,
-      thumb.error || `方框 ${thumb.boxWidth}px，background-size=${thumb.backgroundSize}，`
-        + `帧数 ${thumb.frames}（倍数 ${thumb.ratio.toFixed(2)}），位置 ${thumb.backgroundPosition}`,
+      thumb.error || `${thumb.petId}：方框 ${thumb.boxWidth}×${thumb.boxHeight}px，`
+        + `background-size=${thumb.backgroundSize}，`
+        + `${thumb.frames} 帧（${thumb.cols}×${thumb.rows}），`
+        + `单帧 ${thumb.frameW.toFixed(1)}×${thumb.frameH.toFixed(1)}`
+        + (thumb.expectedFrameW !== null
+          ? `（期望宽 ${thumb.expectedFrameW.toFixed(1)}）` : '')
+        + `，位置 ${thumb.backgroundPosition}`,
     );
 
     // ---- ⑧ 面板里的动作预览图仍正常（图标改动没有波及面板渲染）

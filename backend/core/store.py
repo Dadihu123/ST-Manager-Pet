@@ -2236,7 +2236,8 @@ class PetStore:
         return node
 
     def update_action_animation(
-        self, pet_id: str, action: str, patch: dict, *, variant: int = 0,
+        self, pet_id: str, action: str, patch: dict = None, *,
+        variant: int = 0, patches=None,
     ) -> dict:
         """改写**用户自建形象**某个动作的动画参数（写回 `pet.json`）。
 
@@ -2251,8 +2252,12 @@ class PetStore:
         Args:
             pet_id: 形象 id（只对自建形象开放，内置形象是随包资源）。
             action: 动作名。
-            patch: `{字段名: 值}`。
-            variant: 改第几套动画（多套写法时用；默认第一套）。
+            patch: `{字段名: 值}`（单套写法；与 `patches` 二选一）。
+            variant: 改第几套动画（配合 `patch` 用；默认第一套）。
+            patches: `[{'variant': int, 'patch': {...}}, ...]` —— **多套一起改**。
+                面板用它：用户在选套器上来回切着改了两套，一次保存应当
+                一起生效。分多次请求的话中途失败会留下「改了一半」的包，
+                而这里是**一次** `_patch_manifest`（原子）。
 
         Returns:
             dict: `runtime_pack()` 的结果。
@@ -2264,6 +2269,39 @@ class PetStore:
                 f'动作名非法: {action!r}',
                 user_msg='动作名不合法。',
             )
+        # 归一成统一的 `[(index, patch), ...]` 列表
+        if patches is None:
+            if patch is None:
+                raise PetError(
+                    CODE_WRITE_FAILED, 'patch 与 patches 至少要给一个',
+                    user_msg='没有要改的内容。',
+                )
+            jobs = [(int(variant or 0), patch)]
+        else:
+            if not isinstance(patches, list):
+                raise PetError(
+                    CODE_WRITE_FAILED, 'patches 应为数组',
+                    user_msg='动画设置格式不对。',
+                )
+            if patch is not None:
+                raise PetError(
+                    CODE_WRITE_FAILED, 'patch 与 patches 不能同时给',
+                    user_msg='动画设置格式不对。',
+                )
+            jobs = []
+            for item in patches:
+                if not isinstance(item, dict) or not isinstance(item.get('patch'), dict):
+                    raise PetError(
+                        CODE_WRITE_FAILED, 'patches 的每一项都应是 {variant, patch}',
+                        user_msg='动画设置格式不对。',
+                    )
+                jobs.append((int(item.get('variant') or 0), item['patch']))
+            if not jobs:
+                raise PetError(
+                    CODE_WRITE_FAILED, 'patches 为空',
+                    user_msg='没有要改的内容。',
+                )
+
         pack = self.load_pack(pet_id)
         spec = pack.animations.get(action)
         if spec is None:
@@ -2274,35 +2312,44 @@ class PetStore:
                 http_status=404,
             )
         variants = spec.variants or []
-        index = max(0, min(int(variant or 0), max(0, len(variants) - 1)))
-        frames_hint = variants[index].frames if index < len(variants) else 0
+        # 动图容器不切帧：帧率 / 每帧时长 / 循环 / 帧数 / 排布对它都没有意义。
+        # 传给解析层让它明确拒绝，而不是写进包里之后让 `loads_pack`
+        # 抛一个「整包读不出来」的含糊错误。
+        is_container = any(v.layout == LAYOUT_ANIMATED for v in variants)
 
-        cleaned = parse_animation_patch(
-            action, patch,
-            frames_hint=frames_hint,
-            # 动图容器不切帧，帧率 / 每帧时长 / 循环 / 帧数 / 排布对它
-            # 都没有意义——传进去让解析层明确拒绝，而不是写进包里之后
-            # 让 `loads_pack` 抛一个「整包读不出来」的含糊错误。
-            animated=any(v.layout == LAYOUT_ANIMATED for v in variants),
-        )
+        # 逐套先解析（**校验全部通过再写盘**：一次保存里第 2 套写错了，
+        # 第 1 套也不该落盘——否则用户看到「保存失败」却发现改了一半）
+        cleaned_jobs = []
+        for index, one_patch in jobs:
+            index = max(0, min(index, max(0, len(variants) - 1)))
+            frames_hint = variants[index].frames if index < len(variants) else 0
+            cleaned_jobs.append((
+                index,
+                parse_animation_patch(
+                    action, one_patch,
+                    frames_hint=frames_hint,
+                    animated=is_container,
+                ),
+            ))
 
         def mutate(manifest):
             node = self._action_manifest_node(manifest, action)
-            target = node
-            if isinstance(node.get('variants'), list) and node['variants']:
-                list_index = min(index, len(node['variants']) - 1)
-                target = node['variants'][list_index]
-                if not isinstance(target, dict):
-                    raise PetError(
-                        CODE_PACK_FIELD_INVALID,
-                        f'animations.{action}.variants[{list_index}] 写法非法',
-                        user_msg=f'「{action}」第 {list_index + 1} 套动画的配置格式不对。',
-                    )
-            for key, value in cleaned.items():
-                if value is None:
-                    target.pop(key, None)
-                else:
-                    target[key] = value
+            for index, cleaned in cleaned_jobs:
+                target = node
+                if isinstance(node.get('variants'), list) and node['variants']:
+                    list_index = min(index, len(node['variants']) - 1)
+                    target = node['variants'][list_index]
+                    if not isinstance(target, dict):
+                        raise PetError(
+                            CODE_PACK_FIELD_INVALID,
+                            f'animations.{action}.variants[{list_index}] 写法非法',
+                            user_msg=f'「{action}」第 {list_index + 1} 套动画的配置格式不对。',
+                        )
+                for key, value in cleaned.items():
+                    if value is None:
+                        target.pop(key, None)
+                    else:
+                        target[key] = value
 
         return self._patch_manifest(pet_id, mutate)
 

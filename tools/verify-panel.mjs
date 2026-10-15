@@ -61,10 +61,25 @@ async function main() {
         const cs = getComputedStyle(box);
         const url = cs.backgroundImage.replace(/^url\\(["']?/, '').replace(/["']?\\)$/, '');
         const frames = Number(box.dataset.frames) || 1;
+        // ★ 缩放倍数看的是**网格的列数 / 行数**，不是总帧数。
+        //
+        // 早先这里一律用 frames，于是在网格形象上判错：一个 2×2 的 4 帧
+        // 形象，缩略图应当放大到「框宽 × 2」（列）而不是「× 4」（帧数）。
+        // 几何本身是对的（data-cols / data-rows 一直在下发），
+        // 是**判据**没跟上网格支持——与当初漏掉 vertical 是同一类漏洞。
+        // （本段在模板字符串里，注释中不能用反引号。）
+        const cols = Number(box.dataset.cols) || frames;
+        const rows = Number(box.dataset.rows) || 1;
+        const cellW = Number(box.dataset.cellW) || 0;
+        const cellH = Number(box.dataset.cellH) || 0;
         out.push({
           id: card.dataset.petId,
           hasImage: Boolean(url),
           frames,
+          cols,
+          rows,
+          cellW,
+          cellH,
           // 排布方向：vertical 的整条 sheet 是**竖**的，几何按高度放大
           // （本段在模板字符串里，注释中不能用反引号。）
           layout: box.dataset.layout === 'vertical' ? 'vertical' : 'horizontal',
@@ -74,8 +89,22 @@ async function main() {
           // 用 getBoundingClientRect 会算上 1px 边框，差 2px（假失败）。
           boxWidth: box.clientWidth,
           boxHeight: box.clientHeight,
-          expectedWidth: Math.round(box.clientWidth * frames),
-          expectedHeight: Math.round(box.clientHeight * frames),
+          // ★ 期望几何 = 把**单帧**按 cover 缩放（两个方向都取 max，
+          // 于是帧在两个方向都 >= 方框，网格里也不会漏出邻格），
+          // 再乘上列数 / 行数得到整条 sheet 的显示尺寸。
+          //
+          // 早先这里写的是「框宽 × 帧数」，只在「帧比框宽」时成立；
+          // 帧是竖构图或网格时都会算错（把正确的实现判成失败）。
+          expectedWidth: (() => {
+            if (!(cellW > 0 && cellH > 0)) return null;
+            const scale = Math.max(box.clientWidth / cellW, box.clientHeight / cellH);
+            return cellW * scale * cols;
+          })(),
+          expectedHeight: (() => {
+            if (!(cellW > 0 && cellH > 0)) return null;
+            const scale = Math.max(box.clientWidth / cellW, box.clientHeight / cellH);
+            return cellH * scale * rows;
+          })(),
         });
       }
       return out;
@@ -95,22 +124,35 @@ async function main() {
     // 对齐是「水平居中 + 顶部对齐」（计算值 `50% 0%`）。
     // 早先这里只按 `0%` 开头判，把竖排形象误判成失败——是**判据**的漏洞，
     // 不是几何的错（竖排形象是合法输入，`layout` 是包级字段）。
-    const geometryOk = thumbs.filter((item) => item.frames > 1).every((item) => {
-      if (item.layout === 'vertical') {
-        const height = parseFloat(item.bgSize.split(/\s+/)[1]);
-        return Number.isFinite(height)
+    // 多帧卡片的几何必须与「单帧按 cover 缩放后的整条 sheet」一致。
+    //
+    // ⚠️ 这里必须**同时**校验两个方向：早先只按宽度判（`expectedWidth =
+    // 框宽 × 帧数`），在竖构图帧与网格排布上都会算错——那是**判据**的漏洞，
+    // 不是几何的错（实现用的是 `cover`，两个方向都取 max，见
+    // `applyThumbGeometry` 的注释）。
+    const geometryOk = thumbs.filter((item) => item.frames > 1 && item.hasImage)
+      .every((item) => {
+        const [width, height] = item.bgSize.split(/\s+/).map((v) => parseFloat(v));
+        if (item.expectedWidth === null || item.expectedHeight === null) {
+          // 拿不到单帧尺寸时只要求「两个方向都 >= 方框」（cover 的下界）
+          return Number.isFinite(width) && Number.isFinite(height)
+            && width >= item.boxWidth - 2 && height >= item.boxHeight - 2;
+        }
+        return Number.isFinite(width) && Number.isFinite(height)
+          && Math.abs(width - item.expectedWidth) <= 2
           && Math.abs(height - item.expectedHeight) <= 2
-          && item.bgPos.startsWith('50%');
-      }
-      const width = parseFloat(item.bgSize);
-      return Number.isFinite(width)
-        && Math.abs(width - item.expectedWidth) <= 2
-        && item.bgPos.startsWith('0%');
-    });
+          // 帧在两个方向都要盖住方框（否则网格里会漏出邻格）
+          && width >= item.boxWidth * item.cols - 2
+          && height >= item.boxHeight * item.rows - 2
+          // 贴左上角：只露出第 0 帧。
+          // ⚠️ 计算值是 `0px 0px`（不是 `0%`），别只认百分号。
+          && item.bgPos.startsWith('0');
+      });
     record(
-      '② 多帧缩略图按「框尺寸 × 帧数」放大且贴边对齐（不再只剩透明边）',
+      '② 多帧缩略图按「单帧 cover 放大 × 网格列/行数」铺开且贴左上角',
       geometryOk,
-      thumbs.map((i) => `${i.id}(${i.layout}): ${i.bgSize} @ ${i.bgPos} (frames=${i.frames})`).join('；'),
+      thumbs.map((i) => `${i.id}(${i.layout} ${i.cols}×${i.rows}): ${i.bgSize} @ ${i.bgPos}`
+        + ` (期望 ${i.expectedWidth?.toFixed(1)}×${i.expectedHeight?.toFixed(1)}, frames=${i.frames})`).join('；'),
     );
 
     // 真实像素：截图缩略图区域，确认**不是**整片空白
@@ -124,15 +166,17 @@ async function main() {
         const url = cs.backgroundImage.replace(/^url\\(["']?/, '').replace(/["']?\\)$/, '');
         if (!url) { out.push({ id: card.dataset.petId, ink: 0, error: 'no url' }); continue; }
         // 把「按几何算出的那一帧」画到 canvas 上，数非透明像素。
-        // ⚠️ 同样要分排布方向：竖排 sheet 的帧是**上下**切的，
-        // 按 width/frames 取会拿到「整条高、1/4 宽」的区域，全是空的。
+        // ⚠️ 切帧要看**网格列数 / 行数**，不是总帧数：网格形象的帧是
+        // 「几列几行」铺开的，按 width/frames 切会拿到一条跨越几帧的窄带。
+        // 竖排（1 列 N 行）是网格的特例，同一套算法就够。
         // （本段在模板字符串里，注释中不能用反引号。）
         const frames = Number(box.dataset.frames) || 1;
-        const vertical = box.dataset.layout === 'vertical';
+        const cols = Number(box.dataset.cols) || frames;
+        const rows = Number(box.dataset.rows) || 1;
         const blob = await (await fetch(url, { cache: 'no-store' })).blob();
         const bmp = await createImageBitmap(blob);
-        const frameW = vertical ? bmp.width : Math.round(bmp.width / frames);
-        const frameH = vertical ? Math.round(bmp.height / frames) : bmp.height;
+        const frameW = Math.max(1, Math.round(bmp.width / cols));
+        const frameH = Math.max(1, Math.round(bmp.height / rows));
         const canvas = document.createElement('canvas');
         canvas.width = frameW; canvas.height = frameH;
         const ctx = canvas.getContext('2d');
@@ -381,6 +425,20 @@ async function main() {
       const match = /\\/\\s*(\\d+)\\s*帧/.exec(text);
       const frames = match ? Number(match[1]) : 1;
       const layerRect = layer.getBoundingClientRect();
+      // ★ 单帧尺寸要按**这张图真实的排布**算（background-size 里的
+      // 「整条宽 × 整条高」除以列数 / 行数）。
+      //
+      // ⚠️ 不能假设横排。小卡的睡觉动作声明的是 "layout": "vertical"
+      // （4 行 1 列），按「整条宽 ÷ 帧数」算会得到 41.5 而真实是 166，
+      // 于是正确的实现被判成失败——这个坑踩过一次（同一段里早先漏掉
+      // vertical 也是同一类）。
+      //
+      // 判据改成「用 background-size 反推列/行，再与内层尺寸对齐」：
+      // 内层就是**单帧**的显示尺寸，因此 size[0]/frameW 与 size[1]/frameH
+      // 必须都是整数（列数与行数）。
+      // （本段在模板字符串里，注释中不能用反引号。）
+      const colsGuess = Math.max(1, Math.round(size[0] / layerRect.width));
+      const rowsGuess = Math.max(1, Math.round(size[1] / layerRect.height));
       const boxRect = box.getBoundingClientRect();
       return {
         petId: target.dataset.petId,
@@ -395,6 +453,8 @@ async function main() {
         bottomGap: boxRect.bottom - layerRect.bottom,
         sheetW: size[0],
         sheetH: size[1],
+        cols: colsGuess,
+        rows: rowsGuess,
         // ★ 背景图必须真的在**内层**上（而不是外框）。
         // 只量内层尺寸是不够的：把背景挪回外框时，内层尺寸照样是对的，
         // 但留白处又会露出邻帧——所以必须同时断言「谁带着背景图」。
@@ -419,13 +479,17 @@ async function main() {
     record(
       '⑥ 背景铺在「一帧大小」的内层上（留白处不会露出邻帧）',
       !aspect.error
-        // 内层尺寸 == 整条 sheet 的单帧尺寸
-        && Math.abs((aspect.sheetW / aspect.frames) - aspect.frameW) <= 1.5
-        && Math.abs(aspect.sheetH - aspect.frameH) <= 1.5
+        // 内层尺寸 == 整条 sheet 按**真实排布**切出来的单帧尺寸
+        // （列数 / 行数由 background-size 与内层尺寸反推，见上面的注释）
+        && Math.abs((aspect.sheetW / aspect.cols) - aspect.frameW) <= 1.5
+        && Math.abs((aspect.sheetH / aspect.rows) - aspect.frameH) <= 1.5
+        // 切出来的格子数要能装下这些帧（不能比帧数少）
+        && aspect.cols * aspect.rows >= aspect.frames
         // 背景必须在**内层**上，而不是外框上
         && aspect.layerHasBg && !aspect.boxHasBg,
       `内层 ${aspect.frameW?.toFixed(1)}×${aspect.frameH?.toFixed(1)}，`
-      + `整条 ${aspect.sheetW?.toFixed(1)}×${aspect.sheetH?.toFixed(1)} / ${aspect.frames} 帧；`
+      + `整条 ${aspect.sheetW?.toFixed(1)}×${aspect.sheetH?.toFixed(1)}`
+      + `（${aspect.cols} 列 × ${aspect.rows} 行 / ${aspect.frames} 帧）；`
       + `背景在内层=${aspect.layerHasBg} 在外框=${aspect.boxHasBg}`,
     );
 
@@ -628,32 +692,66 @@ async function main() {
       return nodes.map((node) => {
         const cs = getComputedStyle(node);
         const frames = Number(node.dataset.frames) || 1;
-        const size = cs.backgroundSize;
-        const px = /([\\d.]+)px/.exec(size);
+        // ★ 单帧尺寸看的是**网格列数 / 行数**与单帧比例，不是总帧数。
+        // 按帧数除会得到「跨越几帧的窄带」，把正确的实现判成失败。
+        const cols = Number(node.dataset.cols) || frames;
+        const rows = Number(node.dataset.rows) || 1;
+        const cellW = Number(node.dataset.cellW) || 0;
+        const cellH = Number(node.dataset.cellH) || 0;
+        const parts = cs.backgroundSize.split(/\\s+/).map((v) => parseFloat(v));
+        const boxW = node.clientWidth;
+        const boxH = node.clientHeight;
+        let frameW = 0;
+        let frameH = 0;
+        if (Number.isFinite(parts[0])) frameW = parts[0] / cols;
+        if (Number.isFinite(parts[1])) frameH = parts[1] / rows;
+        // cover 缩放下的期望值（与 applyThumbGeometry 同一套规则）
+        let expectedW = null;
+        if (cellW > 0 && cellH > 0) {
+          const scale = Math.max(boxW / cellW, boxH / cellH);
+          expectedW = cellW * scale;
+        }
         return {
           frames,
+          cols,
+          rows,
           hasImage: node.dataset.hasImage === 'true',
-          bgSize: size,
-          width: node.clientWidth,
-          // 单帧显示宽度 = 整条宽度 / 帧数，应当等于方框宽度
-          frameWidth: px ? Number(px[1]) / frames : 0,
+          bgSize: cs.backgroundSize,
+          width: boxW,
+          height: boxH,
+          // 单帧显示尺寸（整条除以列/行）
+          frameWidth: frameW,
+          frameHeight: frameH,
+          expectedFrameW: expectedW,
         };
       });
     })()`);
     const withImage = tiles.filter((t) => t.hasImage);
+    // ⚠️ 单帧与**动图容器**合法地用 `contain`（它们没有可切的格子，
+    // 整张图就是那一帧）。只对**多帧**的小图要求 cover 几何。
+    const multiFrame = withImage.filter((t) => t.frames > 1);
     record(
       '⑨ 动作网格每一格都真的画了图（不是只剩文字）',
       withImage.length >= 10
-        && withImage.every((t) => t.bgSize !== 'auto' && t.frameWidth > 0),
-      `${withImage.length} 格有图；尺寸样本 `
-      + withImage.slice(0, 3).map((t) => `${t.frames}帧=${t.bgSize}`).join(' / '),
+        && withImage.every((t) => t.bgSize !== 'auto'
+          && (t.frames <= 1 ? t.bgSize === 'contain' : t.frameWidth > 0)),
+      `${withImage.length} 格有图（其中多帧 ${multiFrame.length} 格）；尺寸样本 `
+      + withImage.slice(0, 3).map((t) => `${t.frames}帧(${t.cols}×${t.rows})=${t.bgSize}`).join(' / '),
     );
     record(
-      '⑨ 动作网格的小图按「方框宽 × 帧数」放大（只露出第 0 帧）',
-      withImage.length > 0
-        && withImage.every((t) => Math.abs(t.frameWidth - t.width) <= 1.5),
-      withImage.slice(0, 4)
-        .map((t) => `${t.width}px 框 → 单帧 ${t.frameWidth.toFixed(1)}px`)
+      '⑨ 多帧小图按「单帧 cover 放大」铺开（帧盖住方框，只露第 0 帧）',
+      multiFrame.length > 0 && multiFrame.every((t) => {
+        // 帧必须盖住方框（两个方向都 >=），否则会露出邻格
+        if (!(t.frameWidth >= t.width - 2 && t.frameHeight >= t.height - 2)) return false;
+        // 有单帧尺寸时，帧宽要等于 cover 缩放的结果
+        if (t.expectedFrameW !== null) {
+          return Math.abs(t.frameWidth - t.expectedFrameW) <= 2;
+        }
+        return true;
+      }),
+      multiFrame.slice(0, 4)
+        .map((t) => `${t.width}px 框 → 单帧 ${t.frameWidth.toFixed(1)}×${t.frameHeight.toFixed(1)}`
+          + (t.expectedFrameW !== null ? `（期望宽 ${t.expectedFrameW.toFixed(1)}）` : ''))
         .join('；'),
     );
     // 源图本身有内容（这一条**不**校验几何——它直接读 spritesheet 的第 0 帧，

@@ -1347,6 +1347,30 @@ node tools/verify-visibility.mjs # 关闭宠物（显示开关）：13 项
 `tests/test_cdp_no_profile_leak.py` 钉住这四条，并逐个检查
 **每个 `tools/verify-*.mjs` 都把 `browser.close()` 包在 `finally` 里**。
 
+#### 一次跑完所有套件（`tools/verify-all.mjs`）
+
+```bash
+PET_SANDBOX_PORT=5099 PET_SANDBOX_PETS=<沙箱 data/plugins/stm-pet/data/pets> \
+  node tools/verify-all.mjs          # 可用 PET_ONLY=anim,roam 只跑几个
+```
+
+**为什么需要一个跑批脚本**：22 个套件连着跑时会出现**负载性抖动**。
+每个套件都要起一个 Chrome 并挂上上万节点的宿主 DOM，连着跑时机器明显
+吃紧，而若干断言是时间敏感的（rAF 帧数、下落时长、动画推进）。实测：
+单独跑 5/5 通过的套件，整套连跑时会偶发失败一两条。
+
+因此它**失败自动重跑一次**，并把结果分成三类：一次就过 / 重跑才过
+（标为**抖动**并打印）/ 重跑还挂（**真失败**）。这样「有没有真问题」
+一眼可判，而抖动也不会被掩盖——掩盖它等于把「判据不稳」藏起来。
+
+它顺带报一次 profile 残留数（泄漏是静默的，顺手看一眼很便宜）。
+
+> 已修掉的几处抖动，都记在各自套件的注释里，共同原因是**没做测试隔离**：
+> `verify-anim` / `verify-pet` 没把**自动漫游**推远（漫游每 3~9 秒发生一次，
+> 撞上时帧位当然在变、背景图是 `walk-*`）；`verify-pet` 的空中采样窗口
+> 起点太晚（下落只有 ~600ms，而它等到 720ms 才开始采）；`verify-pet` 的
+> 空中区间用「y 还在增长」界定，被落地弹跳拉长到包含 `land` 帧。
+
 `verify-anim.mjs` / `verify-panel.mjs` / `verify-still.mjs` 是三条**只有真跑起来
 才看得出问题**的验收线：
 

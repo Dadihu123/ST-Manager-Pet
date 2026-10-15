@@ -397,6 +397,13 @@ export function createSettingsPanel({
   let draftScale = 1;
   let draftPixelated = false;
   /**
+   * 待确认的「要丢掉吗」：`{message, onConfirm}` 或 `null`。
+   *
+   * 存成状态而不是直接弹窗，是为了让它**跨重渲染存活**——
+   * 用户看到提示后可能先去别处看一眼再回来决定。
+   */
+  let pendingConfirm = null;
+  /**
    * 新建表单的**标准图像**声明。
    *
    * 三种状态：
@@ -458,6 +465,18 @@ export function createSettingsPanel({
    * 草稿里，用户点「保存」才一次性提交。
    */
   let actionDraft = null;
+  /**
+   * **未保存的预览覆盖**：`{action, variant, entry}` 或 `null`。
+   *
+   * 用户要求「调节参数后点一个应用/刷新就能直接看到预览，而不需要先保存」。
+   * 它是一份**折算过的动作条目**（形状与后端下发的一致），预览器照常从它
+   * 取帧数与节奏——因此「预览里看到的」与「保存后会有的」走的是同一段
+   * 播放代码，不会出现两边不一致。
+   *
+   * 换动作 / 换形象 / 保存 / 取消时都要清掉：留着会让预览显示一个
+   * 早已不存在的草稿（用户以为改生效了，其实没有）。
+   */
+  let previewOverride = null;
   /**
    * 预览器是否处于「播放」状态。
    *
@@ -1013,6 +1032,8 @@ export function createSettingsPanel({
     previewAction = 'idle';
     previewVariant = 0;
     previewPlaying = true;
+    // 未保存的预览草稿同理要丢掉：它属于上一个形象的动作
+    previewOverride = null;
     // ★ 同时**丢掉动画参数编辑草稿**。
     //
     // `editingAction` / `actionDraft` 是模块级的，不清的话切到新形象后
@@ -1041,14 +1062,23 @@ export function createSettingsPanel({
    * 而躺姿睡觉这类动作是横构图，不知道尺寸就会被压扁（用户报的那个）。
    * 优先级与桌面宠物完全一致（`animation.js:frameSizeOf`）：
    * **变体自带 > 动作条目 > 包级**。
+   *
+   * ★ 若用户点过「应用预览」，这一套的字段用**未保存的草稿**顶替
+   * （见 `previewOverride`）——因此预览里看到的节奏就是保存后会有的。
    */
   function previewSpec() {
     const entry = previewEntry();
     if (!entry) return null;
     const variants = entry.variants || [];
-    const pick = variants.length
+    let pick = variants.length
       ? variants[Math.min(Math.max(0, previewVariant), variants.length - 1)]
       : null;
+    if (previewOverride && previewOverride.action === previewAction
+      && previewOverride.variant === previewVariant) {
+      // 草稿只顶替**节奏与几何**字段，图 URL 仍用真实的那一份
+      // （草稿不产生新图，它只改怎么播）。
+      pick = Object.assign({}, pick, previewOverride.entry);
+    }
     if (!pick && !entry.url) return null;
     // 老版本后端只给主变体字段，这里兜底构一个
     const base = pick || {
@@ -1548,6 +1578,15 @@ export function createSettingsPanel({
     for (const pet of pets) {
       list.appendChild(renderPetCard(pet));
     }
+    // ★ 新建中时在最前面插一张**「新建形象」的占位卡**并选中它。
+    //
+    // 用户报障：「此时左侧还是选中之前的形象……我甚至可以选择别的形象，
+    // 而右侧却没有任何变化」。左侧既然列的是「当前在看什么」，
+    // 右栏在新建表单上时左侧就该选中「新建」这一项——
+    // 否则「选中的东西」与「看到的东西」对不上。
+    if (creating) {
+      list.insertBefore(renderCreatingCard(), list.firstChild);
+    }
     body.appendChild(list);
 
     // ---- 右栏：选中形象的详情（或新建表单）
@@ -1563,6 +1602,77 @@ export function createSettingsPanel({
     restoreScroll(savedScroll);
   }
 
+  /**
+   * 「新建形象」在左侧列表里的**占位卡**（新建中时显示并选中）。
+   *
+   * 它的作用是让「左侧选中的」与「右侧显示的」始终是同一件事。
+   * 点它 = 回到新建表单（若用户切去看别的形象又想在回来）。
+   */
+  function renderCreatingCard() {
+    const card = el('button', 'pet-card is-selected is-drafting');
+    card.type = 'button';
+    card.dataset.marqueeIgnore = 'true';
+    card.dataset.petId = '__creating__';
+    card.appendChild(el('div', 'pet-card-thumb is-drafting-thumb', '＋'));
+    const info = el('div', 'pet-card-info');
+    info.appendChild(el('div', 'pet-card-name', draftName.trim() || '新建形象'));
+    info.appendChild(el('div', 'pet-card-meta', '尚未创建'));
+    card.appendChild(info);
+    card.addEventListener('click', () => {
+      // 已经在新建表单上了，点一下没有别的事可做
+      if (!creating) {
+        creating = true;
+        render();
+      }
+    });
+    return card;
+  }
+
+  /**
+   * 新建表单里**有没有用户填过东西**。
+   *
+   * 用来决定「切走时要不要问一句」：空表单直接切走最省事，
+   * 而填过内容的（可能刚传了好几张图）静默丢掉是数据损失。
+   */
+  function hasDraftContent() {
+    if (draftName.trim() || draftAuthor.trim()) return true;
+    if (draftStill) return true;
+    if (draftSchedule && Object.keys(draftSchedule).length) return true;
+    for (const spec of Object.values(draft || {})) {
+      if (spec && spec.file) return true;
+    }
+    return false;
+  }
+
+  /** 丢掉新建表单里的一切（回到「没有在新建」的状态）。 */
+  function abandonCreate() {
+    creating = false;
+    draft = {};
+    draftName = '';
+    draftAuthor = '';
+    draftStill = null;
+    draftSchedule = null;
+    draftScale = 1;
+    draftPixelated = false;
+    pendingConfirm = null;
+    notice = null;
+  }
+
+  /**
+   * 弹一句「要丢掉吗」的确认（**面板内**的一行提示，不用原生对话框）。
+   *
+   * 为什么不用原生的 `confirm()`：宿主的面板本身跑在 modal 里，原生对话框
+   * 会盖住整个应用（包括用户在看的宠物），而且在无头浏览器里它默认返回
+   * false —— 验收脚本会因此永远走不到「确认」那条路。
+   *
+   * 因此这里做成面板内的提示条 + 两个按钮，状态存在 `pendingConfirm`
+   * 里（重渲染后仍在）。
+   */
+  function confirmDiscardCreate(message, onConfirm) {
+    pendingConfirm = { message, onConfirm };
+    render();
+  }
+
   function renderPetCard(pet) {
     const card = el('button', 'pet-card');
     card.type = 'button';
@@ -1570,9 +1680,30 @@ export function createSettingsPanel({
     // 带上 id：验收脚本要能精确点到某一张卡（靠名字匹配会在多语言/改名时失效）
     card.dataset.petId = pet.id;
     if (pet.id === activeId) card.classList.add('is-active');
-    if (pet.id === selectedId) card.classList.add('is-selected');
+    // 新建中时**不高亮任何已有形象**：右栏显示的是新建表单，左侧若还亮着
+    // 某个形象，用户会以为「我在改那个形象」（用户报的就是这个错乱）。
+    if (pet.id === selectedId && !creating) card.classList.add('is-selected');
     if (pet.error) card.classList.add('is-broken');
     card.addEventListener('click', () => {
+      // ★ 新建中点了别的形象：**先问一句**再切。
+      //
+      // 用户报障：「我点击新建形象后，右侧的内容已经变为新建的页面了，
+      // 但是此时左侧还是选中之前的形象，而且我甚至可以选择别的形象，
+      // 而右侧却没有任何变化……我如果不想新建形象了，那还必须得先关闭
+      // 模态框，然后重新打开才能访问已有形象」。
+      //
+      // 这里不静默丢弃用户已经填的新建内容（那可能是刚传了好几张图），
+      // 也不静默无视点击（原来就是「点了没反应」），而是让他选一次。
+      if (creating && hasDraftContent()) {
+        const name = pet.name || pet.id;
+        confirmDiscardCreate(`切到「${name}」会丢掉新建表单里已经填的内容。`, () => {
+          abandonCreate();
+          selectedId = pet.id;
+          loadDetail(pet.id);
+        });
+        return;
+      }
+      if (creating) abandonCreate();
       selectedId = pet.id;
       loadDetail(pet.id);
     });
@@ -2401,17 +2532,23 @@ export function createSettingsPanel({
   }
 
   function renderSchedule() {
-    const section = el('div', 'pet-section');
-    const title = el('div', 'pet-section-title');
-    title.appendChild(el('span', null, '触发时间'));
-    title.appendChild(el('span', 'pet-badge', '可调节'));
-    section.appendChild(title);
-    section.appendChild(el(
-      'div',
-      'pet-field-hint',
-      '只有「由时间自己发生」的行为能设间隔。点击、下落、播报这些由事件触发，'
-      + '没有「多久一次」可言。这三项都是按形象记住的，换形象会自动切回它自己的设置。',
-    ));
+    // ★ 「触发时间」整块可折叠。
+    //
+    // 用户要求：「目前调节项目比较多，部分项应该可以折叠以更好利用现有空间，
+    // 比如触发时间，可以支持整体折叠」。
+    //
+    // 它**默认展开**（与物理参数那种「默认收起」不同）：这三项是用户最常
+    // 回来调的东西（「它怎么不动」→ 调待机间隔），藏起来会让面板显得
+    // 什么都没有。折叠的价值在于**用完能收起来**，把空间让给下面的
+    // 动画预览与动作网格。
+    const section = renderCollapsible('触发时间', {
+      key: 'schedule',
+      badge: '可调节',
+      defaultOpen: true,
+      hint: '只有「由时间自己发生」的行为能设间隔。点击、下落、播报这些由事件'
+        + '触发，没有「多久一次」可言。这三项都是按形象记住的，'
+        + '换形象会自动切回它自己的设置。',
+    });
 
     const effective = detail.schedule || {};
     const declared = detail.declaredSchedule || {};
@@ -2430,7 +2567,7 @@ export function createSettingsPanel({
       // 「多久没人理就睡着」显然不该是随机的，所以这里**不**渲染两个滑块。
       // 用 `afterMs`（毫秒），区间与 manifest 的 `sleep_after` 一致。
       if (behavior.isThreshold) {
-        section.appendChild(renderThresholdField(behavior, current, suggested));
+        section.body.appendChild(renderThresholdField(behavior, current, suggested));
         continue;
       }
 
@@ -2531,7 +2668,7 @@ export function createSettingsPanel({
           ? `形象包建议 ${formatInterval(suggested.minIntervalMs, suggested.maxIntervalMs)}。`
           : ''),
       ));
-      section.appendChild(field);
+      section.body.appendChild(field);
     }
 
     const row = el('div', 'pet-panel-toolbar');
@@ -2543,7 +2680,51 @@ export function createSettingsPanel({
       'pet-card-meta',
       detail.scheduleOverridden ? '已自定义' : '正在用默认 / 形象包的设置',
     ));
-    section.appendChild(row);
+
+    // ★ 「你改过的」与「形象包现在建议的」并排显示。
+    //
+    // 用户问：「触发时间目前已经绑定形象了……后续如果内置形象更新了，
+    // 会发生什么，应该是会覆盖掉吧」。
+    //
+    // 实测答案：**不会覆盖**。用户设置存在 `data/settings.json` 的
+    // `petSchedules` 里，形象包是另一个文件（内置的在 `resources/pets/`），
+    // 插件更新只替换后者，因此用户的选择一定保留（优先级也是用户设置更高）。
+    //
+    // 但这个担心指向了一个**真实**的问题：用户改过之后，官方若调整了推荐值，
+    // 用户**永远看不到**——他保留着自己那份旧设置，不知道作者现在建议别的。
+    // 因此这里在「已覆盖」时把两边都摆出来，让用户自己决定要不要跟随新建议。
+    if (detail.scheduleOverridden) {
+      const diffs = [];
+      for (const behavior of SCHEDULE_BEHAVIORS) {
+        const theirs = declared[behavior.key];
+        if (!theirs) continue;
+        const mine = effective[behavior.key] || {};
+        const same = behavior.isThreshold
+          ? Number(mine.afterMs) === Number(theirs.afterMs)
+          : (Number(mine.minIntervalMs) === Number(theirs.minIntervalMs)
+            && Number(mine.maxIntervalMs) === Number(theirs.maxIntervalMs));
+        if (same) continue;
+        const mineText = behavior.isThreshold
+          ? formatMs(mine.afterMs)
+          : formatInterval(mine.minIntervalMs, mine.maxIntervalMs);
+        const theirsText = behavior.isThreshold
+          ? formatMs(theirs.afterMs)
+          : formatInterval(theirs.minIntervalMs, theirs.maxIntervalMs);
+        diffs.push(`${behavior.label}：你在用 ${mineText}，形象包当前建议 ${theirsText}`);
+      }
+      if (diffs.length) {
+        const box = el('div', 'pet-notice is-info');
+        box.appendChild(el('div', 'pet-notice-title', '你改过这里的设置'));
+        box.appendChild(el('div', 'pet-notice-body',
+          '你的设置会一直保留——形象包更新不会覆盖它。'
+          + '如果作者后来调过推荐值，这里能看出差别：'));
+        for (const line of diffs) {
+          box.appendChild(el('div', 'pet-field-hint', line));
+        }
+        section.body.appendChild(box);
+      }
+    }
+    section.body.appendChild(row);
     return section;
   }
 
@@ -2615,6 +2796,23 @@ export function createSettingsPanel({
           'pet-preview-meta',
           `${frames} 帧${layoutNote}${pageNote} · ${pace} · ${spec.loop === false ? '播一遍' : '循环'}`,
         ));
+      }
+      // ★ 把「这张图被当成哪一种」明说出来。
+      //
+      // 用户问：「webp 怎么判断其是动画还是帧图，gif 我们可以直接认定其为动图，
+      // 但是 webp 不一定，其也支持透明通道，可能是动图，也可能是静态的帧序列图，
+      // 因为动图的方式和帧序列图的方式是两种类型，是互斥的，因此这个必须确认清楚」。
+      //
+      // 判据（后端 `imports.animated_frame_count`，读的是 Pillow 的 `n_frames`）：
+      // **帧数 > 1 = 动图容器；= 1 = 帧序列图**。
+      // 必须按帧数判而不是按格式判——**静态 WebP 与动图 WebP 的 magic bytes
+      // 完全一样**（都是 RIFF....WEBP），只靠格式根本分不出来。
+      //
+      // 面板把结论摆出来，用户就不必猜「它到底走了哪条路」——
+      // 这正是两种路线互斥、又都合法时最容易出错的地方。
+      const formatLabel = formatRouteLabel(spec);
+      if (formatLabel) {
+        side.appendChild(el('div', 'pet-preview-meta is-route', formatLabel));
       }
       // 显存占用：超过预算就**显眼提示**，但不禁用——够不够用取决于用户的机器，
       // 插件无法知道，因此把事实摆出来由用户自己决定。
@@ -2781,6 +2979,8 @@ export function createSettingsPanel({
         previewAction = item.action;
         previewVariant = 0;
         previewPlaying = true;
+        // 手动切动作 = 不再看那份草稿（否则预览会显示一个别处的未保存改动）
+        previewOverride = null;
         render();
       });
       picker.appendChild(node);
@@ -3034,41 +3234,92 @@ export function createSettingsPanel({
   }
 
   /**
-   * 从动作条目里取一份**可编辑的草稿**（动画参数的初值）。
+   * 一个动作**有几套**动画（`variants`）。
    *
-   * 取值来源是后端下发的 `entry`（它已经把回退链算完），因此对**回退**
+   * 术语上刻意区分两件事，它们在 `pet.json` 里是**完全不同的东西**：
+   *
+   * | 概念 | 字段 | 含义 |
+   * |---|---|---|
+   * | **多套** | `variants: [...]` | 一个动作挂好几套**互相替代**的动画，每次触发按 `weight` 随机选一套 |
+   * | **多页** | `sheets: [...]` | **同一套**动画的帧分散在多个图片文件里（为了省显存），播起来是连续的 |
+   *
+   * 用户明确要求过从命名上区分：「命名可能要注意需要考虑到两种情况，
+   * 一个是多套动作，一个是同一个动作的多页，从命名上应该要区分」。
+   * 因此面板上一律叫「套」与「页」，不再混用「变体 / 分页」这类含糊词。
+   */
+  function variantCountOf(entry) {
+    const list = entry && entry.variants;
+    return Array.isArray(list) && list.length ? list.length : 1;
+  }
+
+  /** 取某个动作条目的**某一套**（越界时夹到合法范围）。 */
+  function variantEntryAt(entry, index) {
+    const list = (entry && entry.variants) || [];
+    if (!list.length) return entry || {};
+    const at = Math.min(Math.max(0, Number(index) || 0), list.length - 1);
+    return list[at];
+  }
+
+  /**
+   * 从**某一套**动画里取一份可编辑的草稿。
+   *
+   * 取值来源是后端下发的 `variant`（它已经把回退链算完），因此对**回退**
    * 动作也能编辑——但那种情况下保存会写进**这个动作自己**的声明，
    * 从而把它从「回退」变成「自带」，这是符合直觉的。
    */
-  function buildActionDraft(entry) {
+  function buildVariantDraft(variant) {
+    const source = variant || {};
     const grid = frameGrid({
-      frames: entry.frames,
-      layout: entry.layout,
-      cols: entry.cols,
-      rows: entry.rows,
+      frames: source.frames,
+      layout: source.layout,
+      cols: source.cols,
+      rows: source.rows,
     });
-    const motion = normalizeMotion(entry);
+    const motion = normalizeMotion(source);
     return {
-      frames: Math.max(1, Number(entry.frames) || 1),
-      fps: Number(entry.fps) || 8,
-      loop: entry.loop !== false,
+      frames: Math.max(1, Number(source.frames) || 1),
+      fps: Number(source.fps) || 8,
+      loop: source.loop !== false,
       // 非均匀帧时长：包没声明时给一个「按帧率均匀」的初值，
       // 用户改起来有个起点（而不是一片空白）
-      frameMs: Array.isArray(entry.frameMs) && entry.frameMs.length
-        ? entry.frameMs.slice()
+      frameMs: Array.isArray(source.frameMs) && source.frameMs.length
+        ? source.frameMs.slice()
         : [],
-      useFrameMs: Array.isArray(entry.frameMs) && entry.frameMs.length > 0,
+      useFrameMs: Array.isArray(source.frameMs) && source.frameMs.length > 0,
       layout: grid.cols > 1 && grid.rows > 1 ? 'grid'
         : (grid.rows > 1 ? 'vertical' : 'horizontal'),
       cols: grid.cols,
       rows: grid.rows,
-      weight: Number(entry.weight) || 1,
+      // ⚠️ 权重必须取**这一套自己的**。原来面板读的是动作条目顶层的
+      // `entry.weight`，而多套写法下顶层根本没有这个字段
+      // （小卡实测是 `undefined`），于是 `Number(undefined) || 1` 恒为 **1**
+      // ——用户看到「权重 1」，而实际是 5 与 2。这正是用户报的那个问题。
+      weight: Number(source.weight) || 1,
       breatheAmp: motionBreathes(motion) ? motion.amplitude : 0,
       breathePeriod: motionBreathes(motion) ? motion.periodMs : 3200,
       blinkFrames: motionBlinks(motion) ? motion.blinkFrames.slice() : [],
       blinkEvery: motionBlinks(motion) ? motion.blinkEveryMs.slice() : [3000, 7000],
       blinkDuration: motionBlinks(motion) ? motion.blinkDurationMs : 160,
     };
+  }
+
+  /**
+   * 为一个动作建**逐套**的草稿集合。
+   *
+   * 为什么是「集合」而不是一份：用户报障「目前只能操作第一套动作的各类参数，
+   * 以小卡举例，上面显示的第一套权重为 5，第二套为 2，下面只能操作第一套的
+   * 参数」。一个动作可以挂多套互相替代的动画，因此编辑区必须先选「改哪一套」。
+   *
+   * Returns:
+   *   `{ variants: [draft...], active: 0 }`
+   */
+  function buildActionDraft(entry) {
+    const count = variantCountOf(entry);
+    const variants = [];
+    for (let index = 0; index < count; index += 1) {
+      variants.push(buildVariantDraft(variantEntryAt(entry, index)));
+    }
+    return { variants, active: 0 };
   }
 
   /**
@@ -3084,6 +3335,33 @@ export function createSettingsPanel({
    *   均匀的，一上来就铺 4~70 个输入框会把面板撑爆；
    * - 每个字段都带一句「推荐值」，与帮助页同一套口径。
    */
+  /**
+   * 用一句人话说清**第 N 套是什么样**（选套器与 tooltip 共用）。
+   *
+   * ⚠️ 不能用 `variant.source` 当图片名：那个字段在**变体**上是**动作名**
+   * （`"idle"`），不是文件名——第一版按它显示，于是每一套都写着
+   * 「（无图）」。真正能区分的是这一套自己的帧数 / 帧率 / 页数，
+   * 那也正是作者认「哪套是哪套」时看的东西。
+   */
+  function describeVariant(variant, index) {
+    const one = variant || {};
+    const bits = [];
+    if (one.animated) {
+      bits.push(`动图容器 ${Number(one.animatedFrames) || 1} 帧`);
+    } else {
+      const frames = Math.max(1, Number(one.frames) || 1);
+      const pace = Array.isArray(one.frameMs) && one.frameMs.length
+        ? `${Math.round(one.frameMs.reduce((a, b) => a + Number(b || 0), 0))}ms 一轮`
+        : `${formatNumber(Number(one.fps) || 0)} fps`;
+      bits.push(`${frames} 帧 / ${pace}`);
+    }
+    const pages = Number(one.pageCount) || 1;
+    if (pages > 1) bits.push(`${pages} 页`);
+    const grid = frameGrid(one);
+    if (grid.cols > 1 && grid.rows > 1) bits.push(`${grid.cols}×${grid.rows} 网格`);
+    return `第 ${index + 1} 套：${bits.join('，')}`;
+  }
+
   /**
    * 这个动作是不是**动图容器**（`layout: "animated"`，由浏览器播 Gif/WebP）。
    *
@@ -3103,8 +3381,57 @@ export function createSettingsPanel({
 
   function renderActionEditor(entry) {
     const box = el('div', 'pet-action-editor');
-    const draft = actionDraft;
     const container = isAnimatedContainer(entry);
+    const count = variantCountOf(entry);
+
+    // ★ **多套动画的选套器**。
+    //
+    // 用户报障：「目前同一个类型支持绑定多套动作，但是目前的调节项中看不到
+    // 这个逻辑，只能换图，还有目前只能操作第一套动作的各类参数」。
+    //
+    // 一个动作可以挂好几套**互相替代**的动画（每次触发按权重随机选一套），
+    // 因此编辑区必须先选「改哪一套」。选套器上直接把每套的**权重**与
+    // 图片来源写出来，用户一眼能看出「这套是谁、占多大比例」。
+    if (count > 1) {
+      const picker = el('div', 'pet-editor-variants');
+      picker.appendChild(el(
+        'div',
+        'pet-field-label',
+        `这个动作有 ${count} 套动画（每次触发按权重随机选一套）`,
+      ));
+      const row = el('div', 'pet-choice-row');
+      for (let index = 0; index < count; index += 1) {
+        const one = variantEntryAt(entry, index);
+        const active = index === actionDraft.active;
+        const node = el(
+          'button',
+          `pet-choice ${active ? 'is-active' : ''}`.trim(),
+          `第 ${index + 1} 套 · 权重 ${formatNumber(Number(one.weight) || 1)}`,
+        );
+        node.type = 'button';
+        node.dataset.marqueeIgnore = 'true';
+        node.dataset.editorVariant = String(index);
+        node.title = describeVariant(one, index);
+        node.addEventListener('click', () => {
+          // 切换当前编辑的那一套。**草稿按套各存一份**，因此切回来时
+          // 之前改的东西还在（不会因为看了一眼第 2 套就丢掉第 1 套的修改）。
+          actionDraft.active = index;
+          render();
+        });
+        row.appendChild(node);
+      }
+      picker.appendChild(row);
+      // 每套的具体情况也列出来：作者常按「几帧 / 多快」认「哪套是哪套」，
+      // 而「第 1 套 / 第 2 套」这种序号在包里并不存在。
+      const names = [];
+      for (let index = 0; index < count; index += 1) {
+        names.push(describeVariant(variantEntryAt(entry, index), index));
+      }
+      picker.appendChild(el('div', 'pet-field-hint', names.join('　·　')));
+      box.appendChild(picker);
+    }
+
+    const draft = actionDraft.variants[actionDraft.active];
 
     // ---- 动图容器：只有「权重」与「程序化运动」对它有意义
     if (container) {
@@ -3114,6 +3441,24 @@ export function createSettingsPanel({
         '这个动作是动图容器（由浏览器播放 Gif / WebP），不切帧，'
         + '因此帧率、每帧时长、循环、帧数、排布对它都没有意义。'
         + '能调的是下面的权重与程序化运动。',
+      ));
+    }
+
+    // ---- 多页说明（**页**与**套**是两件不同的事）
+    //
+    // 用户要求区分命名：「一个是多套动作，一个是同一个动作的多页」。
+    // 页数来自 `sheets` 数组（同一套动画的帧分散在多个文件里，为了省显存），
+    // 播起来是**连续**的；它不是「多套」，也不是面板上能随便改的数字
+    // （改它要动文件，属于导入/换图的范畴）。因此这里只**说明**现状。
+    const activeVariant = variantEntryAt(entry, actionDraft.active);
+    const pages = Number(activeVariant.pageCount) || 1;
+    if (pages > 1) {
+      box.appendChild(el(
+        'div',
+        'pet-field-hint',
+        `这一套的帧分成 ${pages} 页存放（为了省显存），播放时是连续的——`
+        + '这与上面的「多套」不同：多套是互相替代的几套动画，'
+        + '多页是同一套动画的帧分散在几个文件里。',
       ));
     }
 
@@ -3281,11 +3626,10 @@ export function createSettingsPanel({
     // 只有一套动画时权重没有任何作用（它只在「每次触发按权重随机选一套」
     // 时有意义），因此那种情况下不显示——与「不展示无意义的设置项」
     // 同一个原则。要加第二套动画得改 `pet.json`（面板暂不支持增删套数）。
-    const variantCount = Array.isArray(entry.variants) ? entry.variants.length : 1;
-    if (variantCount > 1) {
+    if (count > 1) {
       const row3 = el('div', 'pet-editor-row');
       row3.appendChild(editorNumber({
-        label: `权重（共 ${variantCount} 套动画）`,
+        label: `第 ${actionDraft.active + 1} 套的权重`,
         hint: '相对比例：都填 5 就是各一半；填 5 与 1 就是 5/6 与 1/6',
         value: draft.weight,
         min: 0,
@@ -3348,15 +3692,126 @@ export function createSettingsPanel({
     }
 
     // ---- 操作
+    //
+    // ★ 「应用预览」：把草稿**只喂给预览器**，不写盘。
+    //
+    // 用户要求：「对于动作的细致调节，当前我必须得保存后重新播放才可以看到
+    // 效果，但是我当前已经有了预览框了，为什么不能做的更加方便一些呢，
+    // 可以再调节参数后，点击一个类似于应用/刷新的按钮就可以直接看到预览，
+    // 而不需要先保存再去看预览」。
+    //
+    // 实现上不动后端：把草稿**折算成一份「假的动作条目」**塞进
+    // `previewOverride`，预览器照常从它取帧数 / 帧率 / 每帧时长 / 排布 /
+    // 运动，于是看到的节奏就是保存之后会有的节奏。这样「调参 → 看效果 →
+    // 再调」是一个不落盘的循环，满意了才保存。
     const actions = el('div', 'pet-panel-toolbar');
-    actions.appendChild(button('保存', 'is-primary', () => saveActionAnimation(entry.action)));
+    actions.appendChild(button('应用预览', 'is-primary', () => {
+      previewOverride = {
+        action: entry.action,
+        variant: actionDraft.active,
+        entry: draftToPreviewEntry(entry, actionDraft.active),
+      };
+      // 切到正在调的那一套，否则「应用」了却看不到它
+      previewAction = entry.action;
+      previewVariant = actionDraft.active;
+      previewPlaying = true;
+      render();
+    }));
+    actions.appendChild(button('保存', '', () => saveActionAnimation(entry.action)));
     actions.appendChild(button('取消', '', () => {
       editingAction = '';
       actionDraft = null;
+      previewOverride = null;
       render();
     }));
     box.appendChild(actions);
+    if (previewOverride && previewOverride.action === entry.action
+      && previewOverride.variant === actionDraft.active) {
+      box.appendChild(el(
+        'div',
+        'pet-field-hint',
+        '预览框里正在用未保存的草稿播放。满意之后点「保存」写进形象包。',
+      ));
+    }
     return box;
+  }
+
+  /**
+   * 把编辑区的草稿折算成一份**预览用的动作条目**（形状与后端下发的一致）。
+   *
+   * 这样预览器不必知道「草稿」这个概念——它拿到的仍然是一个正常的条目，
+   * 因此**播放规则与桌面上完全一致**（同一段代码），不会出现
+   * 「预览里好看、桌面上不一样」这种最误导人的情况。
+   */
+  function draftToPreviewEntry(entry, index) {
+    const variant = variantEntryAt(entry, index);
+    const draft = actionDraft.variants[index];
+    if (!draft) return variant;
+    const grid = frameGrid({
+      frames: draft.frames,
+      layout: draft.layout,
+      cols: draft.cols,
+      rows: draft.rows,
+    });
+    const motion = {};
+    if (Number(draft.breatheAmp) > 0) {
+      motion.breathe = {
+        amplitude: Number(draft.breatheAmp),
+        periodMs: Math.round(Number(draft.breathePeriod)),
+      };
+    }
+    if (draft.blinkFrames.length) {
+      motion.blink = {
+        frames: draft.blinkFrames.slice(),
+        everyMs: [Number(draft.blinkEvery[0]), Number(draft.blinkEvery[1])],
+        durationMs: Math.round(Number(draft.blinkDuration)),
+      };
+    }
+    return Object.assign({}, variant, {
+      frames: draft.frames,
+      fps: draft.fps,
+      loop: Boolean(draft.loop),
+      frameMs: draft.useFrameMs
+        ? draft.frameMs.map((value) => Number(value) || 100)
+        : [],
+      layout: draft.layout,
+      cols: grid.cols,
+      rows: grid.rows,
+      weight: Number(draft.weight) || 1,
+      motion: Object.keys(motion).length ? motion : null,
+    });
+  }
+
+  /**
+   * 把「这张图被当成哪条路线」写成一句人话（没有可说的就返回空串）。
+   *
+   * 两条路线是**互斥**的，而它们的区别用户看不出来（GIF 与 WebP 都可能
+   * 是动图，WebP 还可能是带透明的静态帧序列图），因此必须由面板明说。
+   *
+   * 判据只认后端下发的 `animated`（它来自 `n_frames`），面板**不自己
+   * 按扩展名猜**——猜错的后果是「界面说的与实际跑的不一致」，
+   * 那比不说还糟。
+   */
+  function formatRouteLabel(spec) {
+    if (!spec) return '';
+    const source = String(spec.source || spec.url || '');
+    const extension = (source.split('?')[0].match(/\.([a-z0-9]+)$/i) || [])[1];
+    const ext = extension ? extension.toLowerCase() : '';
+    if (spec.animated) {
+      const count = Number(spec.animatedFrames) || 1;
+      return `判为动图容器（${ext ? `.${ext} ` : ''}文件里 ${count} 帧）——`
+        + '由浏览器整段播放，因此没有逐帧控制。';
+    }
+    // 静态 WebP 特别值得说一句：它与动图 WebP 的字节头**完全一样**，
+    // 用户很容易以为「.webp 就是动图」。
+    if (ext === 'webp') {
+      return '判为帧序列图（这个 .webp 里只有 1 帧，虽然格式支持动图）——'
+        + '按下面的帧数与排布逐帧播放。';
+    }
+    if (ext === 'gif') {
+      return '判为帧序列图（这个 .gif 里只有 1 帧）——按帧数与排布逐帧播放。';
+    }
+    return '';
   }
 
   /**
@@ -3389,36 +3844,30 @@ export function createSettingsPanel({
   }
 
   /**
-   * 把编辑区的草稿**一次性**提交给后端（写回 `pet.json`）。
+   * 算出**某一套**动画的补丁（只含真的改过的字段）。
+   *
+   * 抽出来是因为它现在有两个用途：
+   * - 保存（写回 `pet.json`）；
+   * - **应用预览**（只更新预览器，不写盘）——用户要求「可以再调节参数后，
+   *   点击一个类似于应用/刷新的按钮就可以直接看到预览，而不需要先保存再去看预览」。
    *
    * 只提交**真的改过**的字段：全量提交会让「本来没声明的字段」被写成
    * 显式值，`pet.json` 会越来越臃肿，而作者原本的「没意见」语义也丢了。
    */
-  async function saveActionAnimation(action) {
-    const draft = actionDraft;
-    if (!draft) return;
-    const entry = (detail.actions || []).find((item) => item.action === action) || {};
+  function buildVariantPatch(entry, variant, draft, container) {
     const patch = {};
-
-    // ★ 动图容器**只提交权重与程序化运动**。
-    //
-    // 帧率 / 每帧时长 / 循环 / 帧数 / 排布对容器都没有意义，后端的
-    // `_parse_animated_layout` 会直接拒绝（实测提交 fps 得到
-    // `pack_field_invalid`）。编辑区已经把这些控件藏起来了，但提交侧
-    // 也必须挡住——否则「草稿里的默认值恰好与现状不同」时会误提交，
-    // 用户点了保存却吃一个看不懂的报错。
-    const container = isAnimatedContainer(entry);
-
     if (!container) {
-      if (Number(entry.fps) !== Number(draft.fps)) patch.fps = draft.fps;
-      if ((entry.loop !== false) !== Boolean(draft.loop)) patch.loop = Boolean(draft.loop);
-      if (Number(entry.frames) !== Number(draft.frames)) patch.frames = draft.frames;
+      if (Number(variant.fps) !== Number(draft.fps)) patch.fps = draft.fps;
+      if ((variant.loop !== false) !== Boolean(draft.loop)) {
+        patch.loop = Boolean(draft.loop);
+      }
+      if (Number(variant.frames) !== Number(draft.frames)) patch.frames = draft.frames;
 
-      const hadFrameMs = Array.isArray(entry.frameMs) && entry.frameMs.length > 0;
+      const hadFrameMs = Array.isArray(variant.frameMs) && variant.frameMs.length > 0;
       if (draft.useFrameMs) {
         const same = hadFrameMs
-          && entry.frameMs.length === draft.frameMs.length
-          && entry.frameMs.every((value, index) => Number(value) === Number(draft.frameMs[index]));
+          && variant.frameMs.length === draft.frameMs.length
+          && variant.frameMs.every((v, i) => Number(v) === Number(draft.frameMs[i]));
         if (!same) patch.frameMs = draft.frameMs.map((value) => Number(value) || 100);
       } else if (hadFrameMs) {
         // 关掉 = 删除该字段（回落到按帧率的均匀节奏）
@@ -3426,7 +3875,8 @@ export function createSettingsPanel({
       }
 
       const grid = frameGrid({
-        frames: entry.frames, layout: entry.layout, cols: entry.cols, rows: entry.rows,
+        frames: variant.frames, layout: variant.layout,
+        cols: variant.cols, rows: variant.rows,
       });
       const currentLayout = grid.cols > 1 && grid.rows > 1 ? 'grid'
         : (grid.rows > 1 ? 'vertical' : 'horizontal');
@@ -3436,15 +3886,16 @@ export function createSettingsPanel({
         if (grid.rows !== draft.rows) patch.rows = draft.rows;
       }
     }
-    if (Number(entry.weight) !== Number(draft.weight)) patch.weight = draft.weight;
+    // 权重取**这一套自己的**（多套写法下顶层没有 weight）。
+    if (Number(variant.weight) !== Number(draft.weight)) patch.weight = draft.weight;
     // 单套动画时权重无意义（编辑区也不显示它），别把它写进包里
     if (Object.prototype.hasOwnProperty.call(patch, 'weight')
-      && (!Array.isArray(entry.variants) || entry.variants.length <= 1)) {
+      && variantCountOf(entry) <= 1) {
       delete patch.weight;
     }
 
     // 程序化运动：把草稿拼成一个完整的 motion 对象（或 null = 删除）
-    const motion = normalizeMotion(entry);
+    const motion = normalizeMotion(variant);
     const hadBreathe = motionBreathes(motion);
     const hadBlink = motionBlinks(motion);
     const wantBreathe = Number(draft.breatheAmp) > 0;
@@ -3476,8 +3927,37 @@ export function createSettingsPanel({
         patch.motion = next;
       }
     }
+    return patch;
+  }
 
-    if (!Object.keys(patch).length) {
+  /** 当前编辑的这套的补丁集合（`[{variant, patch}, ...]`，只含改过的套）。 */
+  function collectActionPatches(entry) {
+    const container = isAnimatedContainer(entry);
+    const count = variantCountOf(entry);
+    const out = [];
+    for (let index = 0; index < count; index += 1) {
+      const variant = variantEntryAt(entry, index);
+      const draft = actionDraft.variants[index];
+      if (!draft) continue;
+      const patch = buildVariantPatch(entry, variant, draft, container);
+      if (Object.keys(patch).length) out.push({ variant: index, patch });
+    }
+    return out;
+  }
+
+  /**
+   * 把编辑区的草稿提交给后端（写回 `pet.json`）。
+   *
+   * **多套一起提交**（`patches` 数组）而不是一套一个请求：用户在选套器上
+   * 来回切着改了两套的参数，一次保存应当一起生效；分多次请求的话中途失败
+   * 会留下「改了一半」的包，而 `_patch_manifest` 的单次调用是原子的。
+   */
+  async function saveActionAnimation(action) {
+    if (!actionDraft) return;
+    const entry = (detail.actions || []).find((item) => item.action === action) || {};
+    const patches = collectActionPatches(entry);
+
+    if (!patches.length) {
       setNotice('ok', '没有改动');
       editingAction = '';
       actionDraft = null;
@@ -3488,12 +3968,18 @@ export function createSettingsPanel({
     await withBusy(async () => {
       const data = await call(
         `/pets/${encodeURIComponent(selectedId)}/actions/${encodeURIComponent(action)}/animation`,
-        { method: 'POST', body: { patch } },
+        { method: 'POST', body: { patches } },
       );
       if (!data) return;
-      setNotice('ok', `「${ACTION_LABELS[action] || action}」的动画参数已保存`);
+      const which = patches.length > 1
+        ? `${patches.length} 套`
+        : `第 ${patches[0].variant + 1} 套`;
+      setNotice('ok', `「${ACTION_LABELS[action] || action}」${which}的动画参数已保存`);
       editingAction = '';
       actionDraft = null;
+      // 保存之后草稿已经落到包里，预览改用真实数据（留着 override 会让
+      // 预览继续显示那份草稿，用户以为「保存了但没变」）
+      previewOverride = null;
       // 让运行中的宠物立刻用上新参数
       if (onPetChanged) await onPetChanged(activeId);
       await refresh();
@@ -3632,15 +4118,17 @@ export function createSettingsPanel({
     // ---- 操作
     const actions = el('div', 'pet-panel-toolbar');
     actions.appendChild(button('创建', 'is-primary', () => submitCreate()));
-    actions.appendChild(button('取消', '', () => {
-      creating = false;
-      draft = {};
-      draftName = '';
-      draftAuthor = '';
-      draftStill = null;
-      draftSchedule = null;
-      notice = null;
-      render();
+    actions.appendChild(button('放弃新建', '', () => {
+      // 填过东西才问一句；空表单直接丢（省一次点击）
+      if (!hasDraftContent()) {
+        abandonCreate();
+        render();
+        return;
+      }
+      confirmDiscardCreate('新建表单里已经填了内容，放弃之后就要重新来一遍。', () => {
+        abandonCreate();
+        render();
+      });
     }));
     actions.appendChild(el(
       'span',
@@ -3648,6 +4136,25 @@ export function createSettingsPanel({
       draft.idle && draft.idle.file ? '已选择待机图' : '还需要一张「待机」图',
     ));
     wrap.appendChild(actions);
+
+    // ---- 「要丢掉吗」的确认条（面板内，不用原生 confirm）
+    if (pendingConfirm) {
+      const box = el('div', 'pet-notice is-warn');
+      box.appendChild(el('div', 'pet-notice-title', '确认放弃？'));
+      box.appendChild(el('div', 'pet-notice-body', pendingConfirm.message));
+      const row = el('div', 'pet-panel-toolbar');
+      row.appendChild(button('放弃并继续', 'is-danger', () => {
+        const action = pendingConfirm.onConfirm;
+        pendingConfirm = null;
+        if (action) action();
+      }));
+      row.appendChild(button('留在新建页', '', () => {
+        pendingConfirm = null;
+        render();
+      }));
+      box.appendChild(row);
+      wrap.appendChild(box);
+    }
 
     return wrap;
   }

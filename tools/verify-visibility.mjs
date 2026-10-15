@@ -254,33 +254,51 @@ async function main() {
 
     // 回来之后动画确实在跑（而不是冻住）
     //
-    // ⚠️ `pokeIdle()` 在宠物**漫游中**（state 不是 idle）会返回 false，
-    // 而漫游每 3~9 秒就发生一次。直接 poke 一次再采样会时不时只采到同一个
-    // 帧位——看起来像「动画冻住了」，实际只是采样时它恰好在走路。
-    // 因此先等它回到 idle，再触发。
-    const frames = [];
-    await page.evaluate(`(async () => {
-      const view = window.__petView;
-      const deadline = performance.now() + 12000;
-      while (performance.now() < deadline) {
-        if (view && view.state === 'idle' && !view.idleBursting) break;
-        await new Promise((r) => setTimeout(r, 80));
-      }
-      if (view) view.pokeIdle();
+    // ⚠️ 两条干扰，都要排掉：
+    //
+    // 1. `pokeIdle()` 在宠物**漫游中**（state 不是 idle）会返回 false，
+    //    而漫游每 3~9 秒就发生一次。因此先把漫游推远，再等它回到 idle；
+    // 2. 一次 poke + 采样只有约 1 秒，而 idle 小动作一轮是 1.6 秒
+    //    （小卡：4 帧 / 400+300+300+600ms）。连跑 22 个套件时机器吃紧，
+    //    采样窗口可能整个落在同一帧里 —— 实测整套连跑时偶发
+    //    「只采到 1 个帧位」。因此**最多试 3 轮**：任何一轮看到帧位变化
+    //    就证明「动画在推进」，这正是这条断言要证的事。
+    await page.evaluate(`(() => {
+      // 只改运行中的视图，不写盘（这一段与用户设置无关）
+      window.__petView.setSchedule({ roam: { minIntervalMs: 600000, maxIntervalMs: 600000 } });
       return true;
     })()`);
-    for (let index = 0; index < 8; index += 1) {
-      frames.push(await page.evaluate(`(() => {
-        const root = document.querySelector('${PET_SELECTOR}');
-        const sprite = root ? root.querySelector('.pet-sprite') : null;
-        return sprite ? getComputedStyle(sprite).backgroundPosition : '';
-      })()`));
-      await sleep(120);
+    let frames = [];
+    let rounds = 0;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      rounds += 1;
+      await page.evaluate(`(async () => {
+        const view = window.__petView;
+        const deadline = performance.now() + 8000;
+        while (performance.now() < deadline) {
+          if (view && view.state === 'idle' && !view.idleBursting) break;
+          await new Promise((r) => setTimeout(r, 80));
+        }
+        if (view) view.pokeIdle();
+        return true;
+      })()`);
+      const seen = [];
+      for (let index = 0; index < 10; index += 1) {
+        seen.push(await page.evaluate(`(() => {
+          const root = document.querySelector('${PET_SELECTOR}');
+          const sprite = root ? root.querySelector('.pet-sprite') : null;
+          return sprite ? getComputedStyle(sprite).backgroundPosition : '';
+        })()`));
+        await sleep(130);
+      }
+      frames = frames.concat(seen);
+      if (new Set(seen).size >= 2) break;
     }
     record(
       '⑥ ★ 重新显示后动画正常推进（不是一张冻住的图）',
       new Set(frames).size >= 2,
-      `${new Set(frames).size} 个不同帧位: ${[...new Set(frames)].slice(0, 4).join(' | ')}`,
+      `${new Set(frames).size} 个不同帧位（试了 ${rounds} 轮）: `
+      + `${[...new Set(frames)].slice(0, 4).join(' | ')}`,
     );
 
     // ============================================== ⑦ 诊断句柄也能开关

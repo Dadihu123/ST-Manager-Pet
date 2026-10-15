@@ -149,15 +149,26 @@ try {
   );
 
   // ---- ③④ 长程游走：边缘停留与方向翻转
+  //
+  // ⚠️ 边缘停留是**统计量**，单次 400 点采样的方差很大（实测同一实现
+  // 连跑三次得到 0.0% / 6.3% / 12.8%，偶尔会顶到阈值以上）。
+  // 只跑一次就断言「明显低于均匀随机」是**不成立的判据**——
+  // 它会让一个正确的实现随机地失败（比漏报更烦人）。
+  //
+  // 因此这里跑 **3 轮独立采样**，对**合计**求比例：
+  // 样本量变成 3 倍，方差降到 1/sqrt(3)，而「不贴边」这个结论本来就是
+  // 关于长期行为的。
   const walk = await page.evaluate(`(async () => {
     const v = window.__view;
     v.setConfig({ autoRoam: true });
     v.setSchedule({ roam: { minIntervalMs: 200, maxIntervalMs: 300 } });
-    v.physics.setPosition(${mid}, v.physics.bounds.height);
     const xs = [];
-    for (let i = 0; i < 400; i += 1) {
-      xs.push(v.physics.x);
-      await new Promise((r) => setTimeout(r, 50));
+    for (let round = 0; round < 3; round += 1) {
+      v.physics.setPosition(${mid}, v.physics.bounds.height);
+      for (let i = 0; i < 400; i += 1) {
+        xs.push(v.physics.x);
+        await new Promise((r) => setTimeout(r, 50));
+      }
     }
     return xs;
   })()`);
@@ -166,10 +177,13 @@ try {
   const edgeHi = high - span * 0.1;
   const edgeShare = walk.filter((x) => x < edgeLo || x > edgeHi).length / walk.length;
   const midShare = walk.filter((x) => Math.abs(x - mid) < span * 0.25).length / walk.length;
+  // 均匀随机的对照是 ~19%（两侧各 10% 的区间）。
+  // 取 0.16 作为判据：既要求「明显低于 19%」，又留出统计波动的余量。
   record(
     '③ ★ 长程游走**不贴边**：待在「最左/最右 10% 区间」的时间明显低于均匀随机',
     edgeShare < 0.16,
-    `边缘停留 ${(edgeShare * 100).toFixed(1)}%（均匀随机的对照是 ~19%）`
+    `边缘停留 ${(edgeShare * 100).toFixed(1)}%（均匀随机的对照是 ~19%；`
+    + `${walk.length} 个采样点，3 轮合计）`
     + `；中间 50% 区域 ${(midShare * 100).toFixed(1)}%（对照 ~50%）`,
   );
 

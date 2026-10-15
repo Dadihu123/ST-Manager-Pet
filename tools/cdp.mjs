@@ -83,6 +83,24 @@ function isAlive(pid) {
 }
 
 /**
+ * 读某个 profile 目录里记录的 owner pid（读不出来就抛）。
+ *
+ * ⚠️ 要去掉 UTF-8 BOM：Windows 上手工创建的文本文件常带 BOM，
+ * 而 `JSON.parse` 遇到 BOM 会直接抛——于是「有 owner 但读不出来」被
+ * 当成「没有 owner」，退化成按时间判断（要等 2 小时才清）。
+ * 实测踩到过：造一个假残留验证清扫时，因为 BOM 而没被清掉。
+ */
+function readOwnerPid(dir) {
+  const raw = fs.readFileSync(path.join(dir, 'owner.json'), 'utf8');
+  const owner = JSON.parse(raw.replace(/^\uFEFF/, ''));
+  const pid = Number(owner && owner.pid);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    throw new Error(`owner.json 里的 pid 不合法: ${owner && owner.pid}`);
+  }
+  return pid;
+}
+
+/**
  * 清扫**上一次**运行留下的 profile 目录。
  *
  * 三条判据，任一条成立就删：
@@ -122,8 +140,7 @@ function sweepStaleProfiles() {
     let stale = age < hardCutoff;
     if (!stale) {
       try {
-        const owner = JSON.parse(fs.readFileSync(path.join(dir, 'owner.json'), 'utf8'));
-        stale = !isAlive(Number(owner && owner.pid));
+        stale = !isAlive(readOwnerPid(dir));
       } catch {
         // 没有 owner.json（老版本留下的）或内容坏了 → 按时间判断
         stale = age < staleCutoff;
@@ -337,12 +354,28 @@ export class CdpSession {
     this.nextId = 1;
     this.pending = new Map();
     this.handlers = new Map();
+    this.closed = false;
     this.opened = new Promise((resolve, reject) => {
       this.socket = new WebSocket(url);
       this.socket.addEventListener('open', () => resolve());
-      this.socket.addEventListener('error', (event) => reject(new Error(`CDP 连接失败: ${event.message || url}`)));
+      this.socket.addEventListener('error', (event) => {
+        // ⚠️ 关连接时也会走到这里。若那时 `opened` 已经没人 await 了，
+        // 这个 reject 就变成**未处理的拒绝**，直接把进程打挂
+        // （实测：`b.close()` 之后报「CDP 连接失败: ws://...」并退出）。
+        //
+        // 关掉之后 socket 出错是**预期**的，因此那时不 reject——
+        // 只把 opened 结掉，让任何还在 await 的调用方拿到一个明确的错误。
+        if (this.closed) {
+          resolve();
+          return;
+        }
+        reject(new Error(`CDP 连接失败: ${event.message || url}`));
+      });
       this.socket.addEventListener('message', (event) => this._onMessage(String(event.data)));
     });
+    // 给 `opened` 挂一个空的 catch：即使没人 await，也不让它变成
+    // 未处理拒绝（真正的错误仍会通过 `send()` 的 await 抛给调用方）。
+    this.opened.catch(() => {});
   }
 
   _onMessage(raw) {
@@ -439,6 +472,9 @@ export class CdpSession {
   }
 
   close() {
+    // 先置位再关：`closed` 让 error 处理器知道「这是关连接引起的」，
+    // 于是不会把错误当成连接失败抛出去（见构造函数里的说明）。
+    this.closed = true;
     try { this.socket.close(); } catch { /* 已经关了 */ }
   }
 }
