@@ -107,8 +107,13 @@ async function main() {
     );
     record(
       '② 开关文案说清「关掉的是宠物、不是插件」',
-      toggle.text.includes('不必卸载或停用插件'),
-      toggle.text.slice(0, 120),
+      // ⚠️ 这句安抚只在**已隐藏**时出现——那才是用户需要它的时刻
+      // （显示中没什么好担心的）。用户反馈讲解文字太啰嗦，因此原来那句
+      // 「不必卸载或停用插件」被删了；要保护的是「用户敢点」这件事，
+      // 也就是隐藏之后文案必须点明插件仍然启用。
+      // 因此这条断言**故意放在下面 ③ 隐藏之后**，见那里的检查。
+      true,
+      '（改到 ③ 之后验：安抚文案只在已隐藏时出现）',
     );
 
     // ============================================== ③ 点开关 → 宠物消失
@@ -147,6 +152,20 @@ async function main() {
       '③ ★ 关掉后宠物视图已销毁（不留 rAF / 定时器空转）',
       idleFrames.hasView === false && idleFrames.petState === 'unmounted',
       JSON.stringify(idleFrames),
+    );
+
+    // ⚠️ 那句安抚只在**已隐藏**时出现——那才是用户需要它的时刻
+    // （显示中没什么好担心的）。用户反馈讲解文字太啰嗦，因此原来那句
+    // 「不必卸载或停用插件」被删了；要保护的是「用户敢点」这件事，
+    // 也就是隐藏之后文案必须点明插件仍然启用。
+    const hiddenCopy = await page.evaluate(`(() => {
+      const box = document.querySelector('.plugin-stm-pet .pet-visibility');
+      return box ? box.textContent.replace(/\\s+/g, ' ').trim() : '';
+    })()`);
+    record(
+      '② 隐藏之后文案说清「关掉的是宠物、不是插件」',
+      hiddenCopy.includes('插件仍然启用'),
+      hiddenCopy.slice(0, 140),
     );
 
     // ============================================== ④ ★ 仍然有路开回来

@@ -83,18 +83,21 @@ async function ensureFixture(page) {
   return page.evaluate(`(async () => {
     const api = window.__petApi.api;
     const list = await api('/pets', { method: 'GET' });
-    // 复用上一次复制出来的那个（id 由后端生成，不能靠猜）
-    const remembered = window.localStorage.getItem('ux3-fixture-id') || '';
-    const existing = (list.items || []).find((i) => i.id === remembered);
+    // 复用上一次复制出来的那个（id 由后端生成，不能靠猜）。
+    //
+    // ⚠️ 不能记在 localStorage：每个验收套件都起一个**全新的浏览器
+    // profile**，localStorage 每次都是空的——于是每跑一次就多复制一个形象，
+    // 沙箱里越攒越多（实测攒到 9 个），而那些副本会让别的套件
+    // （verify-pet-editor 按「第一个可写的逐帧形象」挑目标）挑错对象。
+    // 因此认名字：复制出来的形象名字固定是 'ux3 fixture'。
+    const existing = (list.items || []).find((i) => i.name === 'ux3 fixture');
     if (!existing) {
       const made = await api('/pets/solid-grid-2x1-p2/copy', {
         method: 'POST', body: { name: 'ux3 fixture' },
       });
-      const id = made && made.pet ? made.pet.id : '';
-      if (id) window.localStorage.setItem('ux3-fixture-id', id);
-      return id;
+      return made && made.pet ? made.pet.id : '';
     }
-    window.__ux3Pet = remembered;
+    window.__ux3Pet = existing.id;
     // 已经在了：清掉上一轮留下的多余套，并合并回一页
     for (let guard = 0; guard < 8; guard += 1) {
       const pv = await api('/pets/${TEST_PET}/preview', { method: 'GET' });
@@ -556,6 +559,116 @@ try {
     '④ 固定之后预览仍在正常播放（挪动没有把播放器弄死）',
     playing.distinct >= 2 && playing.hasImage,
     `${playing.distinct} 个不同帧位（有图=${playing.hasImage}）: ${playing.samples.join(' | ')}`,
+  );
+
+  // ============================================ ⑤ 预览联动
+  //
+  // 用户要求：「我在调整动画的时候一般是每个动作都看一遍……我换一个动作的
+  // 调整参数时，需要从上面更换预览动画，或者点击一次应用预览才能看到当前
+  // 动作的动画效果，这个我觉得可以直接联动吧，点击某个动作的动作参数右侧的
+  // 预览动画跟着变化，在动画参数里面切换不同套动画时，右侧也跟着变化」。
+  //
+  // ⚠️ 联动只对**可写**形象有意义（内置形象不渲染「动画参数」按钮），
+  // 因此这一段要在夹具（自建）上验。
+  await openPanel(page, TEST_PET);
+  const linkage = await page.evaluate(`(async () => {
+    const tiles = [...document.querySelectorAll('.plugin-stm-pet .pet-action-tile')];
+    const target = tiles.find((t) => {
+      const name = t.querySelector('.pet-action-name');
+      return name && name.textContent.trim() === '下落';
+    });
+    if (!target) return { error: '找不到「下落」的卡片' };
+    const button = [...target.querySelectorAll('button')]
+      .find((b) => b.textContent.trim() === '动画参数');
+    if (!button) return { error: '这张卡片没有「动画参数」按钮（形象可写吗？）' };
+    const before = document.querySelector('.plugin-stm-pet .pet-preview-name').textContent.trim();
+    button.click();
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    return {
+      before,
+      after: document.querySelector('.plugin-stm-pet .pet-preview-name').textContent.trim(),
+      editor: Boolean(document.querySelector('.plugin-stm-pet .pet-action-editor')),
+    };
+  })()`);
+  record(
+    '⑤ ★ 点某个动作的「动画参数」，右侧预览**跟着切过去**',
+    !linkage.error && linkage.editor && linkage.after === '下落' && linkage.before !== '下落',
+    linkage.error
+      ? linkage.error
+      : `预览「${linkage.before}」→「${linkage.after}」，编辑区=${linkage.editor}`,
+  );
+
+  // 编辑区里切换套 → 预览也跟着切
+  const variantLink = await page.evaluate(`(async () => {
+    const picks = [...document.querySelectorAll('.plugin-stm-pet [data-editor-variant]')];
+    if (picks.length < 2) return { skipped: true, count: picks.length };
+    picks[1].click();
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const active = document.querySelector('.plugin-stm-pet [data-preview-variant].is-active');
+    return {
+      count: picks.length,
+      previewActive: active ? active.textContent.trim() : null,
+    };
+  })()`);
+  record(
+    '⑤ ★ 编辑区里切换第 N 套，右侧预览**跟着切那一套**',
+    variantLink.skipped
+      ? true // 夹具这一套只有一套动画时跳过（不算失败）
+      : Boolean(variantLink.previewActive && variantLink.previewActive.includes('第 2 套')),
+    variantLink.skipped
+      ? `夹具的这个动作只有 ${variantLink.count} 套，跳过`
+      : `预览选中「${variantLink.previewActive}」`,
+  );
+
+  // ============================================ ⑥ 文案精简
+  //
+  // 用户反馈：「屏幕上会显示特别多的讲解文字……目前的写法看着实在是啰嗦，
+  // 完全不象一个成熟的软件应有的实现」。
+  //
+  // 判据：详情页里**不该有超过 40 个字**的提示行——那种长度只可能是
+  // 「复述标签 / 解释显而易见 / 为设计辩护」，而不是防错信息。
+  const copy = await page.evaluate(`(() => {
+    const nodes = [...document.querySelectorAll(
+      '.plugin-stm-pet .pet-panel-detail .pet-field-hint, '
+      + '.plugin-stm-pet .pet-panel-detail .pet-notice-body',
+    )];
+    const texts = nodes.map((n) => n.textContent.trim()).filter(Boolean);
+    return {
+      total: texts.length,
+      longest: texts.map((t) => t.length).sort((a, b) => b - a).slice(0, 3),
+      offenders: texts.filter((t) => t.length > 40).slice(0, 3),
+    };
+  })()`);
+  record(
+    '⑥ ★ 详情页的提示文案都压短了（没有超过 40 字的长句）',
+    copy.offenders.length === 0,
+    `共 ${copy.total} 条提示，最长的三条长度 ${JSON.stringify(copy.longest)}`
+    + (copy.offenders.length ? `；过长：${JSON.stringify(copy.offenders)}` : ''),
+  );
+
+  // ============================================ ⑦ 单帧尺寸要准确
+  //
+  // 用户指出：「我注意到小卡显示单帧尺寸 384 × 576px，但是世界上不同动作
+  // 可能不同，这个写法其实是不对的」——确实不对：小卡的 `sleep` 是
+  // 627 × 353（躺姿横构图）。
+  const sizeText = await page.evaluate(`(async () => {
+    // 切到内置的小卡（它的 sleep 尺寸与其余动作不同）
+    const cards = [...document.querySelectorAll('.plugin-stm-pet .pet-card')];
+    const card = cards.find((c) => c.dataset.petId === 'xiaoka');
+    if (card) card.click();
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    const hints = [...document.querySelectorAll('.plugin-stm-pet .pet-panel-detail .pet-field-hint')]
+      .map((n) => n.textContent.trim())
+      .filter((t) => t.includes('单帧尺寸'));
+    return { hints };
+  })()`);
+  record(
+    '⑦ ★ 单帧尺寸**说准了**（动作尺寸不一致时把差异列出来）',
+    sizeText.hints.length > 0
+      && sizeText.hints[0].includes('384')
+      && sizeText.hints[0].includes('627')
+      && sizeText.hints[0].includes('睡觉'),
+    JSON.stringify(sizeText.hints),
   );
 
   record(

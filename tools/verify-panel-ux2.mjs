@@ -306,7 +306,10 @@ try {
   })()`);
   record(
     '④ ★ 面板用「套」说多套动画（预览区与编辑区口径一致）',
-    naming.switcherText.includes('多套')
+    // ⚠️ 判据是**口径一致**（两处都叫「套」），不是某句引导语。
+    // 用户反馈讲解文字太啰嗦，那句「这一动作有多套动画，按权重随机播：」
+    // 被压成了「按权重随机播：」——按钮上的「第 N 套」才是口径本身。
+    naming.switcherChoices.length >= 2
       && naming.switcherChoices.every((t) => t.includes('套'))
       && variantHint.includes('套'),
     `预览区切换器=${JSON.stringify(naming.switcherChoices)}；`

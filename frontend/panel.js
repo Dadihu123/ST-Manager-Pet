@@ -74,19 +74,19 @@ const SCHEDULE_BEHAVIORS = [
   {
     key: 'idle',
     label: '待机小动作',
-    hint: '闲着的时候偶尔动一下。数值越小越活泼，越大越安静。',
+    hint: '越小越活泼。',
   },
   {
     key: 'roam',
     label: '自动漫游',
-    hint: '闲着的时候自己在屏幕底部走一走。关掉上面「外观」里的「自动漫游」后这项不生效。',
+    hint: '关掉「外观 → 自动漫游」后不生效。',
   },
   {
     key: 'sleep',
     label: '打盹',
     isThreshold: true,
-    hint: '多久没人理它就睡着（睡着后任何操作都会把它唤醒）。'
-      + '睡着动画会在当前动作播完之后才开始，不会打断它。',
+    hint: '多久没人理它就睡着。'
+      + '会在当前动作播完后才开始。',
   },
 ];
 
@@ -167,7 +167,7 @@ function formatSpeed(value) {
  * 「一次待机动画大约播多久」才是用户真正在意的。
  */
 function buildSpeedHint(value, declared) {
-  const base = '越大越慢：1× 按形象包声明的帧率播放，2× 表示播放时间翻倍。';
+  const base = '越大越慢。';
   const tail = declared !== 1 ? `形象包建议 ${formatSpeed(declared)}。` : '';
   return base + tail;
 }
@@ -351,15 +351,15 @@ const HELP_SECTIONS = [
       {
         term: '每动作换图（覆盖）',
         body: '单独替换某个动作的图，不改形象包本身。内置形象也能用。',
-        recommend: '只想换个待机图时用它，比复制整个形象轻。'
-          + '内置形象上遗留的覆盖不会生效（插件会提示并让你一键清理）。',
+        recommend: '只换待机图，比复制整个形象轻。'
+          + '内置形象上的遗留覆盖不会生效。',
       },
       {
         term: '勿扰与播报开关',
-        body: '在「设置 → 插件 → 桌面宠物」里，是全局的：'
-          + '控制要不要弹提示，与是哪只宠物无关。',
-        recommend: '宠物自己的行为参数（大小、速度、触发时间…）都在这个面板里'
-          + '按形象设置，两处不会互相打架。',
+        body: '全局设置。'
+          + '与是哪只宠物无关。',
+        recommend: '宠物自己的行为参数都在这个面板里。'
+          + '按形象设置。',
       },
     ],
   },
@@ -850,9 +850,9 @@ export function createSettingsPanel({
       'div',
       'pet-field-hint',
       hidden
-        ? '屏幕上不会显示宠物，也不会占用任何动画资源。'
-          + '插件仍然启用——想让它回来，点右边的「显示宠物」即可。'
-        : '不想看到它时可以在右边把它关掉，不必卸载或停用插件。',
+        ? '不显示宠物，也不占动画资源。'
+          + '插件仍然启用，随时可以显示回来。'
+        : '',
     ));
     box.appendChild(copy);
 
@@ -1583,7 +1583,7 @@ export function createSettingsPanel({
       list.appendChild(box);
     }
     if (!pets.length) {
-      list.appendChild(el('div', 'pet-empty', '还没有形象。点击「导入形象包」上传一个 .zip。'));
+      list.appendChild(el('div', 'pet-empty', '还没有形象。点「导入形象包」上传 .zip。'));
     }
     for (const pet of pets) {
       list.appendChild(renderPetCard(pet));
@@ -1900,7 +1900,7 @@ export function createSettingsPanel({
     const wrap = el('div', 'pet-panel-detail');
 
     if (!selectedId || !detail) {
-      wrap.appendChild(el('div', 'pet-empty', '从左侧选择一个形象查看详情。'));
+      wrap.appendChild(el('div', 'pet-empty', '从左侧选一个形象。'));
       return wrap;
     }
 
@@ -1944,11 +1944,24 @@ export function createSettingsPanel({
       box.appendChild(el('div', 'pet-notice-body', detail.idMismatch.hint));
       header.appendChild(box);
     }
-    if (detail.size) {
+    // ---- 单帧尺寸
+    //
+    // ⚠️ 这里**不能**写「单帧尺寸 384 × 576px」了事。
+    //
+    // 用户指出：「我注意到小卡显示单帧尺寸 384 × 576px，但是世界上不同动作
+    // 可能不同，这个写法其实是不对的」——确实不对：小卡的 `sleep` 是
+    // **627 × 353**（躺姿是横构图），其余动作才是 384 × 576。
+    // 只报包级那个数会让人以为所有动作都那么大，而「躺下睡觉」恰恰是
+    // 作者最容易搞错尺寸的地方。
+    //
+    // 因此：动作尺寸**一致**时才报一个数；不一致时报「多数是什么 + 哪几个不同」，
+    // 并把逐动作的尺寸交给下面每个动作卡片自己显示（那里才是它该在的位置）。
+    const sizes = collectFrameSizes(detail);
+    if (sizes.length) {
       header.appendChild(el(
         'div',
         'pet-field-hint',
-        `单帧尺寸 ${detail.size.w} × ${detail.size.h}px（不必是正方形）`,
+        describeFrameSizes(sizes, detail.size),
       ));
     }
 
@@ -1963,12 +1976,10 @@ export function createSettingsPanel({
       box.appendChild(el(
         'div',
         'pet-field-hint',
-        '这些动作会退化为「只移动位置、不播放动画」，宠物仍然可用；'
-        + '想让它在这些状态下也有动作，可以单独给对应动作上传一张图。',
+        '缺的动作会退化为只移动位置、不播动画。'
+        + '可以单独给它们上传图。',
       ));
       header.appendChild(box);
-    } else {
-      header.appendChild(el('div', 'pet-field-hint', '所有必要动作齐全。'));
     }
 
     const actions = el('div', 'pet-panel-toolbar');
@@ -1991,7 +2002,7 @@ export function createSettingsPanel({
       //      ——复制到 `resources/pets/` 下仍然只读，改 id、改 author 都没用。
       // 这个按钮由后端生成合法 id 并落到 `data/pets/`，一次做对。
       actions.appendChild(button('复制为我的形象', 'is-primary', () => copyPet(selectedId)));
-      actions.appendChild(el('span', 'pet-card-meta', '插件自带，形象内容不可修改'));
+      actions.appendChild(el('span', 'pet-card-meta', '插件自带，只读'));
     }
     header.appendChild(actions);
     wrap.appendChild(header);
@@ -2034,15 +2045,13 @@ export function createSettingsPanel({
       section.appendChild(el(
         'div',
         'pet-field-hint',
-        '点每个动作的「换图」可单独替换该动作（不改动形象包本身）；'
-        + '「恢复」会回到包内的原图。',
-      ));
+        '「换图」只替换这个动作，不改动形象包。'
+        ));
     } else {
       section.appendChild(el(
         'div',
         'pet-field-hint',
-        '插件自带形象的内容是只读的，因此不提供换图；'
-        + '想要自己的版本，可以用「新建形象」做一个。',
+        + '只读。想要自己的版本请先复制。',
       ));
     }
 
@@ -2153,12 +2162,10 @@ export function createSettingsPanel({
       {
         value: false,
         label: '平滑（插画 / 真人）',
-        hint: '放大时做插值，边缘柔和',
       },
       {
         value: true,
         label: '像素风（硬边）',
-        hint: '放大时保持硬边，不糊',
       },
     ];
     for (const mode of modes) {
@@ -2178,7 +2185,7 @@ export function createSettingsPanel({
     renderField.appendChild(el(
       'div',
       'pet-field-hint',
-      '写实插画与真人形象建议用「平滑」——硬边放大时会出现块状锯齿；'
+      '写实插画用「平滑」，像素风用「硬边」。'
       + '像素风形象用「硬边」才不会糊。'
       + (detail.declaredPixelated ? '（形象包声明为像素风）' : ''),
     ));
@@ -2253,7 +2260,7 @@ export function createSettingsPanel({
     roamField.appendChild(el(
       'div',
       'pet-field-hint',
-      '关掉之后这个形象不会自己走动（走动的间隔仍在下面「触发时间」里调）。'
+      '关掉后不会自己走动。'
       + (detail.declaredAutoRoam === false ? '（形象包声明为不漫游）' : ''),
     ));
     section.appendChild(roamField);
@@ -2286,7 +2293,7 @@ export function createSettingsPanel({
       field.appendChild(el(
         'div',
         'pet-field-hint',
-        '插件自带的形象，作者由随包资源固定。',
+        '插件自带，作者固定。',
       ));
       return field;
     }
@@ -2317,8 +2324,7 @@ export function createSettingsPanel({
     field.appendChild(el(
       'div',
       'pet-field-hint',
-      '会写进形象的 pet.json，导出形象包时一起带走——'
-      + '别人拿到这个包就能看到是谁做的。',
+      '导出形象包时一起带走。',
     ));
     return field;
   }
@@ -2432,8 +2438,7 @@ export function createSettingsPanel({
     const section = renderCollapsible('物理参数', {
       key: 'physics',
       badge: '进阶',
-      hint: '重力、走速、摩擦、终端速度、弹性。调坏了宠物会变得很怪，'
-        + '但改动是立刻看得见的，所以放心试——点「恢复默认」随时能回来。',
+      hint: '调坏了宠物会变怪，但改动立刻看得见，也能一键恢复。',
     });
 
     const current = detail.physics || {};
@@ -2446,7 +2451,7 @@ export function createSettingsPanel({
         max: 20000,
         step: 50,
         fallback: 1800,
-        hint: '默认 1800。调大 = 掉得更急；小于 400 会明显像在月球上。',
+        hint: '默认 1800。小于 400 会明显像在月球上。',
       },
       {
         key: 'walkSpeed',
@@ -2456,7 +2461,7 @@ export function createSettingsPanel({
         max: 2000,
         step: 5,
         fallback: 60,
-        hint: '默认 60。小宠物（64px）用 30~50，大立绘用 80~150。',
+        hint: '默认 60。小宠物用 30~50，大立绘用 80~150。',
       },
       {
         key: 'friction',
@@ -2466,8 +2471,8 @@ export function createSettingsPanel({
         max: 1,
         step: 0.01,
         fallback: 0.02,
-        hint: '默认 0.02（走停约 0.4 秒）。越小刹车越快；'
-          + '0.5 以上会「刹不住」。',
+        hint: '默认 0.02。越小刹车越快；'
+          + '0.5 以上会刹不住。',
       },
       {
         key: 'terminalVelocity',
@@ -2477,7 +2482,7 @@ export function createSettingsPanel({
         max: 20000,
         step: 50,
         fallback: 2400,
-        hint: '默认 2400。下落速度的上限，防止一帧掉太远。',
+        hint: '默认 2400。防止一帧掉太远。',
       },
       {
         key: 'bounce',
@@ -2487,7 +2492,7 @@ export function createSettingsPanel({
         max: 1,
         step: 0.01,
         fallback: 0.15,
-        hint: '默认 0.15（轻轻一顿）。0.4 以上会像皮球，0 则「啪」地贴地。',
+        hint: '默认 0.15。0.4 以上会像皮球。',
       },
     ];
 
@@ -2531,7 +2536,7 @@ export function createSettingsPanel({
     section.body.appendChild(el(
       'div',
       'pet-field-hint',
-      '这些值写在这个形象包里，只影响它自己。',
+      '只影响这个形象。',
     ));
     return section;
   }
@@ -2547,8 +2552,8 @@ export function createSettingsPanel({
     const section = renderCollapsible('锚点与单帧尺寸', {
       key: 'anchor',
       badge: '进阶',
-      hint: '锚点是「脚底」在单帧里的相对位置（0 = 最上/最左，1 = 最下/最右）。'
-        + '宠物站立、呼吸、缩放都以此为原点。调错的后果一眼就能看出来。',
+      hint: '脚底在单帧里的相对位置。'
+        + '调错的后果一眼就能看出来。',
     });
 
     const anchor = detail.anchor || {};
@@ -2557,7 +2562,7 @@ export function createSettingsPanel({
     const anchorRow = el('div', 'pet-editor-row');
     anchorRow.appendChild(editorNumber({
       label: '锚点 X',
-      hint: '0 = 最左，1 = 最右；一般 0.5',
+      hint: '0 = 最左，1 = 最右',
       value: Number.isFinite(Number(anchor.x)) ? Number(anchor.x) : 0.5,
       min: 0,
       max: 1,
@@ -2566,7 +2571,7 @@ export function createSettingsPanel({
     }));
     anchorRow.appendChild(editorNumber({
       label: '锚点 Y',
-      hint: '0 = 最上，1 = 最下；脚底一般 0.95~1',
+      hint: '0 = 最上，1 = 最下；一般 0.95~1',
       value: Number.isFinite(Number(anchor.y)) ? Number(anchor.y) : 1,
       min: 0,
       max: 1,
@@ -2578,7 +2583,6 @@ export function createSettingsPanel({
     const sizeRow = el('div', 'pet-editor-row');
     sizeRow.appendChild(editorNumber({
       label: '单帧宽',
-      hint: '像素',
       value: Number(size.w) || 64,
       min: 1,
       max: 1024,
@@ -2587,7 +2591,6 @@ export function createSettingsPanel({
     }));
     sizeRow.appendChild(editorNumber({
       label: '单帧高',
-      hint: '像素',
       value: Number(size.h) || 64,
       min: 1,
       max: 1024,
@@ -2599,7 +2602,7 @@ export function createSettingsPanel({
     section.body.appendChild(el(
       'div',
       'pet-field-hint',
-      '单帧尺寸是一张贴图里单帧的大小，不是整张 spritesheet 的大小。',
+      '是一张贴图里单帧的大小，不是整张 spritesheet。',
     ));
     const bar = el('div', 'pet-panel-toolbar');
     bar.appendChild(button('恢复默认锚点', 'is-icon', () => {
@@ -2651,9 +2654,7 @@ export function createSettingsPanel({
       key: 'schedule',
       badge: '可调节',
       defaultOpen: true,
-      hint: '只有「由时间自己发生」的行为能设间隔。点击、下落、播报这些由事件'
-        + '触发，没有「多久一次」可言。这三项都是按形象记住的，'
-        + '换形象会自动切回它自己的设置。',
+      hint: '只有由时间驱动的行为能设间隔。按形象记住。',
     });
 
     const effective = detail.schedule || {};
@@ -2790,10 +2791,10 @@ export function createSettingsPanel({
       'pet-card-meta',
       detail.writable
         ? (detail.scheduleOverridden
-          ? '已自定义（存在这个形象的 pet.json 里，导出时一起走）'
-          : '正在用内置默认值（改动会写进 pet.json，导出时一起走）')
+          ? '已自定义（写进 pet.json）'
+          : '默认值（改动会写进 pet.json）')
         : (detail.scheduleOverridden
-          ? '已自定义（插件自带的形象改不了包，这个值存在本机设置里）'
+          ? '已自定义（内置形象，存在本机设置里）'
           : '正在用形象包声明的节奏'),
     ));
 
@@ -2834,8 +2835,7 @@ export function createSettingsPanel({
         const box = el('div', 'pet-notice is-info');
         box.appendChild(el('div', 'pet-notice-title', '你改过这里的设置'));
         box.appendChild(el('div', 'pet-notice-body',
-          '你的设置会一直保留——形象包更新不会覆盖它。'
-          + '如果作者后来调过推荐值，这里能看出差别：'));
+          + '形象包现在的建议：'));
         for (const line of diffs) {
           box.appendChild(el('div', 'pet-field-hint', line));
         }
@@ -2882,8 +2882,8 @@ export function createSettingsPanel({
       'span',
       'pet-card-meta',
       previewFloating
-        ? '预览已固定——滚动设置时它不会跟着走，可以边调边看'
-        : '固定之后预览会浮在面板右侧，改参数时不必来回滚动',
+        ? '已固定'
+        : '',
     ));
     return row;
   }
@@ -2897,8 +2897,7 @@ export function createSettingsPanel({
     section.appendChild(el(
       'div',
       'pet-field-hint',
-      '点任意动作即可在这里播放，用来核对动作效果与节奏。'
-      + '播放规则与桌面上的宠物一致（含每帧时长），因此所见即所得。',
+      '点动作即可播放。'
     ));
 
     const spec = previewSpec();
@@ -3035,7 +3034,7 @@ export function createSettingsPanel({
     const variants = (entry && entry.variants) || [];
     if (variants.length > 1) {
       const row = el('div', 'pet-preview-variants');
-      row.appendChild(el('span', 'pet-field-hint', '这一动作有多套动画，按权重随机播：'));
+      row.appendChild(el('span', 'pet-field-hint', '按权重随机播：'));
       variants.forEach((variant, at) => {
         const node = el(
           'button',
@@ -3113,7 +3112,7 @@ export function createSettingsPanel({
     side.appendChild(el(
       'div',
       'pet-field-hint',
-      '数值越大越慢。这里只影响预览；桌面上的宠物请在「外观 → 动画速度」里按形象调。',
+      '只影响预览。',
     ));
 
     // ---- 帧读数
@@ -3252,8 +3251,8 @@ export function createSettingsPanel({
     box.appendChild(el(
       'div',
       'pet-field-hint',
-      '插件自带的形象现在是只读的，这些图不会再生效，但它们仍占着数据目录。'
-      + '清理只删除你自己上传的覆盖文件，不会动插件自带的图。',
+      '内置形象只读，这些覆盖不会生效，但仍占着数据目录。'
+      + '只删你上传的覆盖文件。',
     ));
     const row = el('div', 'pet-panel-toolbar');
     row.appendChild(button('清理这些文件', 'is-danger', () => clearLegacyOverrides()));
@@ -3392,9 +3391,25 @@ export function createSettingsPanel({
       // 用户要求：「比如我想调整下不同动作的帧率，每帧之间的间隔，
       // 结果发现没有入口，目前只能去直接修改 pet.json 里面的值」。
       // 这个按钮就是那个入口——**只对自建形象开放**（内置形象先复制）。
+      //
+      // ★ 打开编辑区时**把预览也切到这个动作**。
+      //
+      // 用户要求：「我在调整动画的时候一般是每个动作都看一遍……我换一个动作的
+      // 调整参数时，需要从上面更换预览动画，或者点击一次应用预览才能看到当前
+      // 动作的动画效果，这个我觉得可以直接联动吧」。
+      //
+      // 预览框是「你在改什么就看什么」——用户点了某个动作的参数，
+      // 他要看的就是那个动作，没有理由让他再去上面点一次。
       row.appendChild(button('动画参数', 'is-icon', () => {
-        editingAction = editingAction === entry.action ? '' : entry.action;
+        const opening = editingAction !== entry.action;
+        editingAction = opening ? entry.action : '';
         actionDraft = editingAction ? buildActionDraft(entry) : null;
+        if (opening) {
+          previewAction = entry.action;
+          previewVariant = 0;
+          // 草稿只是「还没保存的改动」，切动作时不该带着上一条动作的覆盖
+          previewOverride = null;
+        }
         render();
       }));
       if (entry.overridden) {
@@ -3590,6 +3605,17 @@ export function createSettingsPanel({
           // 切换当前编辑的那一套。**草稿按套各存一份**，因此切回来时
           // 之前改的东西还在（不会因为看了一眼第 2 套就丢掉第 1 套的修改）。
           actionDraft.active = index;
+          // ★ 预览跟着切到这一套。
+          //
+          // 用户要求：「在动画参数里面切换不同套动画时，右侧也跟着变化，
+          // 这样应该就更易用」。与「点动作参数就切预览」同一条道理——
+          // 你在看哪一套，预览就该是哪一套。
+          //
+          // 草稿覆盖要跟着清掉：那份覆盖是给**上一套**的，留着会让
+          // 第 2 套按第 1 套的节奏播（而两套的节奏本来就允许不同）。
+          previewAction = entry.action;
+          previewVariant = index;
+          previewOverride = null;
           render();
         });
         row.appendChild(node);
@@ -3610,7 +3636,7 @@ export function createSettingsPanel({
         'div',
         'pet-field-hint',
         describeVariant(variantEntryAt(entry, 0), 0)
-        + '（目前只有这一套。想让这个动作随机播几种不同反应，用下面的「加一套动画」）',
+        + '目前只有这一套。',
       ));
     }
 
@@ -3635,7 +3661,7 @@ export function createSettingsPanel({
       'pet-card-meta',
       count > 1
         ? `这个动作有 ${count} 套，每次触发按权重随机选一套`
-        : '加一套之后，这个动作每次触发会按权重随机选一套播',
+        : '加一套之后按权重随机播。',
     ));
     box.appendChild(variantTools);
 
@@ -3646,9 +3672,7 @@ export function createSettingsPanel({
       box.appendChild(el(
         'div',
         'pet-field-hint',
-        '这个动作是动图容器（由浏览器播放 Gif / WebP），不切帧，'
-        + '因此帧率、每帧时长、循环、帧数、排布对它都没有意义。'
-        + '能调的是下面的权重与程序化运动。',
+        '动图容器（浏览器播放），不切帧——帧率 / 帧数 / 排布对它都没有意义。',
       ));
     }
 
@@ -3664,9 +3688,7 @@ export function createSettingsPanel({
       box.appendChild(el(
         'div',
         'pet-field-hint',
-        `这一套的帧分成 ${pages} 页存放（为了省显存），播放时是连续的——`
-        + '这与上面的「多套」不同：多套是互相替代的几套动画，'
-        + '多页是同一套动画的帧分散在几个文件里。',
+        `这一套的帧分成 ${pages} 页存放，播放时是连续的（「套」才是互相替代的）。`,
       ));
     }
 
@@ -3757,8 +3779,7 @@ export function createSettingsPanel({
       box.appendChild(el(
         'div',
         'pet-field-hint',
-        '单位毫秒。开启后每帧单独设停顿时间（帧率会被忽略）——'
-        + '例如 400 / 300 / 300 / 600，最后一帧多停一会再循环，看起来比匀速自然。',
+        '逐帧设停顿（帧率被忽略），如 400 / 300 / 300 / 600。',
       ));
     }
 
@@ -3767,7 +3788,6 @@ export function createSettingsPanel({
       const row2 = el('div', 'pet-editor-row');
       row2.appendChild(editorNumber({
         label: '帧数',
-        hint: '一张图里有多少帧',
         value: draft.frames,
         min: 1,
         max: 1024,
@@ -3860,10 +3880,7 @@ export function createSettingsPanel({
       pageField.appendChild(el(
         'div',
         'pet-field-hint',
-        `这一套现在有 ${pagesNow} 页、共 ${framesNow} 帧`
-        + `（每页约 ${Math.max(1, Math.round(framesNow / Math.max(1, pagesNow)))} 帧）。`
-        + '拆页只影响解码时的峰值显存，播放顺序与观感完全不变；'
-        + '填 1 就是合并回一页。',
+        `${pagesNow} 页 / ${framesNow} 帧，只影响解码峰值显存。填 1 合并回一页。`,
       ));
       box.appendChild(pageField);
     }
@@ -3877,7 +3894,7 @@ export function createSettingsPanel({
       const row3 = el('div', 'pet-editor-row');
       row3.appendChild(editorNumber({
         label: `第 ${actionDraft.active + 1} 套的权重`,
-        hint: '相对比例：都填 5 就是各一半；填 5 与 1 就是 5/6 与 1/6',
+        hint: '相对比例，不是百分比',
         value: draft.weight,
         min: 0,
         max: 1000,
@@ -3933,7 +3950,7 @@ export function createSettingsPanel({
       blinkField.appendChild(el(
         'div',
         'pet-field-hint',
-        '要填真的有闭眼的那几帧（从 0 开始数），否则会把睁眼帧当成眨眼。',
+        '填真的有闭眼的那几帧（从 0 开始数）。',
       ));
       box.appendChild(blinkField);
     }
@@ -3977,7 +3994,7 @@ export function createSettingsPanel({
       box.appendChild(el(
         'div',
         'pet-field-hint',
-        '预览框里正在用未保存的草稿播放。满意之后点「保存」写进形象包。',
+        '正在用未保存的草稿播放。',
       ));
     }
     return box;
@@ -4047,16 +4064,16 @@ export function createSettingsPanel({
     if (spec.animated) {
       const count = Number(spec.animatedFrames) || 1;
       return `判为动图容器（${ext ? `.${ext} ` : ''}文件里 ${count} 帧）——`
-        + '由浏览器整段播放，因此没有逐帧控制。';
+        + '浏览器整段播放，无逐帧控制。';
     }
     // 静态 WebP 特别值得说一句：它与动图 WebP 的字节头**完全一样**，
     // 用户很容易以为「.webp 就是动图」。
     if (ext === 'webp') {
-      return '判为帧序列图（这个 .webp 里只有 1 帧，虽然格式支持动图）——'
-        + '按下面的帧数与排布逐帧播放。';
+      return '帧序列图（这个 .webp 只有 1 帧）——'
+        + '按帧数与排布逐帧播放。';
     }
     if (ext === 'gif') {
-      return '判为帧序列图（这个 .gif 里只有 1 帧）——按帧数与排布逐帧播放。';
+      return '帧序列图（这个 .gif 只有 1 帧）——按帧数与排布播放。';
     }
     return '';
   }
@@ -4103,6 +4120,55 @@ export function createSettingsPanel({
     }));
     box.appendChild(row);
     return box;
+  }
+
+  /**
+   * 收集这个形象里**每一个动作（每一套）实际用的单帧尺寸**。
+   *
+   * 为什么要逐动作收集：`pet.json` 的包级 `size` 只是**默认值**，
+   * 每个动作都能自带尺寸。小卡就是活例子——`sleep` 是 627×353（躺姿横构图），
+   * 其余动作是 384×576。只报包级那个数会让人以为所有动作一样大。
+   *
+   * @returns {Array<{key: string, w: number, h: number, actions: string[]}>}
+   *   按「用它的动作数」从多到少排；`key` 是 `"宽x高"` 便于去重。
+   */
+  function collectFrameSizes(detail) {
+    const map = new Map();
+    const fallback = detail && detail.size;
+    for (const entry of (detail && detail.actions) || []) {
+      const variants = entry.variants || [];
+      // 一套都没有时（没图）不参与统计——它没有尺寸可言
+      for (const one of variants) {
+        const size = one.size || fallback;
+        if (!size || !size.w || !size.h) continue;
+        const key = `${size.w}x${size.h}`;
+        if (!map.has(key)) {
+          map.set(key, { key, w: Number(size.w), h: Number(size.h), actions: [] });
+        }
+        const bucket = map.get(key);
+        const label = ACTION_LABELS[entry.action] || entry.action;
+        if (!bucket.actions.includes(label)) bucket.actions.push(label);
+      }
+    }
+    return [...map.values()].sort((a, b) => b.actions.length - a.actions.length);
+  }
+
+  /**
+   * 把 `collectFrameSizes()` 的结果写成一句**准确**的话。
+   *
+   * 一致时只说一个数；不一致时说明「多数是多大、哪几个不同」——
+   * 而不是含糊地报一个包级默认值（那正是用户指出的错）。
+   */
+  function describeFrameSizes(sizes, fallback) {
+    if (!sizes.length) return '';
+    const main = sizes[0];
+    if (sizes.length === 1) {
+      return `单帧尺寸 ${main.w} × ${main.h}px`;
+    }
+    const others = sizes.slice(1)
+      .map((one) => `${one.w} × ${one.h}（${one.actions.join('、')}）`)
+      .join('，');
+    return `单帧尺寸多数是 ${main.w} × ${main.h}px，另有 ${others}`;
   }
 
   /**
@@ -4246,8 +4312,7 @@ export function createSettingsPanel({
     const frames = await askNumber({
       title: `给「${ACTION_LABELS[action] || action}」加一套动画`,
       label: '这一套有几帧？',
-      hint: '按你选的图里的帧数填。单张图填 1；横排/竖排/网格的 spritesheet '
-        + '填总帧数（排布可以在加完之后到「排布」里调）。',
+      hint: '单张图填 1；spritesheet 填总帧数。',
       value: 1,
       min: 1,
       max: 1024,
@@ -4331,7 +4396,7 @@ export function createSettingsPanel({
     }
     if (target > 1 && now > 1) {
       setNotice('warn',
-        '这一套已经拆过页了。要改页数请先填 1 合并回一页，再按新页数拆。');
+        '已拆过页。改页数请先填 1 合并。');
       return;
     }
     const ok = await askConfirm({
@@ -4339,7 +4404,7 @@ export function createSettingsPanel({
         ? `把第 ${index + 1} 套合并回一页？`
         : `把第 ${index + 1} 套拆成 ${target} 页？`,
       body: target === 1
-        ? '会把各页拼回一张图，并删掉原来的页文件。播放效果不变，'
+        ? '把各页拼回一张图，并删掉原页文件。'
           + '只是解码峰值显存回到原来那么多。'
         : `会按行把这一套的图切成 ${target} 份、写成 ${target} 个文件，`
           + '并把这一套改成多页。播放顺序与观感完全不变，'
@@ -4471,7 +4536,7 @@ export function createSettingsPanel({
     header.appendChild(el(
       'div',
       'pet-field-hint',
-      '给每个动作上传一张图即可。单帧尺寸从「待机」推导，其它动作会自动对齐，'
+      '单帧尺寸从「待机」推导，其它动作自动对齐。'
       + '所以不必自己裁成统一尺寸；形象也不要求是正方形。',
     ));
 
@@ -4501,7 +4566,7 @@ export function createSettingsPanel({
     authorField.appendChild(el(
       'div',
       'pet-field-hint',
-      '会写进形象的 pet.json，导出形象包时一起带走。'
+      '导出形象包时一起带走。'
       + '想让别人知道这个宠物是谁做的，就填上。',
     ));
     header.appendChild(authorField);
@@ -4513,8 +4578,8 @@ export function createSettingsPanel({
     section.appendChild(el(
       'div',
       'pet-field-hint',
-      '「待机」是唯一必须的：其它动作缺失时会自动回退到它。'
-      + '若一张图里横向排了多帧动画，把帧数填上即可。',
+      '唯一必须的动作；其余缺失时回退到它。'
+      + '横向排了多帧就填帧数。',
     ));
 
     for (const item of CREATABLE_ACTIONS) {
@@ -4555,7 +4620,7 @@ export function createSettingsPanel({
     scaleField.appendChild(el(
       'div',
       'pet-field-hint',
-      '创建后仍可在形象详情里随时调整，并且是按形象记住的。',
+      '创建后仍可随时调整。',
     ));
     look.appendChild(scaleField);
 
@@ -4593,7 +4658,7 @@ export function createSettingsPanel({
         render();
         return;
       }
-      confirmDiscardCreate('新建表单里已经填了内容，放弃之后就要重新来一遍。', () => {
+      confirmDiscardCreate('表单里已经填了内容，放弃后要重新来。', () => {
         abandonCreate();
         render();
       });
@@ -4648,9 +4713,9 @@ export function createSettingsPanel({
     section.appendChild(el(
       'div',
       'pet-field-hint',
-      '不播放动画时显示的那一帧（也就是平时静止的姿势）。'
-      + '不设就回落到「待机」的第一帧——若待机挂了两套动画，'
-      + '那个回落值可能是个怪姿势，因此建议显式选一张。',
+      '不播放动画时显示的那一帧。'
+      + '不设就回落到「待机」第一帧；若待机有两套，'
+      + '那个值可能是个怪姿势，建议显式选一张。',
     ));
 
     const row = el('div', 'pet-choice-row');
@@ -4733,7 +4798,7 @@ export function createSettingsPanel({
       pick.appendChild(el(
         'div',
         'pet-field-hint',
-        '会按形象的单帧尺寸自动缩放居中，不必自己裁。',
+        '会按单帧尺寸自动缩放居中。',
       ));
       section.appendChild(pick);
     }
@@ -4756,7 +4821,7 @@ export function createSettingsPanel({
     section.appendChild(el(
       'div',
       'pet-field-hint',
-      '闲着的时候多久自己动一次。不填就用默认值'
+      '多久自己动一次。'
       + '（待机小动作 6~18 秒、自动漫游 3~9 秒），大多数形象不需要改。',
     ));
 

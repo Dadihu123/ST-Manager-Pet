@@ -40,6 +40,19 @@ function record(name, ok, detail = '') {
   process.stdout.write(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `\n        ${detail}` : ''}\n`);
 }
 
+/**
+ * 取一个动作**生效的**帧率，兼容「单套」与「多套」两种写法。
+ *
+ * 单套：{sheet, frames, fps} —— 直接读顶层。
+ * 多套：{variants: [{fps}, ...]} —— 读第一套（编辑区改的就是它）。
+ */
+function effectiveFpsOf(node) {
+  if (!node || typeof node !== 'object') return undefined;
+  if (typeof node.fps === 'number') return node.fps;
+  const first = Array.isArray(node.variants) ? node.variants[0] : null;
+  return first && typeof first.fps === 'number' ? first.fps : undefined;
+}
+
 const browser = await launch({ width: 1600, height: 1000 });
 let exitCode = 0;
 try {
@@ -66,15 +79,29 @@ try {
   // Gif/WebP，`fps` 恒为 0 且**改它没有意义**（后端的 `_parse_animated_layout`
   // 明确禁止作者写帧率）。第一版没排除，于是随机挑到动图形象时
   // 「改帧率」这条断言永远失败——看起来像功能坏了，其实是挑错了测试对象。
+  // ⚠️ 本套件要**自己准备**目标形象，不能沿用沙箱里现成的。
+  //
+  // 踩过的坑：原来按「第一个可写的逐帧形象」挑，而别的套件（`panel-ux3`）
+  // 会真的改它挑中的那个——上一套件刚把 `idle` 改成 `variants` 写法，
+  // 这一套件就找不到顶层 `fps` 了，报「期望 fps=5」这种**假失败**。
+  // 现在按名字复用/新建一个专用形象，各套件互不干扰。
   const petId = PET || await page.evaluate(`(async () => {
-    const list = await window.__petApi.api('/pets', { method: 'GET' });
-    const candidates = (list.items || []).filter((i) => i.writable);
-    for (const item of candidates) {
-      const res = await window.__petApi.api('/pets/' + item.id + '/preview', { method: 'GET' });
+    const api = window.__petApi.api;
+    const list = await api('/pets', { method: 'GET' });
+    const mine = (list.items || []).find((i) => i.name === 'editor fixture');
+    if (mine) return mine.id;
+    // 源形象必须是**逐帧**的（动图容器的帧率没有意义，拿它验「改帧率」必挂）
+    for (const item of (list.items || [])) {
+      if (!item.writable) continue;
+      const res = await api('/pets/' + item.id + '/preview', { method: 'GET' });
       const idle = (res.actions || []).find((a) => a.action === 'idle');
-      if (idle && !idle.animated) return item.id;
+      if (!idle || idle.animated) continue;
+      const made = await api('/pets/' + item.id + '/copy', {
+        method: 'POST', body: { name: 'editor fixture' },
+      });
+      return made && made.pet ? made.pet.id : '';
     }
-    return candidates.length ? candidates[0].id : '';
+    return '';
   })()`);
   record(
     '① 前置：有一个可写的**逐帧**自建形象',
@@ -396,8 +423,14 @@ try {
     );
     record(
       '③ ★ 写回之后 pet.json 仍然是一个完整可读的包，且改动生效',
+      // ⚠️ 要按**生效值**判，不能直接读 after.animations.idle.fps。
+      //
+      // 多套动画的形象里 fps 在 variants[i] 里面，顶层根本没有这个键
+      // （variants 写法的规定：顶层不许再写 sheet / fps 之类）。
+      // 直接读顶层会得到 undefined，报「期望 fps=5」这种**假失败**——
+      // 而包其实完全正常。第一版就是这么写的，直到夹具里出现了多套形象。
       keys.includes('id') && keys.includes('animations')
-        && after.animations.idle.fps === nextFps,
+        && effectiveFpsOf(after.animations.idle) === nextFps,
       `顶层键=${JSON.stringify(keys)}；idle=${JSON.stringify(after.animations.idle)}`
       + `（期望 fps=${nextFps}）`,
     );

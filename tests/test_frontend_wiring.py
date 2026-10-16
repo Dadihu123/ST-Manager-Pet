@@ -758,13 +758,20 @@ def test_panel_visibility_toggle_calls_back_to_plugin(panel):
 
 
 def test_panel_visibility_copy_explains_it_is_not_a_disable(panel):
-    """文案要说清「关掉的是宠物，不是插件」——否则用户不敢点。"""
+    """文案要说清「关掉的是宠物，不是插件」——否则用户不敢点。
+
+    ⚠️ 判据是**意思**而不是原句。用户反馈界面上讲解文字太啰嗦
+    （「不像一个成熟的软件应有的实现」），因此这类句子被压短了。
+    这条测试要保护的是「用户不敢点」这个顾虑被回答过，
+    而不是某一句具体措辞——钉死原句会让每次精简文案都变成假失败。
+    """
     body = panel[panel.index('function renderVisibility()'):]
     body = body[:body.index('\n  }')]
     assert '插件仍然启用' in body, '要明确说插件没被停用'
-    assert '不必卸载或停用插件' in body, '要点出这个开关的用途'
-    # 关掉之后要告诉用户怎么开回来
+    # 关掉之后要告诉用户怎么开回来（这是「不敢点」的另一半顾虑）
     assert '显示宠物' in body
+    # 不该再出现为设计辩护的长句
+    assert '不必卸载或停用插件' not in body, '这类长解释已按用户要求精简'
 
 
 def test_panel_hidden_state_is_the_plugin_s_authority(panel):
