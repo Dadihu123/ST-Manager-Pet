@@ -54,6 +54,11 @@
             "breathe": {
               "amplitude": 0.01,
               "periodMs": 3400
+            },
+            "blink": {
+              "frames": [2],
+              "everyMs": [2500, 5000],
+              "durationMs": 140
             }
           }
         },

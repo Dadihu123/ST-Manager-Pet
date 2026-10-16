@@ -320,6 +320,51 @@ export function motionBlinks(motion) {
 }
 
 /**
+ * **现在**允许眨眼吗？
+ *
+ * 光看 `motionBlinks` 是不够的：眨眼走 `setTimeout`，它**独立于 rAF**——
+ * 而「减少动效」与「页面不可见」这两条停绘条件原本只停 rAF 与 CSS 动画
+ * （呼吸），停不住一个已经排好的定时器。于是用户打开「减少动效」之后，
+ * 呼吸停了、帧也不推进了，**眼睛却照眨**——恰好是那个设置要关掉的东西。
+ *
+ * 因此把「现在能不能眨」抽成一条纯判断，由三处共同遵守：
+ * 排定时器前、定时器到点时、暂停恢复时（见 `petview.js` 的 `cancelBlink`）。
+ *
+ * @param {object} motion 规范化后的 motion
+ * @param {{paused?: boolean, reducedMotion?: boolean}} state 停绘状态
+ */
+export function blinkAllowed(motion, state = {}) {
+  if (!motionBlinks(motion)) return false;
+  if (state.paused === true) return false;
+  if (state.reducedMotion === true) return false;
+  return true;
+}
+
+/**
+ * 把人手输的「眨眼帧」文本框解析成帧号数组。
+ *
+ * 为什么值得单独一个函数：**「留空 = 不眨眼」只有在这里才守得住**。
+ *
+ * 面板上的约定是「填 `2` 就是第 2 帧，留空就是不眨」，而最自然的写法
+ * `value.split(...).map(Number).filter(n => n >= 0)` 会把空串变成
+ * **`0`**（`Number('') === 0`），于是「清空输入框」被解析成「眨第 0 帧」：
+ * 用户以为关掉了眨眼，实际上它还在眨——而且眨的是睁眼帧，
+ * 看起来像「眨眼功能坏了 / 一直在闪」。
+ *
+ * 因此这里要求每个片段**非空**且是整数：空串、空白、`abc` 一律丢掉。
+ *
+ * @param {string} text 输入框里的原文（逗号 / 空格 / 顿号分隔）
+ * @returns {Array<number>} 帧号（可能为空 = 不眨眼）
+ */
+export function parseBlinkFrames(text) {
+  return String(text == null ? '' : text)
+    .split(/[,，、\s]+/)
+    .map((part) => part.trim())
+    .filter((part) => part !== '' && /^\d+$/.test(part))
+    .map((part) => Number(part));
+}
+
+/**
  * 从 `[最短, 最长]` 里抽一个间隔（毫秒）。
  *
  * 与 `pickIdleDelay` 同一套约定：**只抽数、不管计时**——计时必须由

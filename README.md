@@ -747,6 +747,17 @@ spritesheet。而很多时候你手上**已经有一个现成的动图**了—�
 
 两者**可以叠加**，也**可以叠加在帧序列上**（一个 4 帧的 idle 同时呼吸）。
 
+三个眨眼参数都能在面板里调（动作卡片 →「动画参数」→ 眨眼帧 / 最短间隔 /
+最长间隔 / 时长），区间与后端一致（0.3~60 秒 / 40~2000 毫秒）。
+**留空 = 不眨眼**——这条约定靠 `animation.js:parseBlinkFrames` 守住：
+自己写 `split(',').map(Number)` 会把空串变成 `0`（`Number('') === 0`），
+于是「清空输入框」变成「眨第 0 帧」，看起来像功能坏了。
+
+> **眨眼要挑真的闭眼帧**。小满的 idle 是第 2 帧闭眼（笑眼），因此写 `[2]`
+> 而不是 `[2, 3]`（第 3 帧是睁眼）。另外它**只在标准图像那条路径上取第一个**：
+> 眨完回到静止帧会重走 `applyMotion`，那会把「轮流用帧」的下标重置掉，
+> 因此列表里第二项基本轮不到。
+
 #### 为什么它值得
 
 **实测**（小卡 idle，真实素材）：现状 4 帧循环的顶边只动 **1px**
@@ -792,6 +803,10 @@ spritesheet。而很多时候你手上**已经有一个现成的动图**了—�
 > **`reducedMotion` 会关掉它**：系统「减少动效」开启时，插件给
 > `.pet-sprite` 加 `animation: none`（这条规则本来就为它准备好了）。
 > 拖动中也会暂停（拎在手里还在喘气很怪）。
+>
+> **眨眼要单独处理**，因为它**唯一**不靠 rAF（走 `setTimeout`）：
+> 停 rAF 与 CSS 动画是停不住一个已经排好的定时器的。因此停绘分支会
+> `cancelBlink()`，恢复时再 `applyMotion()` 把它排回来（见 §10 的坑 22/23）。
 
 ### 3.13 设置的两层分工：按形象 vs 全局
 
@@ -1320,6 +1335,13 @@ key**，因此不能靠返回值判可用；插件用 `api.surfaces.isOpen('pet'
 是因为动效让他不适，降速对他没有任何帮助。CSS 侧同时有
 `@media (prefers-reduced-motion: reduce)` 兜底。
 
+**停绘必须把眨眼也算上**。它是唯一不靠 rAF 的动画（`setTimeout` +
+`background-position` 跳帧），因此「停 rAF + `animation: none`」这套做法
+对它**无效**——不加处理的表现就是「开了减少动效，呼吸停了、帧不推进了，
+眼睛却还在眨」。停绘分支会 `cancelBlink({ repaint: true })`，
+恢复时再 `applyMotion()` 排回来；两个细节都不能省（见
+`frontend/petview.js:cancelBlink` 的说明与 `tools/verify-blink-pause.mjs`）。
+
 ---
 
 ## 9. 隐私与权限
@@ -1372,6 +1394,15 @@ node tools/verify-panel.mjs      # 面板：27 项（缩略图 / 动作网格 / 
 node tools/verify-preview-fix.mjs # 预览专项：8 项（切动作保留滚动 / 帧窗口不露邻帧）
 node tools/verify-still.mjs      # 标准图像 / 重名 / 作者 / 触发时间：17 项
 node tools/verify-visibility.mjs # 关闭宠物（显示开关）：13 项
+node tools/verify-blink-pause.mjs # 眨眼停绘专项：9 项（减少动效时真的停 / 恢复后自己回来）
+node tools/verify-blink-panel.mjs # 眨眼面板专项：9 项（间隔与时长能改能存 / 留空 = 不眨眼）
+```
+
+想一次跑完所有套件（失败会自动重跑一次，把**抖动**与**真失败**分开报）：
+
+```bash
+PET_SANDBOX_PORT=5099 node tools/verify-all.mjs
+PET_ONLY=blink-pause,blink-panel node tools/verify-all.mjs   # 只跑几个
 ```
 
 影子宿主的做法：用 junction 复用宿主的 `core/` `static/` `templates/`，
@@ -1580,7 +1611,7 @@ frontend/
 ├─ petview.js           **唯一**驱动宠物本体的模块（含渲染方式与标准图像）
 ├─ direction.js         方向化行走的判定（纯逻辑）
 ├─ clock.js             帧推进（含非均匀帧时长）+ 省电决策（纯逻辑）
-├─ animation.js         权重抽取 / 动作时长 / 标准图像解析 / 时间驱动行为调度（纯逻辑）
+├─ animation.js         权重抽取 / 动作时长 / 标准图像解析 / 程序化运动判定 / 时间驱动行为调度（纯逻辑）
 ├─ gesture.js           点击与拖拽的手势判定（纯逻辑）
 ├─ physics.js           物理（固定步长，纯逻辑）
 ├─ statemachine.js      状态机（纯逻辑）
@@ -1635,6 +1666,13 @@ resources/
   并指出该用「导入形象包」（§3.11）。
 - **`motion` 做不了肢体运动**：整身仿射变换无法 articulate 四肢，
   交叉淡入关键姿势得到的是双重曝光（§3.12）。它是「整体运动」，不是补间引擎。
+- **眨眼的多个帧基本只会用到第一个**：眨完回到静止帧时会重走 `applyMotion`，
+  那一步把「轮流用帧」的下标重置了，因此 `frames: [2, 3]` 里的 `3` 轮不到。
+  写多个不报错，但别指望它按顺序播（§3.12）。
+- **眨眼间隔不跟随「动画速度」倍率**：呼吸的周期会除以速度倍率
+  （`--pet-breathe-period`），眨眼的 `everyMs` 是原值。两者语义不同是有意的
+  （倍率管的是「动作播得多快」，眨眼是「它自己多久眨一下」），
+  但如果你确实想让眨眼也跟着慢下来，目前只能手改 `everyMs`。
 - **`motion` 的 `transform-origin` 恒为水平居中**：`anchor.x` 目前不参与定位
   （`drawPosition` 用的是 `width / 2`），因此呼吸的横向原点固定 `50%`，
   纵向取 `anchor.y`。若哪天横向锚点接进定位，这里要跟着改。

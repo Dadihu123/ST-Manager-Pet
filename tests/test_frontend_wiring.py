@@ -1030,6 +1030,141 @@ def test_panel_normalizes_motion_before_reading_it(panel):
     )
 
 
+# ==================================================== 眨眼：停绘与恢复
+
+
+def _function_body(source, name):
+    """取出 `name` 那个函数的函数体（从签名到下一个顶层 `/**`）。"""
+    start = source.index(f'function {name}(')
+    rest = source[start:]
+    end = rest.find('\n  /**')
+    return rest if end == -1 else rest[:end]
+
+
+def test_petview_stops_blinking_while_the_drawing_is_paused(petview):
+    """★ 停绘（减少动效 / 页面不可见）时**必须停眨眼**。
+
+    眨眼是**唯一**不靠 rAF 的动画：它走 `setTimeout`，宠物静止时 rAF 停着
+    而它照跑。因此原本那条「停绘分支只停 rAF 与 CSS 动画」的写法对它无效
+    ——用户打开「减少动效」之后，呼吸停了、帧也不推进了，**眼睛却还在眨**，
+    而那正是那个设置要关掉的东西（§4.5 / §8 陷阱 13）。
+
+    只清定时器还不够：一次眨眼是「跳到闭眼帧 → 停 `durationMs` → 跳回来」
+    两步接力，恰好在第二步之前被暂停时，宠物会**永远闭着眼**。因此暂停
+    分支必须同时要求恢复画面（`repaint: true`）。
+    """
+    body = _function_body(petview, 'applyThrottle')
+    marker = 'if (throttle.paused) {'
+    assert marker in body, '找不到停绘分支'
+    paused_branch = body[body.index(marker):]
+    paused_branch = paused_branch[:paused_branch.index('\n      return;')]
+    assert 'cancelBlink(' in paused_branch, (
+        '停绘分支必须调 cancelBlink——否则「减少动效」下宠物照样眨眼'
+    )
+    assert 'repaint: true' in paused_branch, (
+        '暂停时要在闭眼帧上恢复画面，否则宠物会永远闭着眼'
+    )
+
+    cancel = _function_body(petview, 'cancelBlink')
+    assert 'clearTimeout(blinkTimer)' in cancel, 'cancelBlink 必须清掉眨眼定时器'
+    assert 'blinkActive' in cancel and 'drawStill(' in cancel, (
+        'cancelBlink 必须在眨眼中途被打断时重画那一帧'
+    )
+
+
+def test_petview_resumes_blinking_after_the_pause_ends(petview):
+    """★ 恢复动效之后眨眼要**自己回来**。
+
+    暂停时被 `cancelBlink` 停掉，而眨眼只在 `applyMotion` 里排期——那个
+    函数只在**换动作 / 重画标准图像**时被调用。不在这里补一次的话，表现是
+    「打开减少动效再关掉，宠物从此再也不眨眼」，而用户根本等不到换动作。
+    """
+    body = _function_body(petview, 'applyThrottle')
+    resume = body[body.index('if (previous.paused || previous.rate !== throttle.rate) {'):]
+    assert 'applyMotion(motionSpec)' in resume, (
+        '从暂停恢复时要照原样重排眨眼，否则它再也不会眨'
+    )
+    # 载体变量得真的被记下来（记的是「给谁上的运动」，不是某一份 motion）
+    apply_motion = _function_body(petview, 'applyMotion')
+    assert 'motionSpec = spec' in apply_motion, 'applyMotion 必须记下它这次上的载体'
+
+
+def test_petview_guards_blink_scheduling_and_firing(petview):
+    """★ 排期与到点两处都要判「现在能不能眨」。
+
+    只清一次定时器是不够的：清完之后任何一次 `applyMotion`（换动作、
+    重画标准图像、暂停分支里的恢复绘制）都会把它排回来。而已经到期、
+    回调还没跑的那一瞬被打断，`scheduleBlink` 的守卫也管不到——因此
+    `runBlink` 自己也要再判一次。
+    """
+    assert 'blinkAllowed' in petview, 'petview 必须复用 animation.js 的判定'
+    schedule = _function_body(petview, 'scheduleBlink')
+    assert 'canBlink()' in schedule, '排期前必须判停绘状态'
+    run = _function_body(petview, 'runBlink')
+    assert 'canBlink()' in run, '到点执行前必须再判一次停绘状态'
+
+
+def test_panel_exposes_blink_interval_and_duration(panel):
+    """★ 眨眼的**间隔**与**时长**必须能在面板里调。
+
+    过去只暴露帧号，间隔与时长用的是写死的 3~7 秒 / 160 毫秒——用户想让
+    宠物眨得自然一点（例如 2.5~5 秒、140 毫秒）只能去手改 `pet.json`。
+
+    区间必须与后端一致（`test_css_contracts.py` 钉住数值），否则界面上能填
+    出一个后端必定拒绝的值：那看起来是一次「保存失败」，其实是界面允许了
+    它不该允许的输入。
+    """
+    for name in ('BLINK_INTERVAL_MIN_S', 'BLINK_INTERVAL_MAX_S',
+                 'BLINK_DURATION_MIN_MS', 'BLINK_DURATION_MAX_MS'):
+        assert re.search(rf'const {name}\s*=', panel), f'缺少常量 {name}'
+    for name in ('BLINK_INTERVAL_MIN_S', 'BLINK_INTERVAL_MAX_S',
+                 'BLINK_DURATION_MIN_MS', 'BLINK_DURATION_MAX_MS'):
+        assert panel.count(name) >= 2, f'{name} 声明了却没被用上'
+    # 三个字段都要回写进草稿（否则「调了但没保存」）
+    assert 'draft.blinkEvery[0] =' in panel, '最短间隔没有回写草稿'
+    assert 'draft.blinkEvery[1] =' in panel, '最长间隔没有回写草稿'
+    assert 'draft.blinkDuration =' in panel, '眨眼时长没有回写草稿'
+
+
+def test_panel_compares_every_blink_field_before_skipping_the_patch(panel):
+    """★ 补丁的「没改过」判断必须把 `everyMs` 也算进去。
+
+    少比这一项的后果正是本项目最想避免的一类问题：用户只调了眨眼间隔，
+    这一项仍判为「没改过」→ 不写补丁 → 界面显示保存成功，文件里却还是旧值。
+    间隔是**新加的**可编辑字段，这个漏判也随之从「不可能发生」变成
+    「每次调间隔都会发生」。
+    """
+    body = _function_body(panel, 'buildVariantPatch')
+    assert 'motion.blinkEveryMs[0]' in body and 'motion.blinkEveryMs[1]' in body, (
+        'blinkSame 必须比较 everyMs 两端'
+    )
+    # 写盘前把区间排成有序的：运行期本来就会规范化（animation.js），
+    # 因此这不改变语义，却能让「最短填得比最长还大」不再变成一次报错。
+    assert '.sort(' in body, '写盘前要把区间两端排成有序'
+
+
+def test_panel_parses_blink_frames_with_the_shared_helper(panel, animation):
+    """★ 眨眼帧必须走 `parseBlinkFrames`，不能就地 `map(Number)`。
+
+    就地写的后果（真实浏览器验收抓到的）：`Number('') === 0`，于是
+    **清空输入框**被解析成「眨第 0 帧」——用户以为关掉了眨眼，实际它还在眨，
+    而且眨的是睁眼帧（观感是「一直在闪」）。「留空 = 不眨眼」这条约定
+    只有共享的那一个函数能守住。
+    """
+    assert 'export function parseBlinkFrames' in animation, (
+        '解析函数必须在 animation.js 里（纯逻辑层，可单测）'
+    )
+    assert 'parseBlinkFrames' in panel, '面板必须导入 parseBlinkFrames'
+    # 眨眼帧那一处必须调它
+    assert 'draft.blinkFrames = parseBlinkFrames(' in panel, (
+        '眨眼帧输入框必须调 parseBlinkFrames'
+    )
+    # 不允许在面板里再手写一遍「split + Number」的解析
+    body = panel[panel.index("'眨眼帧'"):]
+    body = body[:body.index('眨眼最短间隔')]
+    assert 'Number(part)' not in body, '不要在面板里手写帧号解析'
+
+
 # ==================================================== 3. 空中不串动作
 
 

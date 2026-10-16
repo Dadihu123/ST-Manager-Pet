@@ -17,6 +17,7 @@ import {
   motionBlinks,
   motionBreathes,
   normalizeMotion,
+  parseBlinkFrames,
   SLEEP_AFTER_MAX_MS,
   SLEEP_AFTER_MIN_MS,
 } from './animation.js';
@@ -121,6 +122,22 @@ const CREATABLE_ACTIONS = [
 /** 大小倍率的区间（与 `backend/core/pack.py:SCALE_RANGE` 必须一致）。 */
 const SCALE_MIN = 0.25;
 const SCALE_MAX = 4;
+
+/**
+ * 眨眼的合法区间（与 `backend/core/pack.py:BLINK_INTERVAL_RANGE` /
+ * `BLINK_DURATION_RANGE` 必须一致，由 `test_css_contracts.py` 钉住）。
+ *
+ * 为什么面板不自己发明一套：两边写死不同的数字时，用户能在界面上填出一个
+ * 后端**必定拒绝**的值——那看起来是一次「保存失败」，而其实是一次
+ * 「界面允许了它不该允许的输入」。
+ *
+ * 间隔用秒（面板上没人按毫秒思考），时长用毫秒（100~400 这个量级写秒
+ * 会变成 0.14 秒，读起来更费劲）。后端的单位是毫秒，因此这里进出都要换算。
+ */
+const BLINK_INTERVAL_MIN_S = 0.3;
+const BLINK_INTERVAL_MAX_S = 60;
+const BLINK_DURATION_MIN_MS = 40;
+const BLINK_DURATION_MAX_MS = 2000;
 
 /** 倍率滑块的步长：0.05 足够细，又不至于让用户拖不到整数值。 */
 const SCALE_STEP = 0.05;
@@ -3937,22 +3954,61 @@ export function createSettingsPanel({
       blinkField.appendChild(el('div', 'pet-field-label', '眨眼帧'));
       const blinkInput = el('input', 'pet-input');
       blinkInput.type = 'text';
-      blinkInput.placeholder = '例如 2,3（留空 = 不眨眼）';
+      blinkInput.placeholder = '例如 2（留空 = 不眨眼）';
       blinkInput.value = draft.blinkFrames.join(',');
       blinkInput.dataset.marqueeIgnore = 'true';
       blinkInput.addEventListener('input', () => {
-        draft.blinkFrames = blinkInput.value
-          .split(/[,，\s]+/)
-          .map((part) => Number(part))
-          .filter((number) => Number.isInteger(number) && number >= 0);
+        // ★ 必须走 `parseBlinkFrames`：「留空 = 不眨眼」只有它能守住。
+        // 自己写 `split(',').map(Number).filter(n => n >= 0)` 会把空串变成
+        // **0**（`Number('') === 0`），于是「清空输入框」被解析成「眨第 0 帧」
+        // ——用户以为关掉了，实际它还在眨（而且眨的是睁眼帧）。
+        draft.blinkFrames = parseBlinkFrames(blinkInput.value);
       });
       blinkField.appendChild(blinkInput);
+      // 帧号上界必须说出来：写超了后端会拒绝（否则眨眼的那一瞬间宠物
+      // 会落到 sheet 之外，看起来是「凭空消失」），但用户看不到这条动画有几帧。
+      const frameCount = Math.max(1, Math.floor(Number(draft.frames) || 1));
       blinkField.appendChild(el(
         'div',
         'pet-field-hint',
-        '填真的有闭眼的那几帧（从 0 开始数）。',
+        `填真的有闭眼的那几帧（从 0 开始数，这条动画是 0 ~ ${frameCount - 1}）。`,
       ));
       box.appendChild(blinkField);
+
+      // 眨眼的节奏与时长。
+      //
+      // 用户报障：「眨眼帧填了，但多久眨一次、眨多久只能去改 pet.json」——
+      // 过去面板只暴露帧号，间隔与时长用的是写死的 3~7 秒 / 160 毫秒，
+      // 想让宠物眨得自然一点（例如 2.5~5 秒、140 毫秒）没有任何入口。
+      const blinkRow = el('div', 'pet-editor-row');
+      blinkRow.appendChild(editorNumber({
+        label: '眨眼最短间隔（秒）',
+        hint: '多久眨一次',
+        value: draft.blinkEvery[0] / 1000,
+        min: BLINK_INTERVAL_MIN_S,
+        max: BLINK_INTERVAL_MAX_S,
+        step: 0.1,
+        onInput: (value) => { draft.blinkEvery[0] = Math.round(value * 1000); },
+      }));
+      blinkRow.appendChild(editorNumber({
+        label: '眨眼最长间隔（秒）',
+        hint: '在这个区间里随机',
+        value: draft.blinkEvery[1] / 1000,
+        min: BLINK_INTERVAL_MIN_S,
+        max: BLINK_INTERVAL_MAX_S,
+        step: 0.1,
+        onInput: (value) => { draft.blinkEvery[1] = Math.round(value * 1000); },
+      }));
+      blinkRow.appendChild(editorNumber({
+        label: '眨眼时长（毫秒）',
+        hint: '人眼一眨约 100~400',
+        value: draft.blinkDuration,
+        min: BLINK_DURATION_MIN_MS,
+        max: BLINK_DURATION_MAX_MS,
+        step: 10,
+        onInput: (value) => { draft.blinkDuration = value; },
+      }));
+      box.appendChild(blinkRow);
     }
 
     // ---- 操作
@@ -4027,7 +4083,12 @@ export function createSettingsPanel({
     if (draft.blinkFrames.length) {
       motion.blink = {
         frames: draft.blinkFrames.slice(),
-        everyMs: [Number(draft.blinkEvery[0]), Number(draft.blinkEvery[1])],
+        // 与 `buildVariantPatch` 同一套处理：排序后再喂预览，
+        // 否则「预览里的节奏」与「保存后的节奏」可能不是同一个东西。
+        everyMs: [
+          Math.round(Number(draft.blinkEvery[0])),
+          Math.round(Number(draft.blinkEvery[1])),
+        ].sort((a, b) => a - b),
         durationMs: Math.round(Number(draft.blinkDuration)),
       };
     }
@@ -4260,9 +4321,14 @@ export function createSettingsPanel({
     const breatheSame = hadBreathe === wantBreathe
       && (!wantBreathe || (Number(motion.amplitude) === Number(draft.breatheAmp)
         && Number(motion.periodMs) === Number(draft.breathePeriod)));
+    // ★ 三个字段**都要比**。少比 `everyMs` 的后果是：用户只调了眨眼间隔，
+    // 这一项仍判为「没改过」→ 不写补丁 → 保存成功但文件里还是旧值。
+    // 那正是本项目最想避免的一类问题（点了保存、界面也没报错，却没生效）。
     const blinkSame = hadBlink === wantBlink
       && (!wantBlink || (motion.blinkFrames.join(',') === draft.blinkFrames.join(',')
-        && Number(motion.blinkDurationMs) === Number(draft.blinkDuration)));
+        && Number(motion.blinkDurationMs) === Number(draft.blinkDuration)
+        && Number(motion.blinkEveryMs[0]) === Number(draft.blinkEvery[0])
+        && Number(motion.blinkEveryMs[1]) === Number(draft.blinkEvery[1])));
     if (!breatheSame || !blinkSame) {
       if (!wantBreathe && !wantBlink) {
         patch.motion = null;
@@ -4275,9 +4341,17 @@ export function createSettingsPanel({
           };
         }
         if (wantBlink) {
+          // 区间写成**有序**的：运行期本来就会把 `[a, b]` 规范化成
+          // `[min, max]`（见 `animation.js:normalizeMotion`），因此把两端
+          // 排序后再写盘不改变任何语义，却能让「最短填得比最长还大」这种
+          // 输入不会变成一次后端报错（它会明确拒绝 low > high）。
+          const every = [
+            Math.round(Number(draft.blinkEvery[0])),
+            Math.round(Number(draft.blinkEvery[1])),
+          ].sort((a, b) => a - b);
           next.blink = {
             frames: draft.blinkFrames.slice(),
-            everyMs: [Number(draft.blinkEvery[0]), Number(draft.blinkEvery[1])],
+            everyMs: every,
             durationMs: Math.round(Number(draft.blinkDuration)),
           };
         }

@@ -16,6 +16,7 @@
 
 import {
   animationDuration,
+  blinkAllowed,
   createBehaviorScheduler,
   frameGrid,
   framePage,
@@ -282,6 +283,10 @@ export function createPetView(options = {}) {
   //
   // `blinkTimer` 用 `setTimeout` 而不是 rAF：宠物静止时 rAF 是停着的，
   // 眨眼必须能在那时发生（否则「宠物站着不动时眨眼」永远不会出现）。
+  //
+  // ⚠️ 也正因为**独立于 rAF**，它必须自己遵守停绘契约：暂停（减少动效 /
+  // 页面不可见）时要 `cancelBlink()`，恢复时要重新 `applyMotion()`——
+  // 漏掉前者是「开了减少动效还在眨眼」，漏掉后者是「关掉之后再也不眨」。
   let blinkTimer = 0;
   //: 上一次眨到了 `blinkFrames` 的第几项（轮流用，避免每次都是同一帧）。
   let blinkFrameIndex = -1;
@@ -289,6 +294,10 @@ export function createPetView(options = {}) {
   let currentMotion = null;
   //: 眨眼的落点几何（`{grid, frames, onStill}`）；见 `applyMotion` 的说明。
   let blinkTarget = null;
+  //: 现在画面上是不是正停在闭眼帧上（见 `cancelBlink`：被中途打断要恢复）。
+  let blinkActive = false;
+  //: 最近一次 `applyMotion` 的载体（变体或标准图像）。暂停恢复时照它重排。
+  let motionSpec = null;
   let hostState = {};
   let throttle = { paused: false, rate: 1, reason: '' };
   let reducedMotion = Boolean(config.reducedMotion);
@@ -665,9 +674,14 @@ export function createPetView(options = {}) {
     applyFacing();
 
     // ---- 眨眼
-    clearTimeout(blinkTimer);
-    blinkTimer = 0;
-    blinkFrameIndex = -1;
+    //
+    // `motionSpec` 记下「这次是给谁上的运动」：暂停结束后要照它重排眨眼
+    // （见 `applyThrottle`）。变体与标准图像都可能带 motion，因此记的是
+    // 载体本身，而不是某一份 motion 对象。
+    motionSpec = spec || null;
+    // 这里**不重画**：两个调用点（`setAction` / `drawStill`）都在调用本函数
+    // **之前**已经把自己那一帧画好了，重画反而会把它们刚画的东西覆盖掉。
+    cancelBlink();
     currentMotion = motionBlinks(motion) ? motion : null;
     // 眨眼的**落点几何**跟着「当前显示的东西」走：可能是变体，也可能是
     // 标准图像（默认 idle 模式下大部分时间显示的就是后者，而那正是
@@ -686,6 +700,42 @@ export function createPetView(options = {}) {
     if (currentMotion) scheduleBlink();
   }
 
+  /** 现在允许眨眼吗？（停绘期间不许——见 `blinkAllowed` 的说明。） */
+  function canBlink() {
+    return blinkAllowed(currentMotion, {
+      paused: throttle.paused,
+      reducedMotion,
+    });
+  }
+
+  /**
+   * 停眨眼：清掉定时器，必要时把画面从闭眼帧恢复回来。
+   *
+   * 两件事必须一起做，少任何一件都是可复现的故障：
+   *
+   * - **清定时器**：眨眼走 `setTimeout`，它独立于 rAF（宠物静止时 rAF 停着
+   *   而眨眼照跑）。因此「减少动效 / 页面不可见」的停绘分支只停 rAF 与 CSS
+   *   动画是**停不住眨眼**的——用户开了减少动效，呼吸停了、帧不推进了，
+   *   眼睛却还在眨。
+   * - **恢复画面**：一次眨眼是「跳到闭眼帧 → 停 `durationMs` → 跳回来」两步，
+   *   由两个定时器接力。恰好在第二步之前被暂停时，只清定时器会让宠物
+   *   **永远闭着眼**（比继续眨更糟）。
+   *
+   * `repaint` 只在暂停/恢复路径上传真：`applyMotion` 的调用方马上就会自己
+   * 画一帧，那时重画是多余的（而且会与它们的绘制打架）。
+   */
+  function cancelBlink({ repaint = false } = {}) {
+    clearTimeout(blinkTimer);
+    blinkTimer = 0;
+    blinkFrameIndex = -1;
+    if (!blinkActive) return;
+    blinkActive = false;
+    if (!repaint || disposed) return;
+    // 恢复成「现在本该显示的那一帧」：标准图像重画它自己，变体重画当前帧。
+    if (blinkTarget && blinkTarget.onStill) drawStill();
+    else drawFrame();
+  }
+
   /**
    * 安排下一次眨眼。
    *
@@ -694,7 +744,10 @@ export function createPetView(options = {}) {
    * 已经踩过一次，见 `animation.js` 顶部说明）。
    */
   function scheduleBlink() {
-    if (!currentMotion || disposed) return;
+    // 停绘期间**不排**：这一条是「减少动效还在眨眼」那个 bug 的落点。
+    // 只清一次定时器是不够的——清完之后任何一次 `applyMotion`（换动作、
+    // 重画标准图像、暂停分支里的恢复绘制）都会把它排回来。
+    if (!canBlink() || disposed) return;
     clearTimeout(blinkTimer);
     blinkTimer = setTimeout(() => {
       blinkTimer = 0;
@@ -704,7 +757,10 @@ export function createPetView(options = {}) {
 
   /** 眨一次眼：跳到 `blinkFrames` 的下一帧，停一会儿，再跳回来。 */
   function runBlink() {
-    if (!currentMotion || disposed || !blinkTarget) return;
+    if (disposed || !blinkTarget) return;
+    // 定时器可能在「已经到期、回调还没跑」的那一瞬被暂停打断，所以这里
+    // 再判一次（`scheduleBlink` 的守卫管不到这一段）。
+    if (!canBlink()) return;
     const frames = currentMotion.blinkFrames;
     blinkFrameIndex = (blinkFrameIndex + 1) % frames.length;
     const frame = frames[blinkFrameIndex];
@@ -722,10 +778,14 @@ export function createPetView(options = {}) {
       // （跨页要换图、要解码，那正是我们不想在眨眼这种小事上做的事）。
       if (blinkTarget.onStill || at.page === currentPage) {
         sprite.style.backgroundPosition = `${-at.col * width}px ${-at.row * height}px`;
+        // 记下「画面上正停在闭眼帧」：暂停恰好发生在这 `durationMs` 里时，
+        // 得靠它把眼睛恢复回来（否则宠物会永远闭着眼，见 `cancelBlink`）。
+        blinkActive = true;
       }
     }
     blinkTimer = setTimeout(() => {
       blinkTimer = 0;
+      blinkActive = false;
       // 眨完回到**当前时钟所在的帧**（而不是硬回到第 0 帧——
       // 那样循环动画会突然跳回开头）。标准图像则重画那一帧。
       if (!disposed) {
@@ -1761,6 +1821,11 @@ export function createPetView(options = {}) {
       clearTimeout(actionTimer);
       actionTimer = 0;
       cancelIdleWake();
+      // ★ 眨眼也必须停——它是**唯一**一个不靠 rAF 的动画（见 `cancelBlink`）。
+      // 只停 rAF 与 CSS 动画（呼吸）的话，用户开了「减少动效」之后眼睛照眨，
+      // 而那正是他要关掉的东西。`repaint: true` 是必须的：暂停可能正好落在
+      // 「已经跳到闭眼帧、还没跳回来」的那 100 多毫秒里。
+      cancelBlink({ repaint: true });
       if (reducedMotion) {
         // reducedMotion 的语义是「关掉循环帧动画」而不是降速（§4.5 / §8 陷阱 13）：
         // 把帧定在第 0 帧，并摘掉 will-change（不再有运动）
@@ -1791,6 +1856,10 @@ export function createPetView(options = {}) {
       // 漫游同理：暂停期间 `roamTriggerEnabled()` 为假，排期也已被清掉
       scheduleRoamWake();
       scheduleSleepWake();
+      // ★ 眨了也一样：暂停时被 `cancelBlink` 停掉了，不照原样重排一次的话
+      // 表现是「打开减少动效再关掉，宠物从此再也不眨眼」——而它只在
+      // **换动作**时才会重新排期，用户根本等不到。
+      if (previous.paused) applyMotion(motionSpec);
     }
   }
 

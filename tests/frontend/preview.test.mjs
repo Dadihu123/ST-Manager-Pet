@@ -14,7 +14,9 @@ import { test } from 'node:test';
 import { frameGrid, framePage, framePageCount } from '../../frontend/animation.js';
 import { animationDuration } from '../../frontend/animation.js';
 import {
-  normalizeMotion, motionBreathes, motionBlinks, pickBlinkDelay, playableVariants, stillFrame,
+  blinkAllowed,
+  normalizeMotion, motionBreathes, motionBlinks, parseBlinkFrames, pickBlinkDelay,
+  playableVariants, stillFrame,
 } from '../../frontend/animation.js';
 import {
   frameDurations, totalDuration, applyFrameGeometry, motionStyle,
@@ -600,6 +602,57 @@ test('normalizeMotion：眨眼参数不全就整条丢掉（不要半残的配�
   assert.equal(normalizeMotion({
     motion: { blink: { frames: [], everyMs: [3000, 7000], durationMs: 160 } },
   }), null);
+});
+
+test('★ blinkAllowed：停绘期间不许眨眼（减少动效 / 页面不可见）', () => {
+  // 为什么单独一条：眨眼是**唯一**不靠 rAF 的动画。rAF 停了、CSS 动画
+  // （呼吸）也被 `animation: none` 关掉了，而一个已经排好的 `setTimeout`
+  // 照跑不误——于是用户打开「减少动效」之后，眼睛还在眨。
+  // 实测表现就是这条：呼吸停了、帧不推进了，唯独眼睛还在动。
+  const m = normalizeMotion({
+    motion: { blink: { frames: [2], everyMs: [2500, 5000], durationMs: 140 } },
+  });
+  assert.equal(motionBlinks(m), true, '前提：这条 motion 本身是会眨的');
+  // 正常运行时允许
+  assert.equal(blinkAllowed(m), true);
+  assert.equal(blinkAllowed(m, {}), true);
+  assert.equal(blinkAllowed(m, { paused: false, reducedMotion: false }), true);
+  // 两种停绘条件各自都能单独否掉它
+  assert.equal(blinkAllowed(m, { paused: true }), false);
+  assert.equal(blinkAllowed(m, { reducedMotion: true }), false);
+  // 没有 blink 声明时无论如何都不眨
+  const breatheOnly = normalizeMotion({ motion: { breathe: { amplitude: 0.01, periodMs: 3400 } } });
+  assert.equal(blinkAllowed(breatheOnly), false);
+  assert.equal(blinkAllowed(null), false);
+});
+
+test('★ parseBlinkFrames：留空 = 不眨眼（空串不能变成第 0 帧）', () => {
+  // 这条是真实浏览器验收抓出来的：面板上「清空眨眼帧输入框」按最自然的写法
+  // （split → Number → filter >= 0）会解析成 **[0]**，因为 `Number('') === 0`。
+  // 于是用户以为关掉了眨眼，实际上它还在眨——而且眨的是**睁眼帧**，
+  // 观感是「一直在闪 / 眨眼功能坏了」，而面板上那个框看起来是空的。
+  assert.deepEqual(parseBlinkFrames(''), [], '空串必须是「不眨眼」');
+  assert.deepEqual(parseBlinkFrames('   '), [], '纯空白同理');
+  assert.deepEqual(parseBlinkFrames(','), [], '只有一个分隔符同理');
+  assert.deepEqual(parseBlinkFrames('1,,2'), [1, 2], '中间的空片段要被丢掉');
+
+  // 正常输入
+  assert.deepEqual(parseBlinkFrames('2'), [2]);
+  assert.deepEqual(parseBlinkFrames('2,3'), [2, 3]);
+  assert.deepEqual(parseBlinkFrames('2，3'), [2, 3], '中文逗号');
+  assert.deepEqual(parseBlinkFrames('2 3'), [2, 3], '空格');
+  assert.deepEqual(parseBlinkFrames('2、3'), [2, 3], '顿号');
+  assert.deepEqual(parseBlinkFrames(' 2 , 3 '), [2, 3], '两端空白');
+  assert.deepEqual(parseBlinkFrames('0'), [0], '第 0 帧是合法帧号');
+
+  // 非法片段一律丢掉，而不是变成 NaN / 0
+  assert.deepEqual(parseBlinkFrames('abc'), []);
+  assert.deepEqual(parseBlinkFrames('2,abc'), [2]);
+  assert.deepEqual(parseBlinkFrames('-1'), [], '负数不是帧号');
+  assert.deepEqual(parseBlinkFrames('1.5'), [], '小数不是帧号');
+  assert.deepEqual(parseBlinkFrames('1e3'), [], '科学计数法不是帧号');
+  assert.deepEqual(parseBlinkFrames(null), [], 'null 不崩');
+  assert.deepEqual(parseBlinkFrames(undefined), [], 'undefined 不崩');
 });
 
 test('★ pickBlinkDelay：只抽数、不管计时', () => {

@@ -431,6 +431,42 @@ def test_frontend_scale_range_matches_backend():
     )
 
 
+def test_frontend_blink_ranges_match_backend():
+    """★ 面板上「眨眼间隔 / 眨眼时长」的区间必须与后端校验区间一致。
+
+    与上一条（`scale`）同一个理由：后端在 `_parse_motion` 里对越界值**报错**，
+    因此两边写死不同数字时，用户能在界面上填出一个保存必定失败的值——
+    那看起来像一次「保存失败」，其实是一次「界面允许了它不该允许的输入」。
+
+    单位不同（面板用秒、后端用毫秒），因此这里按数值换算后比较：
+    0.3 秒 ↔ 300 毫秒、60 秒 ↔ 60000 毫秒。
+    """
+    backend = read(os.path.join(REPO_ROOT, 'backend', 'core', 'pack.py'))
+
+    def backend_range(name: str):
+        match = re.search(rf'{name}\s*=\s*\(([^)]*)\)', backend)
+        assert match, f'找不到 {name}'
+        return [float(part.strip()) for part in match.group(1).split(',')]
+
+    panel = read(os.path.join(REPO_ROOT, 'frontend', 'panel.js'))
+
+    def declared(name: str) -> float:
+        found = re.search(rf'const {name}\s*=\s*([0-9.]+)', panel)
+        assert found, f'panel.js 里找不到 {name}'
+        return float(found.group(1))
+
+    interval_low, interval_high = backend_range('BLINK_INTERVAL_RANGE')
+    assert declared('BLINK_INTERVAL_MIN_S') * 1000 == interval_low, (
+        f'BLINK_INTERVAL_MIN_S 应为 {interval_low / 1000} 秒'
+    )
+    assert declared('BLINK_INTERVAL_MAX_S') * 1000 == interval_high, (
+        f'BLINK_INTERVAL_MAX_S 应为 {interval_high / 1000} 秒'
+    )
+    duration_low, duration_high = backend_range('BLINK_DURATION_RANGE')
+    assert declared('BLINK_DURATION_MIN_MS') == duration_low
+    assert declared('BLINK_DURATION_MAX_MS') == duration_high
+
+
 def test_panel_never_renders_edit_controls_for_readonly_pets():
     """★ 内置形象（只读）不得渲染「换图 / 恢复 / 删除 / 导出」控件。
 
