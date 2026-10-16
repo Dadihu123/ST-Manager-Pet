@@ -20,17 +20,17 @@
   },
   "schedule": {
     "idle": {
-      "intervalMs": [
-        6000,
-        18000
-      ],
+      "minIntervalMs": 5000,
+      "maxIntervalMs": 10000,
+      "mode": "random",
       "plays": 1
     },
     "roam": {
-      "intervalMs": [
-        3000,
-        9000
-      ]
+      "minIntervalMs": 3000,
+      "maxIntervalMs": 6000
+    },
+    "sleep": {
+      "afterMs": 30000
     }
   },
   "physics": {
@@ -49,12 +49,7 @@
           "fps": 2.5,
           "loop": true,
           "weight": 5,
-          "frameMs": [
-            400,
-            300,
-            300,
-            600
-          ],
+          "frameMs": [400, 300, 300, 600],
           "motion": {
             "breathe": {
               "amplitude": 0.01,
@@ -68,12 +63,7 @@
           "fps": 2.22,
           "loop": true,
           "weight": 2,
-          "frameMs": [
-            500,
-            400,
-            400,
-            500
-          ],
+          "frameMs": [700.0, 600.0, 600.0, 700.0],
           "motion": {
             "breathe": {
               "amplitude": 0.01,
@@ -88,55 +78,35 @@
       "frames": 4,
       "fps": 4,
       "loop": true,
-      "frameMs": [
-        280,
-        220,
-        280,
-        220
-      ]
+      "frameMs": [380.0, 320.0, 380.0, 320.0]
     },
     "walk-right": {
       "sheet": "walk-right.png",
       "frames": 4,
       "fps": 4,
       "loop": true,
-      "frameMs": [
-        280,
-        220,
-        280,
-        220
-      ]
+      "frameMs": [380.0, 320.0, 380.0, 320.0]
     },
     "drag": {
       "sheet": "drag.png",
       "frames": 2,
       "fps": 3.33,
       "loop": true,
-      "frameMs": [
-        340,
-        260
-      ]
+      "frameMs": [340, 260]
     },
     "fall": {
       "sheet": "fall.png",
       "frames": 2,
       "fps": 3.85,
       "loop": true,
-      "frameMs": [
-        300,
-        220
-      ]
+      "frameMs": [300, 220]
     },
     "land": {
       "sheet": "land.png",
       "frames": 3,
       "fps": 5.56,
       "loop": false,
-      "frameMs": [
-        90,
-        130,
-        320
-      ]
+      "frameMs": [90, 130, 320]
     },
     "sleep": {
       "sheet": "sleep.png",
@@ -144,12 +114,7 @@
       "fps": 1.43,
       "loop": true,
       "layout": "vertical",
-      "frameMs": [
-        900,
-        500,
-        900,
-        500
-      ],
+      "frameMs": [900, 500, 900, 500],
       "size": {
         "w": 627,
         "h": 353
@@ -160,47 +125,28 @@
       "frames": 3,
       "fps": 6.52,
       "loop": false,
-      "frameMs": [
-        90,
-        110,
-        260
-      ]
+      "frameMs": [90, 110, 260]
     },
     "happy": {
       "sheet": "happy.png",
       "frames": 4,
       "fps": 5.56,
       "loop": false,
-      "frameMs": [
-        180,
-        140,
-        140,
-        260
-      ]
+      "frameMs": [230.0, 190.0, 190.0, 310.0]
     },
     "sad": {
       "sheet": "sad.png",
       "frames": 4,
       "fps": 2.86,
       "loop": true,
-      "frameMs": [
-        400,
-        300,
-        400,
-        300
-      ]
+      "frameMs": [400, 300, 400, 300]
     },
     "angry": {
       "sheet": "angry.png",
       "frames": 4,
       "fps": 4.35,
       "loop": true,
-      "frameMs": [
-        260,
-        200,
-        260,
-        200
-      ]
+      "frameMs": [310.0, 250.0, 310.0, 250.0]
     }
   }
 }
