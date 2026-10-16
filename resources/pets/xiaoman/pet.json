@@ -20,17 +20,17 @@
   },
   "schedule": {
     "idle": {
-      "minIntervalMs": 5000,
-      "maxIntervalMs": 10000,
+      "minIntervalMs": 6000,
+      "maxIntervalMs": 18000,
       "mode": "random",
       "plays": 1
     },
     "roam": {
       "minIntervalMs": 3000,
-      "maxIntervalMs": 6000
+      "maxIntervalMs": 9000
     },
     "sleep": {
-      "afterMs": 30000
+      "afterMs": 60000
     }
   },
   "physics": {
@@ -121,11 +121,24 @@
       "frameMs": [90, 110, 260]
     },
     "sleep": {
-      "sheet": "sleep.png",
-      "frames": 4,
-      "fps": 1.43,
-      "loop": true,
-      "frameMs": [900, 500, 900, 500]
+      "variants": [
+        {
+          "sheet": "sleep.png",
+          "frames": 4,
+          "fps": 1.43,
+          "loop": true,
+          "weight": 5,
+          "frameMs": [900, 500, 900, 500]
+        },
+        {
+          "sheet": "sleep-v2.png",
+          "frames": 4,
+          "fps": 1.43,
+          "loop": true,
+          "weight": 2,
+          "frameMs": [900, 500, 900, 500]
+        }
+      ]
     },
     "happy": {
       "sheet": "happy.png",

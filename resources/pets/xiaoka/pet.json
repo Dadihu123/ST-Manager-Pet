@@ -20,17 +20,17 @@
   },
   "schedule": {
     "idle": {
-      "minIntervalMs": 5000,
-      "maxIntervalMs": 10000,
+      "minIntervalMs": 6000,
+      "maxIntervalMs": 18000,
       "mode": "random",
       "plays": 1
     },
     "roam": {
       "minIntervalMs": 3000,
-      "maxIntervalMs": 6000
+      "maxIntervalMs": 9000
     },
     "sleep": {
-      "afterMs": 30000
+      "afterMs": 60000
     }
   },
   "physics": {
