@@ -188,8 +188,8 @@ def _check_upload_persistence():
         '真实浏览器上传链': os.path.isfile(os.path.join(REPO_ROOT, 'tools', 'verify-upload.mjs')),
         '重启后仍在（单测）': 'test_user_data_survives_new_store_instance' in store_tests,
         '重装后仍在（单测）': 'test_plugin_update_keeps_user_data' in store_tests,
-        '数据落 data_dir': 'def data_dir' in read('backend/__init__.py')
-            or 'api.data_dir()' in read('backend/__init__.py'),
+        '数据落 data_dir': 'def register(api)' in read('backend/__init__.py')
+            and 'api.private.dir()' in read('backend/__init__.py'),
     }
     return all(hits.values()), f'覆盖={hits}'
 

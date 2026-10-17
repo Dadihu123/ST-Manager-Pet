@@ -169,7 +169,7 @@ def register_routes(api, store: PetStore) -> None:
 
     # ---------------------------------------------------------------- 形象
 
-    @api.route('/pets', ['GET'])
+    @api.http.route('/pets', ['GET'])
     @_handle
     def list_pets():
         """可用形象列表 + 当前形象 + 动作词表（前端一次性拿全）。"""
@@ -205,7 +205,7 @@ def register_routes(api, store: PetStore) -> None:
             },
         })
 
-    @api.route('/pets/<pet_id>/runtime', ['GET'])
+    @api.http.route('/pets/<pet_id>/runtime', ['GET'])
     @_handle
     def get_runtime(pet_id):
         """某形象的运行期定义：已解析好的动作 → 图 URL + 回退结论。
@@ -214,7 +214,7 @@ def register_routes(api, store: PetStore) -> None:
         """
         return jsonify({'success': True, 'pet': runtime(pet_id)})
 
-    @api.route('/runtime', ['GET'])
+    @api.http.route('/runtime', ['GET'])
     @_handle
     def get_active_runtime():
         """当前形象（含设置里的 noise 配置）——前端启动时调这一个就够。"""
@@ -230,7 +230,7 @@ def register_routes(api, store: PetStore) -> None:
             payload['pet'] = runtime(pet_id)
         return jsonify(payload)
 
-    @api.route('/frame/<pet_id>/<action>', ['GET'])
+    @api.http.route('/frame/<pet_id>/<action>', ['GET'])
     @_handle
     def get_frame(pet_id, action):
         """返回某动作**某一套动画**实际生效的那张图（覆盖 > 包内 > 内置）。
@@ -315,7 +315,7 @@ def register_routes(api, store: PetStore) -> None:
         response.headers['X-Pet-Frame-Source'] = source
         return response
 
-    @api.route('/pets/active', ['POST'])
+    @api.http.route('/pets/active', ['POST'])
     @_handle
     def set_active_pet():
         """切换当前形象。"""
@@ -329,7 +329,7 @@ def register_routes(api, store: PetStore) -> None:
             'pet': runtime(pet_id),
         })
 
-    @api.route('/pets/<pet_id>', ['DELETE'])
+    @api.http.route('/pets/<pet_id>', ['DELETE'])
     @_handle
     def delete_pet(pet_id):
         """删除一个**用户**形象（内置形象不可删）。"""
@@ -348,7 +348,7 @@ def register_routes(api, store: PetStore) -> None:
 
     # ---------------------------------------------------------------- 导入
 
-    @api.route('/pets/import', ['POST'])
+    @api.http.route('/pets/import', ['POST'])
     @_handle
     def import_pet():
         """导入一个宠物包 zip。"""
@@ -363,7 +363,7 @@ def register_routes(api, store: PetStore) -> None:
             'activePetId': payload['id'],
         })
 
-    @api.route('/pets/create', ['POST'])
+    @api.http.route('/pets/create', ['POST'])
     @_handle
     def create_pet():
         """**从零新建**一个用户形象（不需要 zip，也不需要手写 pet.json）。
@@ -452,7 +452,7 @@ def register_routes(api, store: PetStore) -> None:
             'activePetId': created['id'],
         })
 
-    @api.route('/pets/<pet_id>/copy', ['POST'])
+    @api.http.route('/pets/<pet_id>/copy', ['POST'])
     @_handle
     def copy_pet(pet_id):
         """把一个形象（**含内置**）复制成可编辑的用户形象。
@@ -476,7 +476,7 @@ def register_routes(api, store: PetStore) -> None:
         )
         return jsonify({'success': True, 'pet': pack})
 
-    @api.route('/pets/<pet_id>/meta', ['POST'])
+    @api.http.route('/pets/<pet_id>/meta', ['POST'])
     @_handle
     def update_pet_meta(pet_id):
         """改写**自建形象**的元信息：名字 / 作者 / 标准图像 / 触发节奏。
@@ -509,7 +509,7 @@ def register_routes(api, store: PetStore) -> None:
         pack = store.update_pet_meta(pet_id, **kwargs)
         return jsonify({'success': True, 'pet': runtime(pack['id'])})
 
-    @api.route('/pets/<pet_id>/schedule', ['POST'])
+    @api.http.route('/pets/<pet_id>/schedule', ['POST'])
     @_handle
     def update_pet_schedule(pet_id):
         """调整某形象的**触发节奏**（逐形象保存，内置形象同样可调）。
@@ -547,7 +547,7 @@ def register_routes(api, store: PetStore) -> None:
 
         return jsonify({'success': True, 'pet': runtime(pet_id)})
 
-    @api.route('/pets/<pet_id>/export', ['GET'])
+    @api.http.route('/pets/<pet_id>/export', ['GET'])
     @_handle
     def export_pet(pet_id):
         """导出一个形象包 zip（便于用户备份/搬运）。"""
@@ -566,7 +566,7 @@ def register_routes(api, store: PetStore) -> None:
 
     # ------------------------------------------------------------ 外观微调
 
-    @api.route('/pets/<pet_id>/appearance', ['POST'])
+    @api.http.route('/pets/<pet_id>/appearance', ['POST'])
     @_handle
     def update_appearance(pet_id):
         """调整某形象的**大小倍率 / 渲染方式 / 动画速度 / 自动漫游**（逐形象保存）。
@@ -628,7 +628,7 @@ def register_routes(api, store: PetStore) -> None:
 
         return jsonify({'success': True, 'pet': runtime(pet_id)})
 
-    @api.route('/pets/<pet_id>/actions/<action>/animation', ['POST'])
+    @api.http.route('/pets/<pet_id>/actions/<action>/animation', ['POST'])
     @_handle
     def update_action_animation(pet_id, action):
         """改写某动作的**动画参数**（帧率 / 每帧时长 / 循环 / 排布 / 权重 / 运动）。
@@ -659,7 +659,7 @@ def register_routes(api, store: PetStore) -> None:
         )
         return jsonify({'success': True, 'pet': pack})
 
-    @api.route('/pets/<pet_id>/physics', ['POST'])
+    @api.http.route('/pets/<pet_id>/physics', ['POST'])
     @_handle
     def update_pet_physics(pet_id):
         """改写某形象的**物理参数**（重力 / 走速 / 摩擦 / 终端速度 / 弹性）。
@@ -677,7 +677,7 @@ def register_routes(api, store: PetStore) -> None:
         pack = store.update_pet_physics(pet_id, patch)
         return jsonify({'success': True, 'pet': pack})
 
-    @api.route('/pets/<pet_id>/layout', ['POST'])
+    @api.http.route('/pets/<pet_id>/layout', ['POST'])
     @_handle
     def update_pet_layout(pet_id):
         """改写某形象的**锚点 / 单帧尺寸 / 倍率 / 动画速度 / 自动漫游**等形象级字段。
@@ -701,7 +701,7 @@ def register_routes(api, store: PetStore) -> None:
         pack = store.update_pet_layout(pet_id, patch)
         return jsonify({'success': True, 'pet': pack})
 
-    @api.route('/pets/<pet_id>/overrides', ['DELETE'])
+    @api.http.route('/pets/<pet_id>/overrides', ['DELETE'])
     @_handle
     def clear_overrides(pet_id):
         """清掉某形象**全部**遗留覆盖图（内置形象的「一键清理」）。
@@ -720,7 +720,7 @@ def register_routes(api, store: PetStore) -> None:
 
     # ------------------------------------------------------- 单动作图覆盖
 
-    @api.route('/pets/<pet_id>/actions/<action>', ['POST'])
+    @api.http.route('/pets/<pet_id>/actions/<action>', ['POST'])
     @_handle
     def upload_action_image(pet_id, action):
         """上传/替换某个动作的图（单动作覆盖，不改包内原图）。"""
@@ -741,7 +741,7 @@ def register_routes(api, store: PetStore) -> None:
         )
         return jsonify({'success': True, 'override': payload})
 
-    @api.route('/pets/<pet_id>/actions/<action>/variants', ['POST'])
+    @api.http.route('/pets/<pet_id>/actions/<action>/variants', ['POST'])
     @_handle
     def add_action_variant(pet_id, action):
         """给某个动作**再加一套**动画（多套互相替代，按权重随机选一套）。
@@ -779,14 +779,14 @@ def register_routes(api, store: PetStore) -> None:
         )
         return jsonify({'success': True, 'variant': payload, 'pet': runtime(pet_id)})
 
-    @api.route('/pets/<pet_id>/actions/<action>/variants/<int:variant>', ['DELETE'])
+    @api.http.route('/pets/<pet_id>/actions/<action>/variants/<int:variant>', ['DELETE'])
     @_handle
     def delete_action_variant(pet_id, action, variant):
         """删掉某动作的**一套**动画（至少保留一套）。"""
         payload = store.remove_action_variant(pet_id, action, variant)
         return jsonify({'success': True, 'removed': payload, 'pet': runtime(pet_id)})
 
-    @api.route('/pets/<pet_id>/actions/<action>/variants/<int:variant>/pages', ['POST'])
+    @api.http.route('/pets/<pet_id>/actions/<action>/variants/<int:variant>/pages', ['POST'])
     @_handle
     def split_action_variant_pages(pet_id, action, variant):
         """把某一套动画的图**拆成 N 页**（降低解码峰值显存）。
@@ -806,7 +806,7 @@ def register_routes(api, store: PetStore) -> None:
         )
         return jsonify({'success': True, 'split': result, 'pet': runtime(pet_id)})
 
-    @api.route('/pets/<pet_id>/actions/<action>', ['DELETE'])
+    @api.http.route('/pets/<pet_id>/actions/<action>', ['DELETE'])
     @_handle
     def delete_action_image(pet_id, action):
         """删除某动作的覆盖图（回落到包内原图）。"""
@@ -821,7 +821,7 @@ def register_routes(api, store: PetStore) -> None:
 
     # ------------------------------------------------------------ 显示开关
 
-    @api.route('/visibility', ['GET', 'POST'])
+    @api.http.route('/visibility', ['GET', 'POST'])
     @_handle
     def pet_visibility():
         """宠物是否显示（**关闭宠物**的开关）。
@@ -860,7 +860,7 @@ def register_routes(api, store: PetStore) -> None:
 
     # ---------------------------------------------------------------- 设置
 
-    @api.route('/settings', ['GET'])
+    @api.http.route('/settings', ['GET'])
     @_handle
     def get_settings():
         """读取插件私有设置（标量配置在宿主的 config_schema，这里只给结构化部分）。"""
@@ -870,7 +870,7 @@ def register_routes(api, store: PetStore) -> None:
             'configKeys': list(CONFIG_KEYS),
         })
 
-    @api.route('/settings', ['POST'])
+    @api.http.route('/settings', ['POST'])
     @_handle
     def update_settings():
         """写入插件私有设置。"""
@@ -879,7 +879,7 @@ def register_routes(api, store: PetStore) -> None:
 
     # ---------------------------------------------------------------- 预览
 
-    @api.route('/pets/<pet_id>/preview', ['GET'])
+    @api.http.route('/pets/<pet_id>/preview', ['GET'])
     @_handle
     def preview_pet(pet_id):
         """形象的**预览数据**：每个动作的来源与是否可播，供设置页解释回退。

@@ -6,7 +6,7 @@
 
     resources/pets/<pet-id>/pet.json + *.png
 
-用户数据（`api.data_dir()`，宿主保证插件更新时保留）：
+用户数据（`api.private.dir()`，宿主保证插件更新时保留）：
 
     data/
     ├─ settings.json                    # 当前形象、动作覆盖记录
@@ -146,7 +146,7 @@ DEFAULT_SETTINGS = {
     # 只放**插件私有**的结构化状态。
     #
     # 标量开关（勿扰、播报…）声明在 manifest 的 `config_schema` 里，
-    # 由宿主的插件设置表单渲染、由 `api.get_config()/set_config()` 读写。
+    # 由宿主的插件设置表单渲染、由 `api.config.get()/set()` 读写。
     # 两边都存一份会造成「改了宿主表单但插件不生效」这类双写不同步的 bug，
     # 所以这里只留宿主表单表达不了的东西：当前形象 id、逐形象倍率与渲染方式。
 
@@ -386,7 +386,7 @@ class PetStore:
     """宠物形象的读写入口。
 
     Args:
-        data_dir: `api.data_dir()`（用户数据，插件更新时保留）。
+        data_dir: `api.private.dir()`（用户数据，插件更新时保留）。
         builtin_dir: 随包资源目录（`resources/pets`），**只读**。
     """
 

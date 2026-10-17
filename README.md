@@ -1614,6 +1614,27 @@ python tools/measure_dock_icons.py
 16 个写死的宿主图标名，插件资源路径会被静默丢弃。在**旧宿主**上，
 这个图标会降级为「图标位留空 + 一条 console 警告」，**文案照常显示**。
 
+### 宿主 API 契约（域命名空间）
+
+宿主的 `PluginAPI` 已从「扁平白名单」改成**域命名空间**，并且删掉了旧名
+（插件系统未发布，没有兼容层）。本插件后端用到的成员只有下表这些：
+
+| 用途 | 调用 | 旧名（已删除，不要再写） |
+|---|---|---|
+| 后端路由 | `api.http.route(rule, methods)` | `api.route(...)` |
+| 私有数据目录 | `api.private.dir()` | `api.data_dir()` |
+| 插件配置 | `api.config.get()` / `api.config.set(patch)` | `api.get_config()` / `api.set_config(...)` |
+| 日志 | `api.log.debug/info/warn/error(msg)` | `api.log('info', msg)` / `api.notify(...)` |
+| 事件 | `api.on` / `api.emit`（**未改名**） | — |
+
+规则文档：宿主 `docs/2026-10-12-plugin-api-expansion.md`（§3.3 是完整对照表）。
+**不要回退到扁平名**：宿主的 `PluginAPI` 上已经没有 `route` / `data_dir`，
+写旧名会在 `register()` 里直接 `AttributeError`，表现是「插件加载失败」而宠物不出现。
+
+这条契约由测试钉住（`tests/test_backend_api_usage.py`）：黑名单拦住旧名，
+白名单对着宿主生成的 `docs/plugin-api.md` 逐条核对插件用到的成员，
+再用一个**只实现域形状**的替身（`tests/fake_api.py`）跑一遍 `register(api)`。
+
 ### 目录结构
 ```
 backend/

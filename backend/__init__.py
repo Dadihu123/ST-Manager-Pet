@@ -1,10 +1,14 @@
 """stm-pet 插件后端入口。
 
 `register(api)` 由 manifest 的 `backend.register` 指定：宿主在 `create_app()` 阶段
-构造 `PluginAPI` 并调用它；`api.route()` 收集的路由规则会在 `register()` 返回后由
-`api.finalize()` 统一注册。
+构造 `PluginAPI` 并调用它；`api.http.route()` 收集的路由规则会在 `register()` 返回后
+由宿主的 `finalize()` 统一注册（`finalize` 是宿主内部机制，插件不调用）。
 
-装配：解读 manifest 里声明的标量配置 → 建存储层 → 注册路由。
+宿主契约以**域命名空间**组织（`api.cards.*` / `api.private.*` / `api.http.*` …），
+本插件用到的成员全部来自 `ST-Manager/docs/plugin-api.md`，不得回退到已删除的扁平名
+（`api.route()` / `api.data_dir()` / `api.log(level, msg)` …）。
+
+装配：读插件配置 → 建存储层 → 注册路由。
 """
 
 import logging
@@ -24,20 +28,15 @@ def _plugin_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _config_defaults(api) -> dict:
-    """从 manifest 的 `config_schema` 读默认值。
+def _plugin_config(api) -> dict:
+    """读插件当前配置（`api.config.get()`）。
 
-    单一来源：默认值只写在 manifest 里，插件不重复声明一遍，
-    避免「两处默认值不一致」这种最难查的 bug。
+    单一来源：默认值只写在 manifest 的 `config_schema` 里，插件不重复声明一遍，
+    避免「两处默认值不一致」这种最难查的 bug。`api.config.get()` 已经把
+    `config_schema` 的默认值与用户保存值合并好了，插件侧不必自己解析 schema。
     """
-    manifest = getattr(api, 'manifest', None)
-    schema = getattr(manifest, 'config_schema', None) or {}
-    properties = schema.get('properties') or {}
-    defaults = {}
-    for key, spec in properties.items():
-        if isinstance(spec, dict) and 'default' in spec:
-            defaults[key] = spec['default']
-    return defaults
+    config = api.config.get()
+    return config if isinstance(config, dict) else {}
 
 
 def register(api):
@@ -45,19 +44,18 @@ def register(api):
     from .core.store import PetStore
     from .routes import register_routes
 
-    data_dir = api.data_dir()
+    data_dir = api.private.dir()
     builtin_dir = os.path.join(_plugin_root(), BUILTIN_PETS_DIRNAME)
 
     store = PetStore(data_dir, builtin_dir)
-    api.log('info', f'stm-pet 装配：数据目录 {data_dir}')
+    api.log.info(f'stm-pet 装配：数据目录 {data_dir}')
     if not os.path.isdir(builtin_dir):
-        api.log('warning', f'随包形象目录缺失，仅用户形象可用: {builtin_dir}')
+        api.log.warn(f'随包形象目录缺失，仅用户形象可用: {builtin_dir}')
 
-    # 把当前配置快照挂到 api 上，路由层用 `_config_defaults` 之外的读取路径时可用
     try:
-        api.log('info', f'stm-pet 配置: {_config_defaults(api)}')
+        api.log.info(f'stm-pet 配置: {_plugin_config(api)}')
     except Exception:  # noqa: BLE001 - 配置读取失败不该阻断插件加载
-        logger.warning('读取插件配置默认值失败', exc_info=True)
+        logger.warning('读取插件配置失败', exc_info=True)
 
     register_routes(api, store)
 
@@ -65,4 +63,4 @@ def register(api):
     api.pet_store = store
 
     available = [item['id'] for item in store.list_pets()]
-    api.log('info', f'stm-pet 就绪：{len(available)} 个形象 {available}')
+    api.log.info(f'stm-pet 就绪：{len(available)} 个形象 {available}')

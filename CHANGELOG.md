@@ -6,6 +6,44 @@
 
 ### 变更
 
+**后端改用宿主的域命名空间 API（跟随宿主删掉扁平名）**
+
+- 宿主把 `PluginAPI` 从「扁平白名单」改成了**域命名空间**，并且删掉了全部旧名
+  （方案与完整对照表：`ST-Manager/docs/2026-10-12-plugin-api-expansion.md` §3.3；
+  契约文档：`ST-Manager/docs/plugin-api.md`）。插件系统未发布，因此没有兼容层——
+  写旧名不是「报警告」，而是 `register()` 里立刻 `AttributeError`，
+  宿主只留一句「插件加载失败」，宠物根本不出现。
+- 本插件用到的四处后端契约全部改名：
+
+  | 用途 | 旧（已删除） | 新 |
+  |---|---|---|
+  | 后端路由（25 个装饰器） | `@api.route(rule, methods)` | `@api.http.route(rule, methods)` |
+  | 私有数据目录 | `api.data_dir()` | `api.private.dir()` |
+  | 装配日志 | `api.log('info'/'warning', msg)` | `api.log.info(msg)` / `api.log.warn(msg)` |
+  | 插件配置 | 自己解析 `manifest.config_schema` | `api.config.get()` |
+
+  `api.on` / `api.emit` **未改名**（EventEmitter 惯用法保持顶层扁平）。
+- 顺带修掉一个因此暴露出来的 bug：`_config_defaults()` 用
+  `getattr(manifest, 'config_schema', None)` 读默认值，而 `api.manifest` 是
+  **dict 快照**（`manifest.to_dict()`），因此它一直返回 `{}`——
+  装配日志里那行「stm-pet 配置: {}」是空的。现在改走 `api.config.get()`
+  （宿主已把 schema 默认值与用户保存值合并好），实测输出
+  `{'quiet_mode': False, 'announce_cards': True, 'announce_jobs': True, 'show_toast': False}`。
+- **把「只能用新契约」变成可检查的**（新增 `tests/test_backend_api_usage.py`）：
+  - 黑名单：后端源码里出现任何旧名调用（`api.route` / `api.data_dir` /
+    `api.log('info', …)` / `api.get_config` / `api.db` … 共 31 个）即失败。
+    注释与文档字符串先被剥离——本仓库的说明文字里刻意写着这些旧名。
+  - 白名单：从宿主生成的 `docs/plugin-api.md` 解析出后端契约成员，
+    逐条核对插件用到的每个 `api.*` 都登记过（宿主仓库不可用时跳过，
+    与既有的 `test_host_api_usage.py` 同一处置）。
+  - 装配钉子：用**只实现域形状、刻意不提供任何扁平旧名**的替身
+    （`tests/fake_api.py` 已重写）跑一遍 `register(api)`，断言私有目录被建、
+    26 条路由真的进了蓝图、`GET /pets` 返回 200、日志 level 全在
+    `{debug, info, warn, error}` 里。
+  - 另外用**真实宿主** `PluginAPI`（`ST-Manager@b7db0a4`）装配验证过一遍：
+    `api.finalize()` 通过，26 条路由全部注册，`/pets` `/runtime` `/settings`
+    `/visibility` 四个接口均 200。
+
 **落地切换：脚底一沾地就播落地，不再等反弹结束**
 
 - 用户报障：「人物现在坠落的姿态接触到地面后……会有那么很短的一段时间人物

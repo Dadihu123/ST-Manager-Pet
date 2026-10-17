@@ -136,7 +136,7 @@ def test_update_settings_round_trips(store):
 def test_update_settings_ignores_unknown_keys(store):
     """未知键（含宿主 config_schema 里的标量键）一律忽略。
 
-    标量配置的唯一来源是 manifest 的 `config_schema`（宿主表单渲染 + `api.set_config`），
+    标量配置的唯一来源是 manifest 的 `config_schema`（宿主表单渲染 + `api.config.set`），
     插件私有设置里不该再存一份，否则两边会不同步。
     """
     store.update_settings({'hacker': 'x', 'quietMode': True, 'scale': 2})
