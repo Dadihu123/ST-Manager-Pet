@@ -36,7 +36,7 @@ import {
   walkActionFor,
 } from './direction.js';
 import { createGesture, DEFAULT_HOLD_MS, DEFAULT_SLOP } from './gesture.js';
-import { createPhysics, estimateReleaseVelocity } from './physics.js';
+import { createPhysics, estimateReleaseVelocity, hopVelocity } from './physics.js';
 import { createStateMachine, STATES } from './statemachine.js';
 
 /** 指针采样窗口（毫秒），用于估算甩出速度。 */
@@ -99,8 +99,17 @@ const DRAG_HOLD_MS = DEFAULT_HOLD_MS;
 /** 位移超过这么多像素就立刻算拖拽（不必等长按）。 */
 const DRAG_SLOP = DEFAULT_SLOP;
 
-/** 点击后的小弹跳初速度（像素/秒）。 */
-const CLICK_HOP_VELOCITY = -260;
+/**
+ * 点击后的小弹跳**高度比例**的兜底（`physics.clickHop` 缺失时用它）。
+ *
+ * 为什么这里不再有「固定初速度」：观感由**高度**决定，而
+ * `h = v²/(2·gravity)`。`gravity` 与单帧尺寸都是包可声明的（各自差三个
+ * 数量级），所以绝对速度在合法的包里会变成「没有」（gravity 20000 → 0.2px）
+ * 或「飞走」（gravity 100 → 337px 且 5 秒才落地）。高度比例才对每个包一致。
+ *
+ * 取值 0.07：内置形象（高 259px）实测 18px，与改动前的 `-260` 逐帧等价。
+ */
+const DEFAULT_CLICK_HOP_RATIO = 0.07;
 
 /**
  * 「忙完之后补睡」要隔多久才真的躺下（毫秒）。
@@ -1820,26 +1829,75 @@ export function createPetView(options = {}) {
    * 一次真正的「点击」。
    *
    * 旧实现里点击几乎触发不到（拖拽抢走了所有按下），现在手势层先把两者分开，
-   * 这里就只管播 `click` 动作 + 一个小弹跳作为反馈。
+   * 这里只管**播 `click` 动作 + 一次弹跳**作为反馈。
    *
-   * 顺序与旧实现一致（`settle` → `react('click')` → 给一个上抛初速度），
-   * 只是多了「清掉 idle 排期」：用户刚点过它，不该马上又自己动一下。
+   * 三条规则，每一条都对应一个实测过的故障（连续点击时全部会复现）：
+   *
+   * 1. **不二段跳**：只有站在地上时才给上抛速度。
+   *    原来无条件 `setVelocity(0, -260)`，等于每次点击都在当前高度重新抛一次，
+   *    而一次弹跳的空中时间约 290ms——**点击间隔小于它就会累积**。
+   *    实测（小满，高 259px）：每 200ms 点一次 6 秒抬升 437px；每 80ms 一次
+   *    4.4 秒就顶到屏幕上边并贴在那里。改成「落地才跳」之后同样猛点仍是 18px。
+   *
+   * 2. **不重播正在播的那一轮**：`click` 动画正在播时，新点击**不**从头开始。
+   *    退出条件的 `frameMs` 是 `[90, 110, 260]`（一轮 460ms），80ms 连点等于
+   *    每 5 帧重置一次，于是**永远只显示第 0 帧**（实测「出现过的帧=[0]」）。
+   *    现在的处理是「这一轮播完再说」：一直点就一直播整轮，松手自然收尾。
+   *
+   * 3. **不改写 `grounded`**：用 `halt()` 而不是 `endDrag(0, 0)`。
+   *    后者会 `grounded = false`，让「站在地上被点了一下」变成「它离地了」，
+   *    于是空中护栏每次点击都撤掉 idle / 漫游 / 打盹的排期再补回来。
+   *
+   * 顺序与旧实现一致（`settle` → `react('click')` → 给上抛初速度）。
    */
   function handleClick() {
-    physics.endDrag(0, 0);
-    machine.settle({ now: lastInteractionAt });
-    cancelIdleWake();
-    if (actionSpec('click')) {
-      machine.react('click', { now: lastInteractionAt });
-      scheduleReactionEnd('click', 200);
-    }
-    // 点击后稍微弹一下，是有反馈感的最小代价。
+    // ★ 必须在 `halt()` / `settle()` **之前**读：这里要的是「点击那一刻它在不在空中」。
+    const wasGrounded = physics.grounded;
+    // ★ 也必须在 `settle()` **之前**判定。
     //
+    // `settle()` 会把状态切回 `idle`，因此在它之后判 `machine.state === REACT`
+    // 永远为假——动画照样每次都从头播。这个顺序错误由真实浏览器验收抓到
+    // （`tools/verify-anim.mjs` ④b：连点 18 次只观察到 1 个帧位）。
+    const replaying = machine.state === STATES.REACT && machine.action === 'click';
+
+    if (wasGrounded) {
+      // 只清运动（vx / vy / inputActive），**不动** `grounded` 与 `dragging`。
+      // `inputActive` 必须清：否则点一下正在走路的宠物，摩擦就不再接手，
+      // 它会一直滑到屏幕边（`handleClick` 把状态切出 WALK 之后，
+      // `updateStateFromPhysics` 里那个 `stopWalking()` 分支再也跑不到）。
+      //
+      // ⚠️ 只在**站着**时清：宠物被甩出去还在飞的时候点它，不该被凭空
+      // 定在半空（那看起来像撞上了看不见的墙）。那时让它按原来的抛物线
+      // 飞完，点击只体现为动画（空中播报会排队，落地后立刻播）。
+      physics.halt();
+    }
+    cancelIdleWake();
+
+    // 正在播点击动画时**什么都不重来**：不 settle（那会把它踢回 idle 并
+    // 重新排期）、不 react、也不重置结束定时器。这一轮照原样播完。
+    if (!replaying) {
+      machine.settle({ now: lastInteractionAt });
+      if (actionSpec('click')) {
+        machine.react('click', { now: lastInteractionAt });
+        scheduleReactionEnd('click', 200);
+      }
+    }
+
+    if (!wasGrounded) return;
+    // 「被碰一下」的物理反馈：高度由包声明（`physics.clickHop`，0 = 不弹）。
+    // 反解成速度而不是给绝对速度——见 `hopVelocity()` 的说明。
+    const ratio = Number(physics.params.clickHop);
+    const velocity = hopVelocity({
+      gravity: physics.params.gravity,
+      height,
+      ratio: Number.isFinite(ratio) ? ratio : DEFAULT_CLICK_HOP_RATIO,
+    });
+    if (!velocity) return;
     // 注意这里**不**切到 `fall` 态：`react` 态到 `fall` 不在迁移表里，
     // 那次 `go()` 会被拒绝（旧实现也是如此）。物理照常推进，因此
     // 「弹一下」的观感不变，而状态仍是 `react`——这样点击动画能完整播完，
     // 落回地面也不会把 `land` 插进来打断它。
-    physics.setVelocity(0, CLICK_HOP_VELOCITY);
+    physics.setVelocity(0, velocity);
   }
 
   function onContextMenu(event) {

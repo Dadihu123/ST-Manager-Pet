@@ -10,6 +10,9 @@ tmp/
 # 提示词 / 方案书
 docs/
 
+# 图像生成工作台的产物（本地临时图，不属于插件资源）
+dsh-image-gen/
+
 # Python
 __pycache__/
 *.py[cod]

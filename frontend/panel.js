@@ -354,6 +354,13 @@ const HELP_SECTIONS = [
           + '0 则「啪」地贴在地上。',
         risky: true,
       },
+      {
+        term: '点击弹起 clickHop',
+        body: '被点一下时离开地面多高，按占身高的比例算（与重力无关）。',
+        recommend: '默认 0.07（约身高的 1/14）。坐姿 / 躺姿这类'
+          + '「本来就不会原地起跳」的形象调 0：只播点击动画，不做物理弹跳。',
+        risky: true,
+      },
     ],
   },
   {
@@ -2510,6 +2517,18 @@ export function createSettingsPanel({
         step: 0.01,
         fallback: 0.15,
         hint: '默认 0.15。0.4 以上会像皮球。',
+      },
+      {
+        key: 'clickHop',
+        label: '点击弹起',
+        unit: '占身高比例',
+        min: 0,
+        max: 0.3,
+        step: 0.01,
+        fallback: 0.07,
+        // 这一项就是「被点击动画没有跳感」的出口：坐着 / 躺着的形象调 0，
+        // 用的是动画本身那一下；没有 click 美术的最小包则靠它给反馈。
+        hint: '默认 0.07（约 18px）。0 = 点了完全不弹，只播点击动画。',
       },
     ];
 

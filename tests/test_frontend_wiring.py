@@ -1608,6 +1608,74 @@ def test_css_defines_the_preview_frame_layer(css):
     assert 'background-repeat: no-repeat' in body, '不能平铺（否则邻帧会重复出现）'
 
 
+def _handle_click_body(petview):
+    """取出 `handleClick()` 的函数体（到下一个顶层注释块为止）。"""
+    start = petview.index('function handleClick(')
+    rest = petview[start:]
+    end = rest.find('\n  /**')
+    return rest if end == -1 else rest[:end]
+
+
+def test_click_hop_only_when_grounded(petview):
+    """★ 点击弹跳只在**站地上**时给（不允许二段跳）。
+
+    原来无条件 `setVelocity(0, -260)`，等于每次点击都在当前高度重新抛一次。
+    一次弹跳的空中时间约 290ms，因此点击间隔小于它就会累积：
+    实测（小满，高 259px）每 200ms 点一次，6 秒抬升 **437px**；
+    每 80ms 一次，**4.4 秒就顶到屏幕上边**并贴在那里。
+    """
+    body = _handle_click_body(petview)
+    assert 'const wasGrounded = physics.grounded' in body, (
+        '必须先记下点击那一刻是否在地面上'
+    )
+    assert 'if (!wasGrounded) return' in body, '空中点击不该给上抛速度'
+    # 上抛速度必须来自高度反解，而不是写死的速度常量
+    assert 'hopVelocity(' in body, '弹跳高度必须来自包的 clickHop（经 hopVelocity 反解）'
+    assert 'setVelocity(0, ' in body
+
+
+def test_click_hop_ratio_comes_from_the_pack(petview):
+    """弹跳高度是**包声明**的 `physics.clickHop`，不是插件写死的常量。
+
+    为什么必须这样：观感由高度决定，而 `h = v²/(2·gravity)`。`gravity` 是包可
+    声明的（0 ~ 20000），固定速度 -260 在合法包里实测从 337px（gravity=100，
+    且 5 秒才落地）到 0.2px（gravity=20000）——差三个数量级。
+    """
+    body = _handle_click_body(petview)
+    assert 'physics.params.clickHop' in body, '必须读包声明的 clickHop'
+    assert 'physics.params.gravity' in body, '反解速度需要该包的重力'
+    assert 'CLICK_HOP_VELOCITY' not in petview, '写死的上抛速度已删除'
+
+
+def test_click_does_not_restart_a_playing_click_animation(petview):
+    """★ 正在播点击动画时，新点击**不**从头重播。
+
+    `click` 的一轮是 `frameMs: [90, 110, 260]` = 460ms。80ms 连点等于每 5 帧
+    就 `setSpec` 重置一次，于是**永远只显示第 0 帧**（实测「出现过的帧=[0]」），
+    观感就是用户说的「鬼畜」。合并之后同样连点是连续播整轮。
+    """
+    body = _handle_click_body(petview)
+    assert "machine.action === 'click'" in body, '要判断当前播的是不是点击动画'
+    assert 'if (!replaying)' in body, '播放期间不能再触发一次 react'
+    # `scheduleReactionEnd` 也必须被这条包住，否则结束定时器会被反复重置
+    guarded = body[body.index('if (!replaying)'):]
+    guarded = guarded[:guarded.index('\n      }')]
+    assert "machine.react('click'" in guarded
+    assert "scheduleReactionEnd('click'" in guarded
+
+
+def test_click_uses_halt_not_end_drag(petview):
+    """★ 点击路径必须用 `halt()`，不能用 `endDrag(0, 0)`。
+
+    `endDrag` 的语义是「松手交回物理」，会 `grounded = false`。点击时宠物一直
+    站在地上，用它就等于每次点击都谎报一次「它离地了」——空中护栏于是每次
+    点击都撤掉 idle / 漫游 / 打盹的排期再补回来，`physics.resting` 也变假。
+    """
+    body = _handle_click_body(petview)
+    assert 'physics.halt()' in body, '点击应原地停住（不动 grounded）'
+    assert 'physics.endDrag(0, 0)' not in body, 'endDrag 会谎报 grounded'
+
+
 def test_no_compat_shims_for_unreleased_versions():
     """★ 插件**尚未发布**，因此不该有任何「兼容旧版本」的分支。
 

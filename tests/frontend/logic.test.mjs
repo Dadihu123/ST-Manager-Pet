@@ -17,6 +17,7 @@ import { createFrameClock, decideThrottle, createIdleGate, MAX_FPS } from '../..
 import {
   createPhysics,
   estimateReleaseVelocity,
+  hopVelocity,
   DEFAULT_PHYSICS,
   FIXED_STEP,
 } from '../../frontend/physics.js';
@@ -602,6 +603,162 @@ test('甩出速度：同一时刻的采样不产生除零', () => {
   const samples = [{ x: 0, y: 0, t: 100 }, { x: 50, y: 50, t: 100 }];
   const result = estimateReleaseVelocity(samples);
   assert.ok(Number.isFinite(result.vx) && Number.isFinite(result.vy));
+});
+
+// ============================================ 点击弹跳（可反复触发的反馈）
+
+/**
+ * 复现「连点把宠物越抬越高」的那条链：站在地上 → halt → 给上抛速度。
+ *
+ * 与 `petview.js:handleClick` 的规则逐条对应（不二段跳 / 高度来自包声明）。
+ */
+function clickOnce(body, ratio = DEFAULT_PHYSICS.clickHop) {
+  const wasGrounded = body.grounded;
+  if (wasGrounded) body.halt();
+  if (!wasGrounded) return false;
+  const velocity = hopVelocity({
+    gravity: body.params.gravity,
+    height: body.size.height,
+    ratio,
+  });
+  if (!velocity) return false;
+  body.setVelocity(0, velocity);
+  return true;
+}
+
+function clickTrace({ intervalMs, durationMs, ratio }) {
+  const body = physicsAt({
+    y: 600, bounds: { width: 1000, height: 600 }, width: 173, height: 259,
+  });
+  body.advance(FIXED_STEP);   // 先落稳一帧（物理层初始 grounded 为假）
+  let next = 0;
+  let highest = body.y;
+  let hops = 0;
+  for (let t = 0; t <= durationMs; t += 1000 / 60) {
+    if (t >= next) {
+      next += intervalMs;
+      if (clickOnce(body, ratio)) hops += 1;
+    }
+    body.advance(1 / 60);
+    highest = Math.min(highest, body.y);
+  }
+  return { lift: +(600 - highest).toFixed(1), hops };
+}
+
+test('点击弹跳：高度由包声明（clickHop 比例），与重力无关', () => {
+  // 同样的 `clickHop`，重力跨两个数量级，抬升高度必须仍在同一量级。
+  //
+  // 容差 ±25% 而不是更紧：物理是**半隐式欧拉 + 固定 1/120s 步长**，离散误差
+  // 约 `v·dt/2`，它随 g（即随 v）线性增长——实测 g=200 时误差 1%、
+  // g=1800 时 5%、g=20000 时 20%（18.1px → 14.5px，且始终**偏小**、不会飞走）。
+  // 这是积分器的固有性质，不是本次改动引入的，因此不在这里判它。
+  //
+  // 真正要守的是**对比**：改动前的固定速度 -260 在同一批重力下是
+  // 337px → 18px → 0.2px（差三个数量级，且 gravity=0 时宠物一路升到屏幕边）。
+  const lifts = [];
+  for (const gravity of [200, 1800, 20000]) {
+    const body = physicsAt({
+      y: 600, bounds: { width: 1000, height: 600 }, width: 173, height: 259,
+      physics: { gravity },
+    });
+    body.advance(FIXED_STEP);
+    clickOnce(body);
+    let highest = body.y;
+    for (let index = 0; index < 600; index += 1) {
+      body.advance(1 / 60);
+      highest = Math.min(highest, body.y);
+    }
+    lifts.push(600 - highest);
+  }
+  const expected = 259 * DEFAULT_PHYSICS.clickHop;
+  for (const [index, gravity] of [200, 1800, 20000].entries()) {
+    const lift = lifts[index];
+    assert.ok(
+      lift > expected * 0.75 && lift < expected * 1.1,
+      `gravity=${gravity} 抬升 ${lift.toFixed(1)}px 偏离 ${expected.toFixed(1)}px 太多：${lifts}`,
+    );
+  }
+  const spread = Math.max(...lifts) / Math.min(...lifts);
+  assert.ok(spread < 1.35, `三档重力下的抬升不该差出一大截：${lifts.map((v) => v.toFixed(1))}`);
+});
+
+test('点击弹跳：连点不会累积高度（不二段跳）', () => {
+  // 一次弹跳的空中时间约 290ms，因此 200ms 与 80ms 这两种节奏都会撞上
+  // 「上一次还在空中就又被点」。改动前它们分别是 437px / 800px（顶到屏幕上边）。
+  for (const intervalMs of [80, 100, 150, 200]) {
+    const { lift } = clickTrace({ intervalMs, durationMs: 6000 });
+    const single = 259 * DEFAULT_PHYSICS.clickHop;
+    assert.ok(
+      lift <= single + 2,
+      `每 ${intervalMs}ms 点一次，抬升 ${lift}px 超过了单次弹跳 ${single.toFixed(1)}px`,
+    );
+  }
+});
+
+test('点击弹跳：空中点击不改速度（正在下落时点它不会把它托起来）', () => {
+  const body = physicsAt({
+    y: 300, bounds: { width: 1000, height: 600 }, width: 173, height: 259,
+  });
+  body.advance(FIXED_STEP);
+  assert.equal(body.grounded, false, '前提：它在空中');
+  const before = { vx: body.vx, vy: body.vy };
+  assert.equal(clickOnce(body), false, '空中点击不该给出上抛速度');
+  // 同一步内的重力增量不算「被点击改动」，因此这里只断言没有被改快
+  assert.ok(body.vy >= before.vy - 1, `vy 不该被托起来：${before.vy} → ${body.vy}`);
+  assert.equal(body.vx, before.vx);
+});
+
+test('点击弹跳：clickHop = 0 时完全不弹（给没有跳感的形象）', () => {
+  const body = physicsAt({
+    y: 600, bounds: { width: 1000, height: 600 }, width: 173, height: 259,
+  });
+  body.advance(FIXED_STEP);
+  assert.equal(clickOnce(body, 0), false);
+  assert.equal(body.vy, 0, '不该产生任何竖直速度');
+  assert.equal(body.grounded, true, '也不该被踢成「离地」');
+});
+
+test('点击弹跳：失重包（gravity=0）不会让宠物一路上升', () => {
+  // 固定速度 -260 在 gravity=0 下会把宠物顶到屏幕边并永久停在那里
+  assert.equal(hopVelocity({ gravity: 0, height: 259, ratio: 0.07 }), 0);
+  const body = physicsAt({
+    y: 600, bounds: { width: 1000, height: 600 }, width: 173, height: 259,
+    physics: { gravity: 0 },
+  });
+  body.advance(FIXED_STEP);
+  clickOnce(body);
+  for (let index = 0; index < 600; index += 1) body.advance(1 / 60);
+  assert.equal(body.y, 600, '失重包里不该被弹起来');
+});
+
+test('halt()：停住运动但不谎报 grounded', () => {
+  const body = physicsAt({
+    y: 600, bounds: { width: 1000, height: 600 }, width: 173, height: 259,
+  });
+  body.advance(FIXED_STEP);
+  body.walk(1);
+  assert.ok(body.vx > 0);
+  body.halt();
+  assert.equal(body.vx, 0, '水平速度应清零');
+  assert.equal(body.vy, 0);
+  assert.equal(body.grounded, true, '★ 站着被点一下不该变成「在空中」');
+  assert.equal(body.walking, false, '水平输入必须清掉，否则摩擦不再接手');
+});
+
+test('halt()：清掉 inputActive 后摩擦重新生效（点一下正在走路的宠物）', () => {
+  const body = physicsAt({
+    y: 600, bounds: { width: 1000, height: 600 }, width: 173, height: 259,
+  });
+  body.advance(FIXED_STEP);
+  body.walk(1);
+  for (let index = 0; index < 30; index += 1) body.advance(1 / 60);
+  const beforeClick = body.x;
+  body.halt();
+  for (let index = 0; index < 120; index += 1) body.advance(1 / 60);
+  assert.ok(
+    Math.abs(body.x - beforeClick) < 5,
+    `点完之后不该继续滑：位移 ${(body.x - beforeClick).toFixed(1)}px`,
+  );
 });
 
 // ================================================================ 状态机

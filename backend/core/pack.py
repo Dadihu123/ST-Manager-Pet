@@ -676,6 +676,16 @@ DEFAULT_PHYSICS = {
     'friction': 0.02,
     'terminalVelocity': 2400.0,
     'bounce': 0.15,
+    #: 「被点一下」最多离开地面多高，**相对宠物高度**的比例（`0` = 不弹）。
+    #:
+    #: 为什么是比例而不是像素、为什么不给速度：见 `frontend/physics.js` 里
+    #: `DEFAULT_PHYSICS.clickHop` 与 `hopVelocity()` 的说明。一句话——
+    #: 观感由高度决定，而高度随 `gravity`（0 ~ 20000）与单帧尺寸（8 ~ 1024px）
+    #: 各差三个数量级，任何绝对量都会在合法的包里变成「没有」或「飞走」。
+    #:
+    #: 为什么这个键属于 `physics` 而不是 click 的动画块：没有 click 美术的包
+    #: （最小包只有一张 idle 静图）同样需要这个反馈，而那时动画块根本不存在。
+    'clickHop': 0.07,
 }
 
 #: 物理参数的合法区间：`(最小值, 最大值)`。全闭区间。
@@ -685,6 +695,9 @@ _PHYSICS_RANGES = {
     'friction': (0.0, 1.0),
     'terminalVelocity': (1.0, 20000.0),
     'bounce': (0.0, 1.0),
+    #: 上界 0.3：259px 的形象弹 78px（30% 身高）已经很像「被弹起来」，
+    #: 再高就不是「被碰一下」而是「跳起来了」。
+    'clickHop': (0.0, 0.3),
 }
 
 _MIN_FRAME_SIZE = 1

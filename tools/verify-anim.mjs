@@ -273,6 +273,73 @@ async function main() {
       `action=${clickAction}`,
     );
 
+    // ================================ ④b 连点不该把宠物越抬越高（A+B 的验收）
+    //
+    // 用户报障：「点击动画是可以被反复触发的，如果用户框点，人物会被缓慢的
+    // 不断抬高，动画也会比较鬼畜」。
+    //
+    // 判定用**真实指针连点**，量两件事：
+    //   ① 最高点相对地面的高度必须停在「单次弹跳」的量级（不看绝对值——
+    //      包的 clickHop 可以调，只看它没有累积）；
+    //   ② 点击动画的三帧要真的都出现过（不能永远停在第 0 帧）。
+    //
+    // 实测（改动前）每 80ms 点一次时 4.4 秒就顶到屏幕上边，且只出现第 0 帧。
+    //
+    // ⚠️ 基线必须**等它落回地面**再取：④ 那一次点击刚给完弹跳，此刻 y 还在
+    // 半途。拿它当基线会把「落地」误判成「下沉 17px」，也会让最高点看起来
+    // 是 0（实测踩过：基线取在弹跳中途时抬升读数恒为 0.0px）。
+    await sleep(800);
+    const beforeMash = await page.evaluate('window.__p.pos()');
+    const mx = Math.round(beforeMash.x + beforeMash.w / 2);
+    const my = Math.round(beforeMash.y + beforeMash.h / 2);
+    const framePositions = new Set();
+    let highestDuringMash = beforeMash.y;
+    for (let index = 0; index < 18; index += 1) {
+      await page.send('Input.dispatchMouseEvent', {
+        type: 'mousePressed', x: mx, y: my, button: 'left', buttons: 1, clickCount: 1,
+      });
+      await sleep(30);
+      await page.send('Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x: mx, y: my, button: 'left', buttons: 0, clickCount: 1,
+      });
+      // 每 3 次取一次读数，避免 evaluate 太密影响连点节奏
+      if (index % 2 === 0) {
+        const probe = await page.evaluate(`(() => {
+          const pos = window.__p.pos();
+          return { y: pos.y, frame: window.__p.framePos() };
+        })()`);
+        highestDuringMash = Math.min(highestDuringMash, probe.y);
+        if (probe.frame) framePositions.add(probe.frame);
+      }
+      await sleep(50);
+    }
+    await sleep(600);
+    const afterMash = await page.evaluate('window.__p.pos()');
+    const mashSettle = await page.evaluate(`(() => {
+      const view = window.__petView;
+      return { state: view ? view.state : '', action: view ? view.action : '' };
+    })()`);
+    const lift = Math.max(0, beforeMash.y - highestDuringMash);
+    const petH = beforeMash.h || 1;
+    record(
+      '④b 连点 18 次：抬升不超过单次弹跳量级（不累积）',
+      lift <= petH * 0.45,
+      `连点期间最高抬升 ${lift.toFixed(1)}px（宠物高 ${petH.toFixed(0)}px，`
+      + `上限 ${(petH * 0.45).toFixed(0)}px）；松手后 y=${afterMash.y.toFixed(1)}`
+      + ` state=${mashSettle.state} action=${mashSettle.action}`,
+    );
+    record(
+      '④b 连点期间点击动画播到多于一帧（不是只停在第 0 帧）',
+      framePositions.size >= 2,
+      `出现过的帧位置 ${framePositions.size} 个：${[...framePositions].join(' | ')}`,
+    );
+    record(
+      '④b 连点结束后回到地面且回到 idle',
+      mashSettle.state === 'idle' && Math.abs(afterMash.y - beforeMash.y) < 2,
+      `state=${mashSettle.state}（应 idle）、y 偏差 `
+      + `${Math.abs(afterMash.y - beforeMash.y).toFixed(1)}px`,
+    );
+
     // ============================================ ⑤ 长按 0.5s 才进入拖拽
     const beforeHold = await page.evaluate('window.__p.pos()');
     const hx = Math.round(beforeHold.x + beforeHold.w / 2);

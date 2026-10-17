@@ -32,6 +32,21 @@ export const DEFAULT_PHYSICS = {
   friction: 0.02,
   terminalVelocity: 2400,
   bounce: 0.15,
+  //: 「被点一下」最多离开地面多高，**相对宠物的高度**（不是像素）。
+  //:
+  //: 为什么不直接给一个初速度：观感由**高度**决定，而
+  //: `h = v² / (2·gravity)`。`gravity` 是包可声明的参数（合法区间
+  //: 0 ~ 20000），于是同一个速度在不同包里意味着完全不同的东西：
+  //: 实测 `v = 260px/s` 时，gravity=100 会抬升 337px 并且**51 秒才落地**
+  //: （拾取动画变成「它飞走了」），gravity=20000 只抬升 0.2px（等于没有）。
+  //: 改成声明高度之后，任何 gravity 下都是同一个观感。
+  //:
+  //: 为什么用比例而不是绝对像素：宠物单帧尺寸的合法区间是 8 ~ 1024px，
+  //: 同一个 `18px` 对 32px 的小宠物是半个身子，对 1024px 的立绘是看不见。
+  //:
+  //: `0` = **完全不弹**：给「坐着 / 躺着 / 本来就没有跳感」的形象用。
+  //: 默认 `0.07`：小满（高 259px）实测 18px，与改动前的固定速度 -260 等价。
+  clickHop: 0.07,
 };
 
 /**
@@ -313,6 +328,29 @@ export function createPhysics(options = {}) {
       return this;
     },
 
+    /**
+     * **原地停住**：清掉速度与水平输入，但**不动** `grounded`。
+     *
+     * 为什么不能复用 `endDrag(0, 0)`：那个的语义是「松手交回物理」，会
+     * `grounded = false`。点击路径上宠物**一直站在地上**，用 `endDrag` 就等于
+     * 每次点击都谎报一次「它离地了」——`updateStateFromPhysics` 的空中护栏
+     * 于是每次点击都撤掉 idle / 漫游 / 打盹的排期再补回来，`physics.resting`
+     * 也变假。眼下靠自愈能跑，但状态是假的，任何依赖 `grounded` 的新逻辑
+     * 都会在这里出错。
+     *
+     * 而它**必须**清 `inputActive`：`walk()` 会把它置真，如果不在这里清掉，
+     * 点一下正在走路的宠物之后摩擦就不生效了（`step()` 里按 `inputActive`
+     * 跳过衰减），宠物会一直滑到屏幕边为止——而 `handleClick` 把状态切出
+     * `WALK` 之后，`updateStateFromPhysics` 里那个 `stopWalking()` 分支
+     * 再也不会跑到。
+     */
+    halt() {
+      vx = 0;
+      vy = 0;
+      inputActive = false;
+      return this;
+    },
+
     get walking() { return inputActive; },
 
     /**
@@ -373,6 +411,34 @@ export function createPhysics(options = {}) {
         && Math.abs(y - bounds.height) < 0.5;
     },
   };
+}
+
+/**
+ * 把「想弹多高」反解成**上抛初速度**（像素/秒，负值向上）。
+ *
+ * 公式来自 `h = v² / (2g)` ⇒ `v = -√(2gh)`。
+ *
+ * 为什么需要反解而不是直接给速度：`gravity` 是包可声明的（0 ~ 20000），
+ * 固定速度在不同包里高度差三个数量级（见 `DEFAULT_PHYSICS.clickHop` 的说明）。
+ * 声明高度之后，同一个 `clickHop` 在任何包里的观感都一致。
+ *
+ * 边界：
+ * - `height` 或 `ratio` 非正 → `0`（不弹；调用方据此完全跳过 `setVelocity`）。
+ * - `gravity <= 0`（失重包）→ `0`：那种包本来就不会下落，给一个上抛速度
+ *   只会让它**永久上升**（实测 gravity=0 时 -260 会让宠物一路顶到屏幕边）。
+ *
+ * @param {object} options
+ * @param {number} options.gravity 该包的重量加速度（像素/秒²）
+ * @param {number} options.height 宠物包围盒高度（CSS px，已含缩放）
+ * @param {number} options.ratio `clickHop` 比例（0 ~ 0.3）
+ * @returns {number} 上抛初速度（负值）；`0` 表示不弹
+ */
+export function hopVelocity(options = {}) {
+  const gravity = Number(options.gravity);
+  const height = Number(options.height);
+  const ratio = Number(options.ratio);
+  if (!(gravity > 0) || !(height > 0) || !(ratio > 0)) return 0;
+  return -Math.sqrt(2 * gravity * height * ratio);
 }
 
 /**
