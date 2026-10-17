@@ -1168,19 +1168,75 @@ def test_panel_parses_blink_frames_with_the_shared_helper(panel, animation):
 # ==================================================== 3. 空中不串动作
 
 
-def test_petview_lands_on_touch_down_not_only_on_hard_impact(petview):
-    """★ 落地判定必须用 `touchedDown`（状态翻转），不能只用 `justLanded`。
+def test_petview_lands_on_foot_contact_not_on_hard_impact(petview):
+    """★ 落地判定必须用 `footContact`（脚底一沾地），不能只用 `justLanded`。
 
-    用户报障的衍生现象：「如果不是以坠落动画落得地，那么就不会出现落地动画」。
+    这条测试守的是**两个**先后踩到的坑，它们都出在同一行上：
 
-    根因：`justLanded` 要求冲击 > 60px/s。从很低的地方放下（或贴着地面松手）
-    冲击不足，于是状态机永远停在 `fall`——既没有落地动作，rAF 也永远停不下来
-    （`fall` 属于「必须继续跑」的状态），表现为「宠物贴着地面一直播下落动画」。
+    1. 用户报障的衍生现象：「如果不是以坠落动画落得地，那么就不会出现落地动画」。
+       根因：`justLanded` 要求冲击 > 60px/s。从很低的地方放下（或贴着地面松手）
+       冲击不足，于是状态机永远停在 `fall`——既没有落地动作，rAF 也永远停不下来
+       （`fall` 属于「必须继续跑」的状态），表现为「宠物贴着地面一直播下落动画」。
+
+    2. 用户报障（本轮）：「人物现在坠落的姿态接触到地面后……会有那么很短的一段
+       时间人物贴着地面但是处于坠落动画，因为时间有个几百 ms，因此肉眼可见」。
+       第一版为修 (1) 换成了 `touchedDown`，而它的语义是「回到地面并待住了」：
+       落地反弹会把 `grounded` 重新置假，于是它要等到**弹完停稳**才置位。
+       实测默认 `bounce: 0.12` 下这一等是 **108~225ms**（落差越大越久），
+       而这段时间宠物离地最多 10.7px——正是他说的「贴着地面」。
+
+    因此判据要落在**第三个**标记上：`footContact` = 脚底第一次碰到地面的那一帧，
+    且在「决定反不反弹」之前置位。物理层有一条 mjs 测试量死这个时序。
     """
     body = petview[petview.index('function updateStateFromPhysics'):]
     body = body[:body.index('\n  }')]
-    assert 'physics.touchedDown' in body, '必须用 touchedDown 判落地'
+    assert 'physics.footContact' in body, (
+        '必须用 footContact 判落地——用 touchedDown 会等反弹结束（几百 ms 贴着地面播坠落），'
+        '用 justLanded 会让轻放永远出不了 fall'
+    )
+    assert 'physics.touchedDown' not in body, (
+        '不要再用 touchedDown 判落地：它是「停稳」，比「碰到地面」晚一整个反弹'
+    )
     assert 'machine.land(' in body, '触地要进 land 态'
+
+
+def test_petview_pauses_before_sleeping_after_being_busy(petview):
+    """★ 忙完之后补睡要**先安静一小会儿**，不能同一 tick 就躺下。
+
+    用户报障：「人物正在移动，然后移动播放完后突然就睡觉了，给人感觉像是
+    往前滑了一下睡着了」。根因是走路结束与入睡发生在同一 tick，于是
+    「走完的最后一帧」立刻被「躺下」顶掉。
+    """
+    assert 'SLEEP_SETTLE_MS' in petview, '要有那个停顿常量'
+    settle = _function_body(petview, 'settleSleep')
+    assert 'armSleepSettle()' in settle, '忙完补睡要走「先安静一下」那条路径'
+    # 注释里**故意**提到了 `machine.sleep()` 来解释为什么不能这么写，
+    # 因此剥掉注释再判——否则文档会被当成违规。
+    settle_code = re.sub(r'^\s*//.*$', '', settle, flags=re.MULTILINE)
+    assert 'machine.sleep(' not in settle_code, (
+        'settleSleep 不该直接睡——那样还是「走完就躺下」'
+    )
+
+
+def test_petview_sleep_settle_blocks_new_roam_rounds(petview):
+    """★ 入睡前那 420ms **不许开新的一趟漫游**。
+
+    这条守的是一个真实回归（本轮的「先站住再躺下」引入的）：漫游间隔很短时
+    （实测 200ms）宠物几乎一直在走，于是每回到 idle 就排一次入睡，
+    而新的漫游又在 420ms 内开始——定时器到期时 `canSleepNow()` 为假、
+    判定重来，最终表现是**永远睡不着**（`perpet-settings` 的 ⑤ 当场抓到）。
+
+    同一个「永远不睡」的 bug 这个文件踩过一次（`sleepWakeTimer` 的注释里
+    记着：进入 WALK 撤掉打盹定时器、只有 IDLE 才重排）。这次从
+    「漫游抢在入睡之前」这个入口回来了，因此这条判据要钉住两个地方。
+    """
+    roam = _function_body(petview, 'roamTriggerEnabled')
+    assert 'sleepSettleTimer' in roam, (
+        'roamTriggerEnabled 必须在「准备睡觉」期间为假，否则停顿会被踩掉'
+    )
+    arm = _function_body(petview, 'armSleepSettle')
+    assert 'cancelRoamWake()' in arm, '排入睡时要撤掉已排好的那一趟漫游'
+
 
 
 def test_petview_blocks_ground_behaviors_while_airborne(petview):

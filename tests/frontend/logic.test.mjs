@@ -419,7 +419,76 @@ test('物理：拖拽期间不清标记会误判落地（防回归）', () => {
   body.advance(FIXED_STEP);
   assert.equal(body.touchedDown, false, '抓在手里不该被判成落地');
   assert.equal(body.justLanded, false);
+  assert.equal(body.footContact, false, 'footContact 同样不能在拖拽中被点亮');
 });
+
+// ================================================= footContact（落地切换）
+
+test('★ 物理：footContact 在触地那一帧就置位，touchedDown 要等反弹结束', () => {
+  // 用户报障：「人物现在坠落的姿态接触到地面后……会有那么很短的一段时间
+  // 人物贴着地面但是处于坠落动画，因为时间有个几百 ms，因此肉眼可见」。
+  //
+  // 根因：落地反弹把 `grounded` 重新置假，于是 `touchedDown`（「停稳」）
+  // 比「脚底碰到地面」晚一整个反弹。这条把那个差值量死。
+  //
+  // ⚠️ 必须**单步**推进：`advance(1/60)` 内部会补算 2 个子步，宠物可能在
+  // 被判触地的同一帧里就弹了起来，外部看不到「贴地」那一瞬。
+  const body = physicsAt({ y: 100, width: 172, height: 259 });
+  let t = 0;
+  let footAt = null;
+  let touchedAt = null;
+  let maxLift = 0;
+  let contactAt = null;
+  while (t < 5) {
+    body.advance(FIXED_STEP);
+    t += FIXED_STEP;
+    if (contactAt === null && body.y >= 600 - 0.001) contactAt = t;
+    if (footAt === null && body.footContact) footAt = t;
+    if (touchedAt === null && body.touchedDown) touchedAt = t;
+    if (contactAt !== null) maxLift = Math.max(maxLift, 600 - body.y);
+    if (body.grounded && Math.abs(body.vy) < 1e-9) break;
+  }
+  assert.ok(footAt !== null, 'footContact 必须触发');
+  assert.ok(touchedAt !== null, 'touchedDown 也必须触发（它是「停稳」）');
+  assert.equal(footAt, contactAt, 'footContact 必须与「首次触地」同一时刻');
+  const delayMs = (touchedAt - footAt) * 1000;
+  assert.ok(delayMs > 50, (
+    `这条测试的意义就是 touchedDown 明显晚于 footContact，实测只差 ${delayMs.toFixed(0)}ms`
+    + '——若两者相同，说明反弹没发生（bounce 被改成 0？），这条判断就失效了'
+  ));
+  assert.ok(maxLift > 1, `反弹应当真的把脚抬高（实测 ${maxLift.toFixed(1)}px）`);
+});
+
+test('★ 物理：footContact 与 touchedDown 在无反弹时同时置位', () => {
+  // 轻放 / bounce=0 时两者应当同一帧——不能因为加了新标记就让「落地」
+  // 在那种情况下变慢。
+  const body = physicsAt({ y: 590, physics: { bounce: 0 } });
+  let footAt = null;
+  let touchedAt = null;
+  for (let index = 0; index < 200; index += 1) {
+    body.advance(FIXED_STEP);
+    if (footAt === null && body.footContact) footAt = index;
+    if (touchedAt === null && body.touchedDown) touchedAt = index;
+    if (body.grounded) break;
+  }
+  assert.ok(footAt !== null && touchedAt !== null);
+  assert.equal(footAt, touchedAt, '没有反弹时两者应同帧');
+});
+
+test('物理：一直贴地时 footContact 不再重复报告', () => {
+  // 它是边沿，不是电平——否则贴着地面时每帧都会重新切一次 land。
+  // 先让它站稳（第一帧本身会报一次「落地」，那是正确的：身体初始不在 grounded 态）。
+  const body = physicsAt({ y: 600 });
+  for (let index = 0; index < 5; index += 1) body.advance(FIXED_STEP);
+  assert.equal(body.grounded, true);
+  let count = 0;
+  for (let index = 0; index < 60; index += 1) {
+    body.advance(FIXED_STEP);
+    if (body.footContact) count += 1;
+  }
+  assert.equal(count, 0, '已经站稳之后不该再报告「碰到地面」');
+});
+
 
 test('物理：行走用 walkSpeed，停下后摩擦减速到 0', () => {
   const body = physicsAt({ y: 600, x: 300 });

@@ -81,8 +81,13 @@ try {
     `animSpeed=${schema.animSpeed} autoRoam=${schema.autoRoam} scale=${schema.scale}`,
   );
   record(
-    '② 打盹阈值没设时是 `null`（= 用默认值），不是某个全局值',
-    schema.sleep && schema.sleep.afterMs === null,
+    '② 打盹阈值来自**包内声明或默认值**（不是某个全局值）',
+    // 内置形象声明了 `schedule.sleep.afterMs`（作者建议值），此时生效值
+    // 就该是那个数；只有包里没声明时才是 null（= 用默认值）。
+    // 判据因此是「null 或正数毫秒」——重点是不能来自宿主全局。
+    Boolean(schema.sleep)
+      && (schema.sleep.afterMs === null
+        || (Number.isFinite(schema.sleep.afterMs) && schema.sleep.afterMs > 0)),
     `schedule.sleep=${JSON.stringify(schema.sleep)}`,
   );
 

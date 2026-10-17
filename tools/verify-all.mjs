@@ -61,7 +61,8 @@ function runSuite(name) {
 
 const ALL = [
   'anim', 'still', 'preview-fix', 'grid', 'pages', 'animated', 'motion',
-  'builtin-motion', 'blink-pause', 'blink-panel', 'copy-pet', 'roam',
+  'builtin-motion', 'blink-pause', 'blink-panel', 'landing-sleep', 'copy-pet',
+  'roam',
   'roam-direction', 'sleep-setting', 'perpet-settings', 'pet-editor',
   'panel-ux2', 'panel-ux3', 'upload', 'panel', 'pet', 'visibility', 'icon',
   'dock', 'toast-icon',

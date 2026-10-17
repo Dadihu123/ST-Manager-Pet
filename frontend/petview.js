@@ -102,6 +102,22 @@ const DRAG_SLOP = DEFAULT_SLOP;
 /** 点击后的小弹跳初速度（像素/秒）。 */
 const CLICK_HOP_VELOCITY = -260;
 
+/**
+ * 「忙完之后补睡」要隔多久才真的躺下（毫秒）。
+ *
+ * 用户报障：「人物正在移动，然后移动播放完后突然就睡觉了，
+ * 给人感觉像是往前滑了一下睡着了」。
+ *
+ * 原因是走路结束与入睡发生在**同一 tick**：走完的最后一帧立刻被「躺下」
+ * 顶掉，眼睛来不及把两件事分开。中间垫这一小段之后，读起来是
+ * 「走完 → 站住（标准图像）→ 躺下」。
+ *
+ * 取值为什么是 420：太快（< 200ms）在 60fps 下只有十来帧，仍然只是一眨眼；
+ * 太慢（> 800ms）会让「打盹到点」显得犹豫，用户会以为它忘了睡。
+ * 实测 400ms 左右刚好够看清「它停下了」。
+ */
+const SLEEP_SETTLE_MS = 420;
+
 const clamp = (value, low, high) => Math.min(Math.max(value, low), high);
 
 /**
@@ -393,6 +409,14 @@ export function createPetView(options = {}) {
    * 因此既不能打断也不能丢，只能挂起。
    */
   let sleepPending = false;
+  /**
+   * 「已经安静下来、隔一小会儿就躺下」的定时器（见 `armSleepSettle`）。
+   *
+   * 必须独立成变量并在销毁/交互时清掉：它比 tick 活得久，而触发之后
+   * 会调 `machine.sleep()`——宠物已经被 dispose 时再去迁移状态机
+   * 就会往一个摘掉的节点上画东西。
+   */
+  let sleepSettleTimer = 0;
 
   // ---------------------------------------------------------------- 绘制
 
@@ -1049,23 +1073,30 @@ export function createPetView(options = {}) {
 
     // ---- 落地判定
     //
-    // 用 `touchedDown`（离地→触地的**状态翻转**）而不是 `justLanded`
-    // （冲击够不够重）。两者的分工见 `physics.js` 里 `touchedDown` 的说明。
+    // 用 `footContact`（脚底**第一次**碰到地面的那一帧）而不是
+    // `touchedDown`（停稳），也不是 `justLanded`（砸得够不够重）。
+    // 三个标记的分工见 `physics.js` 里 `footContact` 的说明，这里只说后果：
     //
-    // 用 `justLanded` 的旧写法有两个真实故障：
-    // 1. 从很低的地方放下 / 贴着地面松手时冲击不足 60px/s，于是永远不落地
-    //    —— 宠物贴在屏幕上一直播下落动画，而且 rAF 永不停止（`fall` 属于
-    //    「必须继续跑」的状态，省电直接失效）；
-    // 2. 用户报的「不是以坠落动画落得地就没有落地动画」，同源。
+    // - 用 `justLanded` 的两个真实故障：从很低的地方放下 / 贴着地面松手时
+    //   冲击不足 60px/s 于是永远不落地——宠物贴在屏幕上一直播下落动画，
+    //   而且 rAF 永不停止（`fall` 属于「必须继续跑」的状态，省电直接失效）；
+    //   以及用户报的「不是以坠落动画落得地就没有落地动画」。
+    // - 用 `touchedDown` 的一个真实故障：落地反弹把 `grounded` 重新置假，
+    //   于是它要等到**弹完停稳**才置位。实测默认 `bounce: 0.12` 下这一等就是
+    //   **108~225ms**，而这段时间宠物已经贴在地面上（离地最多 10.7px）却还在播
+    //   `fall`。用户报的正是这个：「接触到地面后……有一小段时间人物贴着地面
+    //   但是处于坠落动画，时间有个几百 ms，肉眼可见」。
+    //   换 `footContact` 就变成「脚一沾地就切落地」，那点余震由
+    //   `land` 的屈膝缓冲帧吃掉。
     //
     // 允许的来源只有 `fall` 与 `drag`：
     // - `fall`：正常路径（松手 → 下坠 → 触地）；
     // - `drag`：防御性保留。物理在拖拽期间**不推进**（`step()` 直接返回），
-    //   因此 `touchedDown` 理论上不会在 `drag` 态为真；留着它只是为了
+    //   因此 `footContact` 理论上不会在 `drag` 态为真；留着它只是为了
     //   万一将来「拖拽中也跑物理」时不会退化成「永远不落地」。
     //   `react` **刻意排除**：点击后的小弹跳不切 `fall`（见 `handleClick()`），
     //   因此也不该被落地动作打断——那是点击反馈的一部分。
-    if (physics.touchedDown && (state === STATES.FALL || state === STATES.DRAG)) {
+    if (physics.footContact && (state === STATES.FALL || state === STATES.DRAG)) {
       machine.land({ now });
       // 落地动作播完回 idle（一次性）
       const duration = actionDurationMs('land', 180);
@@ -1239,6 +1270,13 @@ export function createPetView(options = {}) {
       clearTimeout(sleepWakeTimer);
       sleepWakeTimer = 0;
     }
+    // 「安静一下就睡」那一段也要撤：它是**已经到点**之后的延迟，
+    // 而任何交互（`noteInteraction`）都会把阈值推后——那这次打盹就不作数了，
+    // 留着它会让宠物在被摸过之后仍然躺下（比不睡更怪）。
+    if (sleepSettleTimer) {
+      clearTimeout(sleepSettleTimer);
+      sleepSettleTimer = 0;
+    }
     sleepDeadline = 0;
   }
 
@@ -1297,14 +1335,53 @@ export function createPetView(options = {}) {
       } else if (canSleepNow()) {
         sleepPending = false;
         physics.stopWalking();
-        machine.sleep({ now: performance.now() });
-        wake();
+        // ★ **不在这里直接睡**，先安静地站一小会儿。
+        //
+        // 用户报障：「人物正在移动，然后移动播放完后突然就睡觉了，
+        // 给人感觉像是往前滑了一下睡着了」。
+        //
+        // 根因是这一行原本直接调 `machine.sleep()`：走路结束（`stopWalk`）
+        // 与入睡发生在**同一 tick**，于是「走完的最后一帧」立刻被
+        // 「躺下」顶掉——看起来就是滑了一下就地卧倒。中间没有任何停顿，
+        // 眼睛来不及把「它停下了」和「它躺下了」分成两件事。
+        //
+        // 现在中间隔 `SLEEP_SETTLE_MS`：这段时间宠物已经回到 idle、
+        // 显示的是**标准图像**（站着），于是读起来是「走完 → 站住 → 躺下」。
+        armSleepSettle();
         return;
       }
       // 还不能睡（例如刚进 WALK）→ 继续挂着，等下一次回到闲着
       if (sleepPending) return;
     }
     scheduleSleepWake();
+  }
+
+  /**
+   * 排一次「安静一下就睡」。
+   *
+   * 只给**忙完之后补睡**的那条路径用（见 `settleSleep`）：正常到点入睡
+   * （宠物本来就是静止的）不需要这个停顿，加了反而像卡了一下。
+   *
+   * 定时器再判一次全部条件，因为这几百毫秒里用户完全可能又碰它、
+   * 让它走一趟、或者把打盹关掉。
+   */
+  function armSleepSettle() {
+    // 这段停顿期间**不许开新的一趟漫游**（见 `roamTriggerEnabled` 的说明），
+    // 否则停顿会被反复踩掉、判定重来，最终表现是「永远睡不着」。
+    // 已经排好的那一趟也要撤掉。
+    cancelRoamWake();
+    clearTimeout(sleepSettleTimer);
+    sleepSettleTimer = setTimeout(() => {
+      sleepSettleTimer = 0;
+      if (!canSleepNow() || !sleepDue()) {
+        // 条件变了（又忙起来了 / 被交互重置了）→ 重新走一遍判定
+        settleSleep();
+        return;
+      }
+      physics.stopWalking();
+      machine.sleep({ now: performance.now() });
+      wake();
+    }, SLEEP_SETTLE_MS);
   }
 
   /**
@@ -1398,6 +1475,15 @@ export function createPetView(options = {}) {
       && !throttle.paused
       && machine.state === STATES.IDLE
       && !idleBurst
+      // ★ **准备睡觉的那 420ms 里不再开新的一趟**。
+      //
+      // 少了这一条，`armSleepSettle` 的那段停顿会被「下一趟漫游」反复踩掉：
+      // 漫游间隔短（实测 200ms）时宠物几乎一直在走，于是每回到 idle 就排一次
+      // 入睡、而新的漫游又在 420ms 内开始——`sleepSettleTimer` 到期时
+      // `canSleepNow()` 为假，判定重来，**永远睡不着**。
+      // 那个「永远不睡」的 bug 这个文件已经踩过一次（见 `sleepWakeTimer`），
+      // 只是这次换了个入口回来。让位给入睡，代价是那半秒不走动。
+      && !sleepSettleTimer
       && gesture.phase === 'done'
       && !physics.dragging
       && physics.grounded;
@@ -2138,6 +2224,8 @@ export function createPetView(options = {}) {
         paused: throttle.paused,
         afterMs: sleepAfterMs(),
         sinceInteractionMs: Math.round(performance.now() - lastInteractionAt),
+        // 已经安静下来、正等着那 420ms 过去（诊断用：「它怎么还不睡」）
+        settling: Boolean(sleepSettleTimer),
       };
     },
     dispose() {

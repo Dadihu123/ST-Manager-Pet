@@ -78,20 +78,42 @@ export function createPhysics(options = {}) {
   /** 本步内是否发生过「砸下来」（**重**触地，一次性）。 */
   let justLanded = false;
   /**
-   * 本步内是否发生过「离地 → 触地」的**状态翻转**（一次性）。
+   * 本步内是否发生过「离地 → 触地**并停稳**」的状态翻转（一次性）。
    *
-   * 为什么它与 `justLanded` 必须分开：两者回答的是不同的问题。
+   * 三个标记回答三个不同的问题（见 `footContact` 的说明）：
    *
-   * - `justLanded` 回答「砸得够不够重」——它是**动画选择**的依据，
+   * - `justLanded` 回答「砸得够不够重」——**动画选择**的依据，
    *   轻贴地面不该播「落地」那一套（会像在发抖）。
-   * - `touchedDown` 回答「它现在回到地面了吗」——它是**状态迁移**的依据。
+   * - `touchedDown` 回答「它回到地面**并待住了**吗」。
+   * - `footContact` 回答「脚底什么时候**第一次**碰到地面」——**状态迁移**的依据。
    *
-   * 合在一起用会漏掉真实故障：用户把宠物从很低的地方放下（或贴着地面松开），
-   * 冲击速度不到 60px/s，于是 `justLanded` 为假 → 状态机永远停在 `fall`，
-   * 既没有落地动作，rAF 也永远停不下来（`fall` 是「必须继续跑」的状态），
-   * 表现为「宠物贴着地面一直播下落的动画」。这正是用户报的那个衍生现象。
+   * ⚠️ 别拿 `touchedDown` 判落地：反弹会把 `grounded` 重新置假，它要等到
+   * 弹完停稳才置位，实测晚 108~225ms，那段时间宠物贴着地面却还在播坠落动画。
+   * 也别拿 `justLanded`：轻放时冲击不足 60px/s 永远为假，状态机会卡在 `fall`。
    */
   let touchedDown = false;
+  /**
+   * 本步内脚底是否**第一次碰到地面**（一次性，含随后还要反弹的那一下）。
+   *
+   * 第三个标记，因为它回答第三个问题：**动画什么时候该换成「落地」**。
+   *
+   * `touchedDown` 回答不了它：那个语义是「回到地面**并待住了**」，而落地反弹
+   * 会把 `grounded` 重新置假，于是它要等到**弹完停稳**才置位。实测默认
+   * `bounce: 0.12` 下这段延迟是 **108~225ms**（落差越大越久），
+   * 而这段时间宠物已经贴着地面（离地最多 10.7px）却还在播 `fall`——
+   * 用户报的就是这个：「人物现在坠落的姿态接触到地面后……会有那么很短
+   * 的一段时间人物贴着地面但是处于坠落动画，因为时间有个几百 ms，
+   * 因此肉眼可见」。
+   *
+   * 因此状态迁移改用这个标记：脚底碰到地面**那一刻**就切 `land`，
+   * 后续的反弹让它在播落地动画的过程中自己弹完（那点余震正好被
+   * 「屈膝缓冲」那一帧吃掉，比悬在半空播坠落要自然得多）。
+   *
+   * ⚠️ 不能拿 `justLanded` 顶替：那个要求冲击 > 60px/s（它是「砸得重不重」），
+   * 从很低的地方放下时永远为假——那样状态机会卡在 `fall` 里出不来
+   * （`touchedDown` 就是为修这个才出现的）。
+   */
+  let footContact = false;
 
   const halfWidth = () => size.width / 2;
 
@@ -136,6 +158,12 @@ export function createPhysics(options = {}) {
     if (y >= bounds.height) {
       y = bounds.height;
       const impact = vy;
+      // ★ 脚底**碰到地面那一刻**就置位——在决定反不反弹**之前**。
+      //
+      // 顺序很要紧：反弹会把 `grounded` 重新置假，若放在判断之后
+      // （像 `touchedDown` 那样），就要等到弹完停稳才为真，
+      // 于是宠物贴在地面上空 10px 播 200ms 坠落动画（见 `footContact` 的说明）。
+      if (!wasGrounded) footContact = true;
       if (impact > 0) {
         const bounceVy = params.bounce > 0 ? -impact * params.bounce : 0;
         // 只有「快得值得反弹」的一次性冲击才反弹；否则直接停下，
@@ -190,6 +218,14 @@ export function createPhysics(options = {}) {
      * 这个是**状态迁移**的依据（`fall` → `land`），那个是**动画选择**的依据。
      */
     get touchedDown() { return touchedDown; },
+    /**
+     * 本步内脚底是否**第一次碰到地面**（一次性，含随后还要反弹的那一下）。
+     *
+     * 它是**状态迁移**（`fall` → `land`）的依据——比 `touchedDown` 更早，
+     * 因为落地反弹会让 `touchedDown` 等到弹完停稳。三个标记的分工见文件内
+     * `footContact` / `touchedDown` / `justLanded` 的说明。
+     */
+    get footContact() { return footContact; },
     get bounds() { return { width: bounds.width, height: bounds.height }; },
     get size() { return { width: size.width, height: size.height }; },
     get params() { return Object.assign({}, params); },
@@ -283,8 +319,8 @@ export function createPhysics(options = {}) {
      * 推进物理。用**累加器 + 固定步长**：无论 `dt` 多大或多小，
      * 走的都是同样大小的物理步，因此表现与帧率无关（§4.1 / §8 陷阱 10）。
      *
-     * 一次性标记（`justLanded` / `touchedDown`）在**每次 `advance()` 开头**
-     * 清掉，而不是在每个内部 `step()` 开头清。
+     * 一次性标记（`justLanded` / `touchedDown` / `footContact`）在**每次
+     * `advance()` 开头**清掉，而不是在每个内部 `step()` 开头清。
      *
      * 为什么：一帧内可能补算**多步**（累加器，最多 `MAX_STEPS_PER_FRAME` 步）。
      * 放在 `step()` 里清的话，只有**最后一步**的结论能被调用方看到——
@@ -302,6 +338,7 @@ export function createPhysics(options = {}) {
       // 它在手里播起了落地动画。
       justLanded = false;
       touchedDown = false;
+      footContact = false;
 
       if (dragging) {
         accumulator = 0;

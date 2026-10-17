@@ -399,6 +399,13 @@ async function main() {
     // （`bounce`），y 会再小幅度增长，于是窗口被拉长到包含 `land` 帧，
     // 断言随机失败（实测连跑 22 个套件时偶发）。按「离最终落点还有距离」
     // 判定不受弹跳影响。
+    //
+    // ⚠️⚠️ 也不能用「比最低点高 1px 就算空中」——**落地反弹本身就是**一次
+    // 明显离地（默认 bounce: 0.12 下实测 10.7px），而那几帧**本来就该是
+    // land**（用户要求「脚一沾地就切落地」，见 physics.js 的 footContact）。
+    // 用 1px 的阈值会把这次反弹误判成「空中串了 land」，实测必挂。
+    // 因此阈值取在反弹高度之上：离地超过 24px 才算真的还在坠落。
+    // （数值要写进下面的页面侧代码里：那是另一个作用域，读不到这里的常量。）
     await sleep(900);
     const airSamples = await page.evaluate(`(() => {
       window.__airStop = true;
@@ -409,8 +416,10 @@ async function main() {
                  airborneActions: [], allActions: [...new Set(log.map((e) => e.a))] };
       }
       const restY = Math.max(...log.map((e) => e.y));
-      // 空中 = 离最终落点还有 1px 以上的帧（且在第一帧 fall 之后）
-      const airborne = log.slice(firstFall).filter((e) => e.y < restY - 1);
+      // 空中 = 离最终落点还超过 24px 的帧（且在第一帧 fall 之后）。
+      // 阈值必须大于落地反弹的高度，否则那次反弹（本来就该是 land）会被
+      // 误判成「空中串了别的动画」——见上面那段说明。
+      const airborne = log.slice(firstFall).filter((e) => e.y < restY - 24);
       return {
         total: log.length,
         sawFall: true,

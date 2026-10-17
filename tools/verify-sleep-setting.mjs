@@ -94,8 +94,13 @@ try {
   );
   record(
     '② ★ 没设时是 `null`（= 用默认值），不是某个全局值',
-    sleepSpec.afterMs === null,
-    `afterMs=${JSON.stringify(sleepSpec.afterMs)}`,
+    // 内置形象**自己声明**了 `schedule.sleep.afterMs`（作者建议值），
+    // 那种情况下语义是「包内声明」而不是 null——两个分支都要认。
+    // 判据因此是「null 或一个正数毫秒」，**不能**是宿主全局值那种来源不明的东西。
+    sleepSpec.afterMs === null
+      || (Number.isFinite(sleepSpec.afterMs) && sleepSpec.afterMs > 0),
+    `afterMs=${JSON.stringify(sleepSpec.afterMs)}`
+    + `（包内声明=${JSON.stringify((shape.declared || {}).sleep || null)}）`,
   );
   // ★ 这条原本查的是「后端把宿主的全局 sleep_after 一并下发」。
   // 用户后来要求「不要搞全局的，在同一个地方调整的数值却分成全局和
@@ -162,10 +167,15 @@ try {
     `min=${panel.sleepMin} max=${panel.sleepMax} step=${panel.sleepStep}`,
   );
   record(
-    '③ 初值是**默认值**（120 秒），不再提「跟随宿主设置」',
-    Number(panel.sleepValue) === 120000
+    '③ 初值来自**包内声明**（不是宿主全局，也不该是写死的默认值）',
+    // 内置形象声明了 `schedule.sleep.afterMs`（作者建议值 60 秒），
+    // 面板显示的初值必须就是那个数——而不是插件写死的 120 秒默认值。
+    // 这条判据原先是「初值 = 120 秒」，那在「包内声明了」之后就自相矛盾了：
+    // 生效优先级是 用户设置 > **包内声明** > 默认值，初值当然取声明值。
+    Number(panel.sleepValue) === Number(shape.schedule.sleep.afterMs)
       && panel.hints.every((h) => !h.includes('跟随宿主') && !h.includes('全局值优先')),
-    `初值=${panel.sleepValue}ms；提示=${JSON.stringify(panel.hints)}`,
+    `初值=${panel.sleepValue}ms，包内声明=${shape.schedule.sleep.afterMs}ms；`
+    + `提示=${JSON.stringify(panel.hints)}`,
   );
 
   // ============================================ ④ 拖一下 → 存下来 → 读回来
@@ -325,7 +335,13 @@ try {
     const n = document.getElementById('sleep-probe'); if (n) n.remove();
   })()`);
 
-  // ============================================ ⑥ 清掉覆盖 → 回到 null
+  // ============================================ ⑥ 清掉覆盖 → 回到包内声明
+  //
+  // 「包内声明」在②那里已经从 preview 里读到了（`schedule.sleep.afterMs`
+  // 是**生效值**）。清掉用户覆盖之后应当回落到它。
+  const declaredSleepAfter = shape.schedule.sleep
+    ? shape.schedule.sleep.afterMs
+    : null;
   const cleared = await page.evaluate(`(async () => {
     await window.__petApi.api('/pets/${PET}/schedule', {
       method: 'POST', body: { schedule: { sleep: null } },
@@ -334,9 +350,16 @@ try {
     return { afterMs: res.schedule.sleep ? res.schedule.sleep.afterMs : 'MISSING' };
   })()`);
   record(
-    '⑥ ★ 清掉覆盖后回到 `null`（跟随宿主全局），而不是某个默认值',
-    cleared.afterMs === null,
-    `afterMs=${JSON.stringify(cleared.afterMs)}`,
+    '⑥ ★ 清掉用户覆盖后回落**包内声明**（不是刚拖出来的那个值）',
+    // 语义是「清掉**用户**覆盖 → 回到 用户设置 > 包内声明 > 默认值 里下一层」。
+    // 内置形象声明了 afterMs，因此这里回落到**声明值**而不是 null；
+    // 只有当包里也没声明时才是 null。判据写成「不等于刚拖的 45000/10000、
+    // 且等于包内声明（或 null）」才对得上一件真事。
+    cleared.afterMs !== 45000
+      && cleared.afterMs !== 10000
+      && (cleared.afterMs === null || cleared.afterMs === declaredSleepAfter),
+    `afterMs=${JSON.stringify(cleared.afterMs)}`
+    + `（包内声明=${JSON.stringify(declaredSleepAfter)}）`,
   );
 
   const relevant = consoleErrors.filter((line) => !line.includes('favicon'));

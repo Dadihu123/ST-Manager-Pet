@@ -975,7 +975,15 @@ def test_schedule_for_a_builtin_pet_stays_in_settings(tmp_path):
     manifest = json.loads(
         open(os.path.join(str(builtin), 'xiaoka', 'pet.json'), encoding='utf-8').read()
     )
-    assert manifest['schedule']['idle']['intervalMs'] == [6000, 18000], '内置包不该被改'
+    # ⚠️ 内置包的 `schedule.idle` 用的是**规范形式** `minIntervalMs` /
+    # `maxIntervalMs`（`intervalMs: [a, b]` 是等价的简写，两者都合法）。
+    # 这条以前读的是 `['intervalMs']`，而内置包一直是分开写的——
+    # 于是它靠 `KeyError` 失败，报的是「字段不存在」而不是「包被改了」，
+    # 与它想守的东西完全无关。
+    idle = manifest['schedule']['idle']
+    assert [idle['minIntervalMs'], idle['maxIntervalMs']] == [6000, 18000], (
+        '内置包不该被改'
+    )
 
 
 def test_schedule_is_editable_for_builtin_pets(tmp_path):
