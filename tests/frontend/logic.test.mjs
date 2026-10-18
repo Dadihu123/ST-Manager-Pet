@@ -387,6 +387,49 @@ test('拖拽：脚底坐标由调用方换算，物理层只做夹取', () => {
   assert.ok(Math.abs(body.y - 346) < 2, `脚底应约 346，实际 ${body.y}`);
 });
 
+test('拖拽：抓取偏移必须够得着，否则「拖了不动」', () => {
+  // 复刻 petview.beginDrag 的目标偏移算法
+  const height = 259;
+  const grip = dragGripOffset(height, 0.98, 0.03);   // 246
+  const boundsHeight = 1040;
+  const reachable = (pressY) => Math.min(grip, Math.max(0, boundsHeight - pressY));
+
+  // 站在地面的宠物：按下点的偏移 = 视口高 − 按下 y
+  const deadZone = (pressY) => {
+    const offset = reachable(pressY);
+    for (let y = pressY; y >= 0; y -= 1) {
+      const foot = Math.min(Math.max(y + offset, height * 0.98), boundsHeight);
+      if (foot < boundsHeight - 0.5) return pressY - y;
+    }
+    return null;
+  };
+
+  // 抓头顶：偏移就是满值（贴地那一刻可用空间恰好等于抓取偏移，
+  // 差的是浮点尾数，用容差而不是严格相等）
+  assert.ok(
+    Math.abs(reachable(794) - grip) < 0.1,
+    `抓头顶时应能拿满偏移：${reachable(794)} vs ${grip}`,
+  );
+  assert.ok(deadZone(794) <= 1, `抓头顶不该有死区，实际 ${deadZone(794)}`);
+
+  // 抓腰部 / 脚部：偏移被夹到「脚底不穿地」，**同样**立刻跟手
+  for (const pressY of [900, 1030]) {
+    assert.ok(reachable(pressY) < grip, `按 y=${pressY} 时偏移应被夹小`);
+    assert.ok(
+      deadZone(pressY) <= 1,
+      `按 y=${pressY} 不该有死区（旧实现是 107 / 237px），实际 ${deadZone(pressY)}`,
+    );
+  }
+
+  // 关键：夹取后的偏移不会让脚底穿到视口下方
+  for (const pressY of [794, 900, 1030]) {
+    assert.ok(
+      pressY + reachable(pressY) <= boundsHeight + 0.001,
+      `按 y=${pressY} 时脚底不该低于视口底`,
+    );
+  }
+});
+
 test('物理：触地标记 justLanded 一次性', () => {
   const body = physicsAt({ y: 590 });
   let landedAt = -1;

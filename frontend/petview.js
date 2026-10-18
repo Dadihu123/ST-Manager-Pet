@@ -1829,15 +1829,31 @@ export function createPetView(options = {}) {
    * 把手势升级成真正的拖拽。
    *
    * ★ 起手不跳：先按「脚底相对指针的**当前**偏移」把位置续上，再用
-   * `DRAG_GRIP_EASE_S` 把偏移滑到「抓头顶」的目标值（见 `applyDragPoint`）。
-   * 这样按下时人物一动不动，随后被拎到指针下方。
+   * `DRAG_GRIP_EASE_S` 把偏移滑到目标值（见 `applyDragPoint`）。
+   * 这样按下时人物一动不动，随后才被拎到指针下方。
    */
   function beginDrag(point) {
     machine.beginDrag({ now: performance.now() });
     // 起手瞬间的「脚底 − 指针」偏移：用它保证**没有跳变**
     // （此刻人物还站在地上，脚底在指针下方约 anchorY×身高处）。
     dragOffsetFrom = physics.y - point.y;
-    dragOffsetTo = dragGripOffset(height, anchorY, dragAnchorY);
+    // ★ 目标偏移要**够得着**才算数。
+    //
+    // 抓取点设在头顶意味着「脚底在指针下方约一个身高」。而宠物站在地面时，
+    // 脚底已经贴着视口底部——照这个目标算，脚底会落到视口**下方**一百多像素，
+    // 被 `applyDragPoint` 的地面夹取吃掉。结果是：指针往上拖一百多像素、
+    // 宠物一动不动，直到指针升到它头顶才开始跟手。
+    //
+    // 实测（小映 259px 高、视口 1040）：按腰部死区 107px、按脚部 237px。
+    // 那是「按住半天不动、然后突然跳起来跟上」的手感，不能接受。
+    //
+    // 因此目标偏移再夹一道 `视口高 − 指针 y`（脚底不穿地的上限）：
+    // 抓得越高越接近「整只挂在指针下方」，抓得越低就越接近「按哪儿拎哪儿」，
+    // 且**任何情况下都立刻跟手**。
+    dragOffsetTo = Math.min(
+      dragGripOffset(height, anchorY, dragAnchorY),
+      Math.max(0, physics.bounds.height - point.y),
+    );
     dragOffset = dragOffsetFrom;
     dragBlend = 0;
     physics.beginDrag(point.x, point.y + dragOffset);
@@ -1852,19 +1868,22 @@ export function createPetView(options = {}) {
   /**
    * 拖拽中：把指针位置换算成**脚底**世界坐标并写进物理。
    *
-   * 换算 = 指针 y + `dragOffset`，而 `dragOffset` 在起手后的
-   * `DRAG_GRIP_EASE_S` 内从「按下时的相对偏移」缓动到「抓头顶」的目标值。
-   * 缓动只做一次，之后 `dragOffset` 恒定，人物就稳稳挂在指针下方。
+   * 换算 = 指针 y + `dragOffset`。`dragOffset` 在起手后的
+   * `DRAG_GRIP_EASE_S` 内从「按下时的相对偏移」缓动到目标值，之后恒定，
+   * 因此跟手是严格 1:1 的（指针移多少、宠物移多少）。
    *
    * ⚠️ 纵向还要再夹一道：**整只贴图不能越过视口顶边**。
    * 物理层的 `clampY` 只保证「脚底 y ∈ [0, 视口高]」，而脚底贴着 y=0 时
    * 人物整个身体都在屏幕上方——用户把宠物拖出屏幕就再也抓不回来了。
    * 这里按「顶边 ≥ 0」重新夹，即脚底 ≥ 身高 × anchorY。
+   *
+   * 下界（脚底 ≤ 视口高）不用另外写：`physics.clampY` 已经保证，
+   * 而且 `dragOffset` 在起手时就被夹到「脚底不穿地」，所以往上拖时
+   * 不会有空行程（见 `beginDrag`）。
    */
   function applyDragPoint(point) {
-    const offset = dragOffset;
     const minFootY = height * anchorY;
-    const footY = clamp(point.y + offset, minFootY, physics.bounds.height);
+    const footY = clamp(point.y + dragOffset, minFootY, physics.bounds.height);
     physics.moveDrag(point.x, footY);
     drawPosition();
   }
