@@ -664,6 +664,80 @@ DEFAULT_AUTO_ROAM = True
 #: （`frontend/panel.js` 里的 `SCALE_MIN` / `SCALE_MAX` 必须与此一致）。
 SCALE_RANGE = (0.25, 4.0)
 
+#: 走速倍率的合法区间：用户在面板上给「作者声明的走速」再乘一个系数。
+#:
+#: 与 `ANIM_SPEED_RANGE` 取同一组数字（0.25×~4×），但**语义相反**：
+#: 动画速度是「越大越慢」，走速是「越大越快」。两个滑块并排时这个差别
+#: 必须在文案里说清，否则用户会以为它们同向。
+WALK_SPEED_MULTIPLIER_RANGE = (0.25, 4.0)
+DEFAULT_WALK_SPEED_MULTIPLIER = 1.0
+
+
+def scaled_walk_speed(
+    declared_speed,
+    *,
+    declared_scale,
+    effective_scale,
+    multiplier=DEFAULT_WALK_SPEED_MULTIPLIER,
+):
+    """把作者声明的走速换算到**当前显示倍率**下的实际像素速度。
+
+    为什么必须换算
+    --------------
+    `physics.walkSpeed` 的单位是「屏幕像素/秒」，而它是在**作者声明的
+    `scale`** 下量出来的（内置形象：`145` px/s，`scale 0.45`）。
+    用户在面板上把倍率从 `0.45` 调到 `1.5`（3.3 倍大）之后，人物在屏幕上
+    高了 3.3 倍，却仍以 145px/s 平移——**脚在打滑**，走得像在冰面上滑行。
+    这不是「参数没调好」，是两件事没有联动。
+
+    做法：按「显示倍率相对作者声明倍率的比值」等比放大。
+    这样 `倍率 × 走速` 恒定，**每一步相对身高的距离不变**，
+    观感在任何倍率下都一致——与 `physics.clickHop` 用「占身高的比例」
+    表达弹跳高度是同一个道理（那个也是为了跨尺寸保持观感）。
+
+    为什么以**作者声明的倍率**为基准而不是绝对 1.0：
+    同一个 `52` 对 `scale 0.45` 的包是「作者认为合适的速度」，
+    对 `scale 1.0` 的包则是另一个意思。基准选错时，**没动过倍率的用户**
+    会看到速度凭空变了——那是比脚打滑更糟的回归。
+
+    Args:
+        declared_speed: `pet.json` 里声明的 `physics.walkSpeed`（或默认值）。
+        declared_scale: 作者声明的 `scale`（缺省 1.0）。
+        effective_scale: 用户当前生效的 `scale`。
+        multiplier: 用户在面板上给的额外系数（1.0 = 完全按作者的速度）。
+
+    Returns:
+        float: 夹在 `_PHYSICS_RANGES['walkSpeed']` 内的像素/秒。
+    """
+    low, high = _PHYSICS_RANGES['walkSpeed']
+    try:
+        speed = float(declared_speed)
+    except (TypeError, ValueError):
+        speed = DEFAULT_PHYSICS['walkSpeed']
+    try:
+        base_scale = float(declared_scale)
+    except (TypeError, ValueError):
+        base_scale = 1.0
+    try:
+        current_scale = float(effective_scale)
+    except (TypeError, ValueError):
+        current_scale = base_scale
+    try:
+        factor = float(multiplier)
+    except (TypeError, ValueError):
+        factor = DEFAULT_WALK_SPEED_MULTIPLIER
+
+    # 两个倍率都可能被手工改成 0 或负数；用一个极小的正数兜底，
+    # 而不是抛错——这个值会被**每个请求**读到，为它抛错会让整个面板打不开。
+    base_scale = base_scale if base_scale > 1e-6 else 1.0
+    current_scale = current_scale if current_scale > 1e-6 else base_scale
+    if factor != factor or factor <= 0:  # NaN / 非正
+        factor = DEFAULT_WALK_SPEED_MULTIPLIER
+
+    scaled = speed * (current_scale / base_scale) * factor
+    return round(min(max(scaled, low), high), 3)
+
+
 DEFAULT_PHYSICS = {
     'gravity': 1800.0,
     'walkSpeed': 60.0,

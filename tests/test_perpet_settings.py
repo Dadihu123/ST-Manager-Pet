@@ -72,7 +72,7 @@ def test_settings_hold_the_per_pet_maps():
     from backend.core.store import DEFAULT_SETTINGS
 
     for key in ('petScales', 'petPixelated', 'petSchedules',
-                'petAnimSpeeds', 'petAutoRoam'):
+                'petAnimSpeeds', 'petAutoRoam', 'petWalkSpeeds'):
         assert key in DEFAULT_SETTINGS, f'缺少 {key}'
 
 
@@ -166,6 +166,103 @@ def test_auto_roam_is_per_pet(tmp_path):
     store.set_pet_auto_roam('a', False)
     assert store.effective_auto_roam('a') is False
     assert store.effective_auto_roam('b') is True
+
+
+# ==================================================== 走路速度（跟大小联动）
+
+def test_walk_speed_follows_the_display_scale(tmp_path):
+    """★ 走速必须**跟着倍率变**——这是「脚打滑」的根因。
+
+    用户指出：「不同形象的人物大小、动画步幅不一，为了让动画和移动的速度
+    能够对应，这个有可能需要调整；尤其是大小是可以调整的，但是大小调整完了，
+    移动速度是固定的，结果就对不上了」。
+
+    `physics.walkSpeed` 是作者在他声明的 `scale` 下量的 px/s。用户把倍率
+    调大之后，人物在屏幕上高了几倍而速度不变 → 每一步相对身高的距离变短，
+    看起来就是脚在冰面上滑。因此生效走速 = 声明值 × (当前倍率 ÷ 声明倍率)。
+    """
+    store = _store(tmp_path)
+    _pack(store, 'mine', scale=0.5, physics={'walkSpeed': 100})
+
+    # 没动倍率：完全按作者声明的速度
+    assert store.effective_walk_speed('mine')['speed'] == 100
+
+    # 倍率翻倍 → 走速同步翻倍（观感不变）
+    store.set_pet_scale('mine', 1.0)
+    assert store.effective_walk_speed('mine')['speed'] == 200
+    assert store.effective_walk_speed('mine')['scaleRatio'] == 2.0
+
+    # 倍率减半 → 走速同步减半
+    store.set_pet_scale('mine', 0.25)
+    assert store.effective_walk_speed('mine')['speed'] == 50
+
+
+def test_walk_speed_multiplier_is_a_user_knob(tmp_path):
+    """倍率之上还能再乘一个系数（不同形象的动画步幅不一样，作者声明未必准）。"""
+    store = _store(tmp_path)
+    _pack(store, 'mine', physics={'walkSpeed': 100})
+    assert store.effective_walk_speed_multiplier('mine') == 1.0
+
+    store.set_pet_walk_speed_multiplier('mine', 1.5)
+    assert store.effective_walk_speed('mine')['speed'] == 150
+    assert store.effective_walk_speed('mine')['multiplier'] == 1.5
+
+    store.clear_pet_walk_speed_multiplier('mine')
+    assert store.effective_walk_speed('mine')['speed'] == 100
+
+
+def test_walk_speed_is_per_pet(tmp_path):
+    store = _store(tmp_path)
+    _pack(store, 'a', physics={'walkSpeed': 100})
+    _pack(store, 'b', physics={'walkSpeed': 100})
+    store.set_pet_walk_speed_multiplier('a', 2.0)
+    assert store.effective_walk_speed('a')['speed'] == 200
+    assert store.effective_walk_speed('b')['speed'] == 100
+
+
+def test_walk_speed_multiplier_is_clamped_not_rejected(tmp_path):
+    """越界**夹住**而不是抛错（与倍率 / 动画速度同一套取舍）。"""
+    from backend.core.pack import WALK_SPEED_MULTIPLIER_RANGE
+
+    store = _store(tmp_path)
+    _pack(store, 'mine')
+    low, high = WALK_SPEED_MULTIPLIER_RANGE
+    assert store.set_pet_walk_speed_multiplier('mine', 99) == high
+    assert store.set_pet_walk_speed_multiplier('mine', 0) == low
+    assert store.set_pet_walk_speed_multiplier('mine', 'abc') == 1.0
+
+
+def test_runtime_physics_carries_the_effective_walk_speed(tmp_path):
+    """★ 换算结果要**覆盖** `physics.walkSpeed` 再下发。
+
+    前端只读 `physics`（它不需要知道「换算」这回事）。若在别处另给一个字段，
+    就会出现「两个地方各算一遍」——两边不一致时表现是「面板显示 200、
+    实际走 100」，最难查。
+    """
+    store = _store(tmp_path)
+    _pack(store, 'mine', scale=0.5, physics={'walkSpeed': 100})
+    store.set_pet_scale('mine', 1.0)
+
+    pack = store.runtime_pack('mine')
+    assert pack['physics']['walkSpeed'] == 200
+    assert pack['walkSpeed'] == 200
+    assert pack['declaredWalkSpeed'] == 100
+    assert pack['walkSpeedScaleRatio'] == 2.0
+    assert pack['walkSpeedMultiplier'] == 1.0
+    assert pack['walkSpeedOverridden'] is False
+
+
+def test_scaled_walk_speed_survives_bad_input():
+    """脏值不能抛错——这个值**每个请求**都读，抛错等于面板打不开。"""
+    from backend.core.pack import scaled_walk_speed
+
+    # 全非法：回落到默认 60
+    assert scaled_walk_speed('x', declared_scale=0, effective_scale=-1,
+                             multiplier=float('nan')) == 60.0
+    # 声明倍率是 0：按 1.0 兜底，不做除法爆炸
+    assert scaled_walk_speed(100, declared_scale=0, effective_scale=1) == 100.0
+    # 结果被夹在 physics 区间内
+    assert scaled_walk_speed(100, declared_scale=1, effective_scale=100) == 2000.0
 
 
 # ==================================================== 倍率不再有全局兜底

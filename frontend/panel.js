@@ -190,6 +190,66 @@ function buildSpeedHint(value, declared) {
 }
 
 /**
+ * **走路速度倍率**的区间（越大越快）。
+ *
+ * 与后端 `pack.WALK_SPEED_MULTIPLIER_RANGE` **必须一致**（由
+ * `tests/test_css_contracts.py` 钉住）。
+ *
+ * ⚠️ 它和 `SPEED_MIN/MAX`（动画速度）**方向相反**：动画速度越大越慢，
+ * 走速越大越快。数值眼下恰好相同，但**刻意不共用常量**——共用的话，
+ * 哪天有人只改其中一个，另一个会悄悄跟着变，而两者语义本来不同。
+ */
+const WALK_MIN = 0.25;
+const WALK_MAX = 4;
+const WALK_STEP = 0.05;
+
+/** 把走路速度倍率夹到合法区间。 */
+function clampWalk(value) {
+  const number = Number(value);
+  const base = Number.isFinite(number) && number > 0 ? number : 1;
+  return Math.min(Math.max(base, WALK_MIN), WALK_MAX);
+}
+
+/** 走路速度倍率的显示格式（`1×` / `1.35×`）。 */
+function formatWalk(value) {
+  const number = clampWalk(value);
+  const text = Number.isInteger(number)
+    ? String(number)
+    : number.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return `${text}×`;
+}
+
+/**
+ * 走路速度那一行的说明文字。
+ *
+ * 必须讲清两件事，否则用户会困惑：
+ * 1. **它会跟着大小自动变**——放大宠物时速度会同比提高（否则脚在打滑）；
+ * 2. 这个滑块是**在自动值之上再乘一个系数**，不是绝对像素速度。
+ *
+ * 第三句给出「每秒多少个身高」：那是唯一与大小无关的读数，
+ * 也是判断「走得像不像人」的真正依据（绝对 px/s 在 2 倍大小下没有意义）。
+ */
+function buildWalkHint(multiplier, speedPx, heightPx, ratio) {
+  const parts = ['越大越快。'];
+  if (ratio > 1.001 || ratio < 0.999) {
+    parts.push(`放大后已自动提速 ${ratio.toFixed(2)}×。`);
+  }
+  if (speedPx > 0) {
+    const heights = heightPx > 0 ? (speedPx / heightPx) : 0;
+    parts.push(
+      `当前约 ${Math.round(speedPx)}px/秒`
+      + (heightPx > 0
+        ? `（身高 ${Math.round(heightPx)}px，每秒约 ${heights.toFixed(2)} 个身高）。`
+        : '。'),
+    );
+  }
+  if (multiplier !== 1) {
+    parts.push(`你的倍率 ${formatWalk(multiplier)}。`);
+  }
+  return parts.join('');
+}
+
+/**
  * **帮助页的内容**。
  *
  * 用户要求：「因为当前的设置项之类的比较多，所以可以给页面添加一个帮助页，
@@ -225,6 +285,17 @@ const HELP_SECTIONS = [
         recommend: '觉得「动作太快看不清」就调大（1.5~2×）；'
           + '觉得「半天不动一下」就调小（0.6~0.8×）。'
           + '它只做整体缩放，不改包里的帧率——因此非均匀帧时长的节奏仍然保留。',
+      },
+      {
+        term: '走路速度',
+        body: '自动漫游时横向移动的快慢。它跟着大小倍率自动变：'
+          + '把宠物放大 2 倍，走速也会自动 ×2——否则人物变大而平移不变，'
+          + '脚就会在屏幕上打滑。这个滑块是在那个自动值之上再乘一个系数，'
+          + '1× 表示完全按形象包声明的速度。',
+        recommend: '判断标准是「脚会不会滑」：走起来像在冰面上平移就调大，'
+          + '像在原地小碎步蹭着走就调小。'
+          + '提示行里的「每秒约几个身高」是唯一与大小无关的读数，'
+          + '真人走路约 0.8~1.0，慢悠悠散步约 0.4~0.6。',
       },
       {
         term: '自动漫游',
@@ -328,9 +399,12 @@ const HELP_SECTIONS = [
       },
       {
         term: '走速 walkSpeed',
-        body: '自动漫游时的水平速度（像素/秒）。',
-        recommend: '默认 60。小宠物（64px）用 30~50，'
-          + '大立绘用 80~150，否则它看起来像在「滑」。',
+        body: '形象包声明的基准水平速度（像素/秒），量于作者声明的 scale。',
+        recommend: '默认 60。这个数要配得上走路动画的步幅：'
+          + '步幅 × 2 ÷ 一轮动画秒数 ≈ 应有的速度（一轮 = 两步）。'
+          + '配不上就会「脚打滑」。'
+          + '日常调整用上面「走路速度」那个倍率就行，不必改这里——'
+          + '而且这里只对自建形象可写，内置形象改不了。',
         risky: true,
       },
       {
@@ -2288,6 +2362,71 @@ export function createSettingsPanel({
       + (detail.declaredAutoRoam === false ? '（形象包声明为不漫游）' : ''),
     ));
     section.appendChild(roamField);
+
+    // ---- 走路速度（**按形象**，且**自动跟随大小倍率**）
+    //
+    // 用户指出：「移动速度的调整缺失……不同形象的人物大小、动画步幅不一，
+    // 为了让动画和移动的速度能够对应，这个有可能需要调整；尤其是大小是可以
+    // 调整的，但是大小调整完了，移动速度是固定的，结果就对不上了」。
+    //
+    // 两件事一起补上：
+    // 1. **联动**（后端做，见 `pack.scaled_walk_speed`）：生效走速会按
+    //    「当前倍率 ÷ 作者声明倍率」自动换算。放大 3 倍 → 走速也 ×3，
+    //    「每一步相对身高的距离」因此恒定，任何大小下观感一致。
+    // 2. **可调**（这里）：不同形象的动画步幅差 10%~20% 是常态，
+    //    作者声明的那个速度未必配得上它的素材；而 `physics` 写回只对
+    //    自建形象开放，内置形象改不了。这个倍率就是给用户的那个旋钮。
+    //
+    // 存的是**倍率**而不是绝对 px/s：绝对值会在用户改倍率之后再次失配，
+    // 而那正是这次要修的问题。
+    const walkMult = clampWalk(
+      detail.walkSpeedMultiplier === undefined ? 1 : detail.walkSpeedMultiplier,
+    );
+    const walkRatio = Number(detail.walkSpeedScaleRatio) || 1;
+    const walkSpeedPx = Number(detail.walkSpeed) || 0;
+    const walkHeightPx = Math.round(
+      (Number(base.h) || 0) * (Number(detail.scale) || 1),
+    );
+    const walkField = el('div', 'pet-field');
+    const walkHead = el('div', 'pet-slider-head');
+    walkHead.appendChild(el('span', 'pet-field-label', '走路速度'));
+    const walkReadout = el('span', 'pet-slider-value', formatWalk(walkMult));
+    walkHead.appendChild(walkReadout);
+    walkField.appendChild(walkHead);
+
+    const walkHint = el('div', 'pet-field-hint', buildWalkHint(
+      walkMult, walkSpeedPx, walkHeightPx, walkRatio,
+    ));
+    const walkRow = createSliderRow({
+      min: WALK_MIN,
+      max: WALK_MAX,
+      step: WALK_STEP,
+      value: walkMult,
+      label: '走路速度',
+      format: (value) => String(value),
+      onInput: (value) => {
+        walkReadout.textContent = formatWalk(value);
+        // 拖动时实时按新倍率折算像素速度（只影响读数，不发请求）
+        walkHint.textContent = buildWalkHint(
+          value,
+          walkSpeedPx / (walkMult || 1) * value,
+          walkHeightPx,
+          walkRatio,
+        );
+      },
+      onCommit: (value) => updateAppearance({ walkSpeed: value }),
+    });
+    walkRow.slider.classList.add('pet-slider-walk');
+    walkField.appendChild(walkRow.row);
+    walkField.appendChild(walkHint);
+    const walkRange = el('div', 'pet-slider-range');
+    walkRange.appendChild(el('span', null, `${formatWalk(WALK_MIN)} 慢`));
+    walkRange.appendChild(el('span', null, `${formatWalk(WALK_MAX)} 快`));
+    walkField.appendChild(walkRange);
+    walkField.appendChild(button('恢复默认速度', 'is-icon', () => {
+      updateAppearance({ walkSpeed: null });
+    }));
+    section.appendChild(walkField);
 
     return section;
   }

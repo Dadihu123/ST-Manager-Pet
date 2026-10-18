@@ -35,7 +35,7 @@
   },
   "physics": {
     "gravity": 1800,
-    "walkSpeed": 52,
+    "walkSpeed": 138,
     "friction": 0.02,
     "terminalVelocity": 2400,
     "bounce": 0.12

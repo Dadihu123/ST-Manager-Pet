@@ -92,10 +92,12 @@ from .pack import (
     BEHAVIOR_FIELDS,
     DEFAULT_ANIM_SPEED,
     DEFAULT_AUTO_ROAM,
+    DEFAULT_WALK_SPEED_MULTIPLIER,
     SCHEDULE_BEHAVIORS,
     SLEEP_AFTER_RANGE,
     STILL_ACTION,
     DEFAULT_PIXELATED,
+    WALK_SPEED_MULTIPLIER_RANGE,
     PetPack,
     SCALE_RANGE,
     Trigger,
@@ -107,6 +109,7 @@ from .pack import (
     parse_animation_patch,
     parse_physics_patch,
     parse_schedule,
+    scaled_walk_speed,
 )
 from .paths import is_action_name, is_safe_relative_name, safe_join, to_posix
 
@@ -177,6 +180,21 @@ DEFAULT_SETTINGS = {
     #: 不是每个形象都「会走」——坐着的猫、躺着的玩偶自己溜达起来很出戏。
     #: 包可以声明 `"autoRoam": false`，用户还能按形象覆盖。
     'petAutoRoam': {},
+    #: 逐形象的**走速倍率**覆盖：`{pet_id: float}`（越大越快）。
+    #:
+    #: 为什么需要它（两件事，一件是「联动」一件是「可调」）：
+    #:
+    #: 1. **联动**：`physics.walkSpeed` 是「屏幕像素/秒」，且是在作者声明的
+    #:    `scale` 下量出来的。用户把倍率调大之后，人物在屏幕上高了好几倍、
+    #:    速度却不变，脚就在打滑。因此生效走速必须按「当前倍率 ÷ 作者声明倍率」
+    #:    等比换算（见 `pack.scaled_walk_speed`）——那部分是**自动**的，不存这里。
+    #: 2. **可调**：不同形象的动画步幅不一样（同样的 4 帧走路，步长可以差 20%），
+    #:    作者声明的那个速度未必配得上它的素材。用户觉得「脚在滑」时需要一个
+    #:    旋钮，而 `physics` 写回只对自建形象开放、内置形象改不了。
+    #:
+    #: 所以这里存的是**倍率**（1.0 = 完全按作者声明的速度），而不是绝对 px/s：
+    #: 绝对值会在用户改倍率之后再次失配，倍率则一直有效。
+    'petWalkSpeeds': {},
     #: 逐形象的**时间驱动行为节奏**覆盖：
     #: `{pet_id: {行为名: {'minIntervalMs': int, 'maxIntervalMs': int, 'plays': int}}}`。
     #:
@@ -277,6 +295,22 @@ def clamp_anim_speed(value) -> float:
     if number != number:  # NaN
         return DEFAULT_ANIM_SPEED
     return float(min(max(number, ANIM_SPEED_RANGE[0]), ANIM_SPEED_RANGE[1]))
+
+
+def clamp_walk_speed_multiplier(value) -> float:
+    """把**走速倍率**夹到合法区间内（与 `pack.WALK_SPEED_MULTIPLIER_RANGE` 一致）。
+
+    与 `clamp_anim_speed` 同一套取舍：夹住而不是抛错。注意两者的语义
+    **方向相反**——动画速度是「越大越慢」，走速是「越大越快」。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_WALK_SPEED_MULTIPLIER
+    if number != number:  # NaN
+        return DEFAULT_WALK_SPEED_MULTIPLIER
+    low, high = WALK_SPEED_MULTIPLIER_RANGE
+    return float(min(max(number, low), high))
 
 
 def clamp_sleep_after_ms(value) -> int:
@@ -476,6 +510,7 @@ class PetStore:
         settings['petSchedules'] = {}
         settings['petAnimSpeeds'] = {}
         settings['petAutoRoam'] = {}
+        settings['petWalkSpeeds'] = {}
         path = self.settings_path()
         if not os.path.isfile(path):
             return settings
@@ -496,6 +531,7 @@ class PetStore:
         settings['petSchedules'] = self._clean_schedule_map(settings.get('petSchedules'))
         settings['petAnimSpeeds'] = self._clean_anim_speed_map(settings.get('petAnimSpeeds'))
         settings['petAutoRoam'] = self._clean_bool_map(settings.get('petAutoRoam'))
+        settings['petWalkSpeeds'] = self._clean_walk_speed_map(settings.get('petWalkSpeeds'))
         # 隐藏开关必须是**真布尔**：手工写了 `"false"`（字符串）时
         # `bool("false")` 是 `True`，宠物会莫名其妙消失。
         settings['petHidden'] = settings.get('petHidden') is True
@@ -531,6 +567,26 @@ class PetStore:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 continue
             cleaned[pet_id] = clamp_anim_speed(value)
+        return cleaned
+
+    @staticmethod
+    def _clean_walk_speed_map(raw) -> dict:
+        """把 `{pet_id: 走速倍率}` 清洗成「合法 id → 夹过的倍率」。
+
+        与 `_clean_anim_speed_map` 完全同构，只是夹取区间不同
+        （走速越大越快，动画速度越大越慢——两者语义相反，因此**不能**共用一个
+        区间常量，虽然眼下数值恰好一样）。
+        """
+        if not isinstance(raw, dict):
+            return {}
+        cleaned = {}
+        for key, value in raw.items():
+            pet_id = sanitize_pet_id(key, fallback='')
+            if not pet_id:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            cleaned[pet_id] = clamp_walk_speed_multiplier(value)
         return cleaned
 
     @staticmethod
@@ -822,6 +878,86 @@ class PetStore:
                 return False
             del flags[pet_id]
             settings['petAutoRoam'] = flags
+            self._write_json(self.settings_path(), settings)
+        return True
+
+    # ------------------------------------------------------------ 走速
+
+    def effective_walk_speed_multiplier(self, pet_id: str) -> float:
+        """某形象的**走速倍率**（用户覆盖；没有覆盖就是 1.0）。
+
+        注意它**不是**最终速度：最终 px/s 还要乘上「当前倍率 ÷ 作者声明倍率」，
+        见 `effective_walk_speed`。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        stored = self.get_settings().get('petWalkSpeeds') or {}
+        if pet_id in stored:
+            return clamp_walk_speed_multiplier(stored[pet_id])
+        return DEFAULT_WALK_SPEED_MULTIPLIER
+
+    def effective_walk_speed(self, pet_id: str) -> dict:
+        """算出某形象**实际生效**的走速，以及它由哪几部分拼出来。
+
+        返回 `{speed, declared, multiplier, declaredScale, effectiveScale,
+        scaleRatio}`：
+
+        - `speed`：真正下发给前端的 px/s（**已按当前倍率换算**）；
+        - `declared`：`pet.json` 里写的原值；
+        - `multiplier`：用户在面板上给的倍率；
+        - `scaleRatio`：`当前倍率 ÷ 作者声明倍率`（没动过倍率时是 1.0）。
+
+        为什么把这几项一起返回：面板要显示「作者声明 52px/秒，你调到了 1.2×，
+        当前实际 62px/秒」——只给最终值的话，用户改倍率时会看到速度自己变了，
+        却不知道为什么。把来源摊开，那件事就成了可解释的。
+        """
+        pet_id = sanitize_pet_id(pet_id)
+        try:
+            pack = self.load_pack(pet_id)
+            declared = float(pack.physics.get('walkSpeed', 60.0))
+            declared_scale = clamp_scale(pack.scale)
+        except PetError:
+            declared = 60.0
+            declared_scale = DEFAULT_SCALE
+        effective_scale = self.effective_scale(pet_id)
+        multiplier = self.effective_walk_speed_multiplier(pet_id)
+        speed = scaled_walk_speed(
+            declared,
+            declared_scale=declared_scale,
+            effective_scale=effective_scale,
+            multiplier=multiplier,
+        )
+        ratio = effective_scale / declared_scale if declared_scale > 1e-6 else 1.0
+        return {
+            'speed': speed,
+            'declared': round(declared, 3),
+            'multiplier': multiplier,
+            'declaredScale': declared_scale,
+            'effectiveScale': effective_scale,
+            'scaleRatio': round(ratio, 4),
+        }
+
+    def set_pet_walk_speed_multiplier(self, pet_id: str, value) -> float:
+        """写入某形象的走速倍率覆盖。"""
+        pet_id = sanitize_pet_id(pet_id)
+        speed = clamp_walk_speed_multiplier(value)
+        with self._lock:
+            settings = self.get_settings()
+            speeds = dict(settings.get('petWalkSpeeds') or {})
+            speeds[pet_id] = speed
+            settings['petWalkSpeeds'] = speeds
+            self._write_json(self.settings_path(), settings)
+        return speed
+
+    def clear_pet_walk_speed_multiplier(self, pet_id: str) -> bool:
+        """删掉某形象的走速倍率覆盖（回落到 1.0 = 完全按作者声明的速度）。"""
+        pet_id = sanitize_pet_id(pet_id)
+        with self._lock:
+            settings = self.get_settings()
+            speeds = dict(settings.get('petWalkSpeeds') or {})
+            if pet_id not in speeds:
+                return False
+            del speeds[pet_id]
+            settings['petWalkSpeeds'] = speeds
             self._write_json(self.settings_path(), settings)
         return True
 
@@ -1521,6 +1657,17 @@ class PetStore:
             if size > distinct_decode.get(key, 0):
                 distinct_decode[key] = size
 
+        # 走速：**必须按当前倍率换算**再下发。
+        #
+        # `physics.walkSpeed` 是作者在他声明的 `scale` 下量的「屏幕像素/秒」。
+        # 用户把倍率调大之后，人物在屏幕上高了好几倍而速度不变 → 脚在打滑。
+        # 因此这里用 `scaled_walk_speed()` 把声明值换算到当前倍率，
+        # **覆盖** `physics.walkSpeed` 再下发——前端照旧只读 `physics`，
+        # 不需要知道「换算」这回事，也不会出现「两处各算一遍」的分歧。
+        walk = self.effective_walk_speed(pet_id)
+        physics = dict(pack.physics)
+        physics['walkSpeed'] = walk['speed']
+
         return {
             'id': pet_id,
             'source': source,
@@ -1531,7 +1678,7 @@ class PetStore:
             # （`animations.<动作>.size`）。躺姿这类横构图的动作必须能覆盖，
             # 否则前端会按竖构图的 `size` 把贴图拉伸变形。
             'anchor': dict(pack.anchor),
-            'physics': dict(pack.physics),
+            'physics': physics,
             # 生效值（已按「用户设置 > 包内声明 > 默认」算好）——前端直接用，
             # 不再自己判断优先级，避免两边规则不一致。
             'scale': self.effective_scale(pet_id),
@@ -1546,6 +1693,18 @@ class PetStore:
             'declaredPixelated': bool(pack.pixelated),
             'declaredAnimSpeed': clamp_anim_speed(pack.anim_speed),
             'declaredAutoRoam': bool(pack.auto_roam),
+            # 走速的**来源摊开**（面板要显示「作者声明 / 你的倍率 / 实际」）：
+            # - `walkSpeed`：已按当前倍率换算的 px/s（与 `physics.walkSpeed` 同值）；
+            # - `declaredWalkSpeed`：`pet.json` 里的原值；
+            # - `walkSpeedMultiplier`：用户在面板上给的倍率；
+            # - `walkSpeedScaleRatio`：当前倍率 ÷ 作者声明倍率。
+            'walkSpeed': walk['speed'],
+            'declaredWalkSpeed': walk['declared'],
+            'walkSpeedMultiplier': walk['multiplier'],
+            'walkSpeedScaleRatio': walk['scaleRatio'],
+            'walkSpeedOverridden': bool(
+                (self.get_settings().get('petWalkSpeeds') or {}).get(pet_id)
+            ),
             'writable': not self._is_builtin_only(pet_id),
             # `pet.json` 的 `id` 与**目录名**不一致时带上提示（见 `_describe`）。
             # 两者是同一个东西的两个来源，而目录名才是生效的那个。

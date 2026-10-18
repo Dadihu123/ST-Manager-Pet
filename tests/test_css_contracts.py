@@ -431,6 +431,36 @@ def test_frontend_scale_range_matches_backend():
     )
 
 
+def test_frontend_walk_speed_range_matches_backend():
+    """★ 面板上「走路速度」滑块的区间必须与后端夹取区间一致。
+
+    与 `scale` / 眨眼那两条同一个理由：两边写死不同数字时，用户能拖出一个
+    后端**悄悄夹掉**的值——表现是「拖到 3× 却没生效」，而没有任何报错。
+
+    ⚠️ 这条**刻意**不复用 `SPEED_MIN` / `SPEED_MAX`（动画速度）那对常量：
+    两者语义相反（动画速度越大越慢、走速越大越快）。数值眼下恰好相同，
+    但共用会让「哪天有人只改其中一个」时另一个悄悄跟着变。
+    """
+    backend = read(os.path.join(REPO_ROOT, 'backend', 'core', 'pack.py'))
+    match = re.search(r'WALK_SPEED_MULTIPLIER_RANGE\s*=\s*\(([^)]*)\)', backend)
+    assert match, '找不到 WALK_SPEED_MULTIPLIER_RANGE'
+    low, high = [float(part.strip()) for part in match.group(1).split(',')]
+
+    panel = read(os.path.join(REPO_ROOT, 'frontend', 'panel.js'))
+
+    def declared(name: str) -> float:
+        found = re.search(rf'{name}\s*=\s*([0-9.]+)', panel)
+        assert found, f'panel.js 里找不到 {name}'
+        return float(found.group(1))
+
+    assert declared('WALK_MIN') == low, f'panel.js 的 WALK_MIN 应为 {low}'
+    assert declared('WALK_MAX') == high, f'panel.js 的 WALK_MAX 应为 {high}'
+    # 反向守卫：这两个常量必须是**独立声明**的，不能 `WALK_MIN = SPEED_MIN`
+    assert re.search(r'const WALK_MIN\s*=\s*[0-9.]+', panel), (
+        'WALK_MIN 应写死数值，不要复用 SPEED_MIN——两者语义相反'
+    )
+
+
 def test_frontend_blink_ranges_match_backend():
     """★ 面板上「眨眼间隔 / 眨眼时长」的区间必须与后端校验区间一致。
 

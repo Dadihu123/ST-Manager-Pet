@@ -446,23 +446,26 @@ def test_settings_only_expose_structured_keys(env):
 
     两边都存会引出「宿主的设置表单改了、插件却不生效」这类双写不同步的 bug。
     `petScales` / `petPixelated` / `petSchedules` / `petAnimSpeeds` /
-    `petAutoRoam` 是**结构化**的（每个形象一个值，宿主表单表达不了），
-    `petHidden` 则是「宠物要不要显示」——它需要触手可及（面板顶部），
-    放宿主表单里就等于藏起来了。因此这几个合法地留在这里。
+    `petAutoRoam` / `petWalkSpeeds` 是**结构化**的（每个形象一个值，
+    宿主表单表达不了），`petHidden` 则是「宠物要不要显示」——它需要触手可及
+    （面板顶部），放宿主表单里就等于藏起来了。因此这几个合法地留在这里。
 
     ⚠️ `petAnimSpeeds` / `petAutoRoam` 是后加的：用户要求「不要搞全局的，
     在同一个地方调整的数值却分成全局和形象绑定两种情况，用户可能会困惑」，
     因此动画速度与自动漫游从宿主 `config_schema` 移到了这里（按形象）。
+    `petWalkSpeeds` 同理：走路速度必须**按形象**（不同形象的动画步幅不同），
+    而且它还要能覆盖内置形象——内置形象是只读的，写不进 `pet.json`。
     """
     _app, _store, client, _api = env
     settings = json_of(client.get('/api/plugins/stm-pet/settings'))['settings']
     assert set(settings) == {
         'activePetId', 'petScales', 'petPixelated', 'petSchedules',
-        'petAnimSpeeds', 'petAutoRoam', 'petHidden',
+        'petAnimSpeeds', 'petAutoRoam', 'petWalkSpeeds', 'petHidden',
     }
     # 这些**全局标量**不该出现在插件自己的设置里（那会造成双写不同步）
     for scalar in ('quietMode', 'quiet_mode', 'scale', 'sleepAfter', 'sleep_after',
-                   'animSpeed', 'anim_speed', 'autoRoam', 'auto_roam'):
+                   'animSpeed', 'anim_speed', 'autoRoam', 'auto_roam',
+                   'walkSpeed', 'walk_speed'):
         assert scalar not in settings
 
 
@@ -580,6 +583,60 @@ def test_update_appearance_is_allowed_on_builtin(env):
     )
     assert response.status_code == 200
     assert json_of(response)['pet']['scale'] == 0.5
+
+
+def test_update_appearance_sets_walk_speed_multiplier(env):
+    """★ 走路速度是**倍率**，且内置形象也能调（改的是用户设置，不碰随包文件）。
+
+    为什么不做成绝对 px/s：作者声明的 `walkSpeed` 量于**他声明的 `scale`**，
+    而生效走速会按「当前倍率 ÷ 声明倍率」自动换算。存绝对值的话，用户改一次
+    倍率就得重调一次走速——正是这次要修的联动缺失。
+    """
+    _app, store, client, _api = env
+    base = json_of(client.get('/api/plugins/stm-pet/pets/xiaoman/runtime'))['pet']
+    declared = base['declaredWalkSpeed']
+
+    response = client.post(
+        '/api/plugins/stm-pet/pets/xiaoman/appearance',
+        json={'walkSpeed': 2},
+        content_type='application/json',
+    )
+    assert response.status_code == 200
+    pet = json_of(response)['pet']
+    assert pet['walkSpeedMultiplier'] == 2
+    assert pet['walkSpeed'] == declared * 2
+    # 落在 settings.json，**没有**写进随包的 pet.json
+    assert store.get_settings()['petWalkSpeeds']['xiaoman'] == 2
+    assert store.load_pack('xiaoman').physics['walkSpeed'] == declared
+
+    # 传 null 清除覆盖
+    cleared = client.post(
+        '/api/plugins/stm-pet/pets/xiaoman/appearance',
+        json={'walkSpeed': None},
+        content_type='application/json',
+    )
+    assert json_of(cleared)['pet']['walkSpeedMultiplier'] == 1
+    assert json_of(cleared)['pet']['walkSpeed'] == declared
+
+
+def test_walk_speed_follows_scale_through_the_api(env):
+    """★ 联动在**接口层**也要成立：改倍率 → 走速同比变。"""
+    _app, _store, client, _api = env
+    before = json_of(client.get('/api/plugins/stm-pet/pets/xiaoman/runtime'))['pet']
+    declared = before['declaredWalkSpeed']
+    declared_scale = before['declaredScale']
+
+    client.post(
+        '/api/plugins/stm-pet/pets/xiaoman/appearance',
+        json={'scale': declared_scale * 2},
+        content_type='application/json',
+    )
+    after = json_of(client.get('/api/plugins/stm-pet/pets/xiaoman/runtime'))['pet']
+    assert after['walkSpeedScaleRatio'] == 2
+    assert after['walkSpeed'] == declared * 2
+    assert after['physics']['walkSpeed'] == after['walkSpeed'], (
+        'physics.walkSpeed 必须是换算后的生效值——前端只读这一处'
+    )
 
 
 def test_update_appearance_clamps_scale(env):

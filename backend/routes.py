@@ -626,6 +626,19 @@ def register_routes(api, store: PetStore) -> None:
                     )
                 store.set_pet_auto_roam(pet_id, flag)
 
+        if 'walkSpeed' in payload:
+            # ★ 这里收的是**倍率**（1.0 = 按作者声明的速度），不是 px/s。
+            #
+            # 为什么不做成绝对值：作者声明的 `walkSpeed` 是在**他声明的 `scale`**
+            # 下量的，而生效走速会按「当前倍率 ÷ 声明倍率」自动换算
+            # （见 `pack.scaled_walk_speed`）。存绝对值的话，用户改一次倍率
+            # 就得重调一次走速——正是这个联动缺失导致的问题。
+            value = payload.get('walkSpeed')
+            if value is None or value == '':
+                store.clear_pet_walk_speed_multiplier(pet_id)
+            else:
+                store.set_pet_walk_speed_multiplier(pet_id, value)
+
         return jsonify({'success': True, 'pet': runtime(pet_id)})
 
     @api.http.route('/pets/<pet_id>/actions/<action>/animation', ['POST'])
@@ -986,6 +999,15 @@ def register_routes(api, store: PetStore) -> None:
             'autoRoam': pack.get('autoRoam'),
             'declaredAnimSpeed': pack.get('declaredAnimSpeed'),
             'declaredAutoRoam': pack.get('declaredAutoRoam'),
+            # 走速（**按形象**）。`walkSpeed` 是已按当前倍率换算的 px/s，
+            # `declaredWalkSpeed` 是作者在 pet.json 里写的原值，
+            # `walkSpeedMultiplier` 是用户在面板上给的倍率。
+            # 三者都透传，面板才能把「为什么速度变了」讲清楚。
+            'walkSpeed': pack.get('walkSpeed'),
+            'declaredWalkSpeed': pack.get('declaredWalkSpeed'),
+            'walkSpeedMultiplier': pack.get('walkSpeedMultiplier'),
+            'walkSpeedScaleRatio': pack.get('walkSpeedScaleRatio'),
+            'walkSpeedOverridden': pack.get('walkSpeedOverridden', False),
             'writable': pack.get('writable', True),
             # `pet.json` 的 `id` 与**目录名**不一致（见 `store._describe`）。
             #
