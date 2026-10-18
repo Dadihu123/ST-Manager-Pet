@@ -1,4 +1,4 @@
-﻿"""每个动作自带单帧尺寸（`animations.<动作>.size`）。
+"""每个动作自带单帧尺寸（`animations.<动作>.size`）。
 
 为什么需要这个能力：一个动作的画布比例可能和别的动作根本不同。典型例子是
 躺姿睡觉——人物横躺，画布是横构图，而站立动作是 2:3 竖构图。若所有动作共用
@@ -241,3 +241,115 @@ def test_to_dict_includes_size_for_resolved_action():
     parsed = from_dict(payload)
     dumped = parsed.resolve('idle').to_dict()
     assert dumped['size'] == SLEEP_LOGICAL
+
+
+# ------------------------------------------------- 内置形象：尺寸必须对得上素材
+
+def _builtin_pet_dirs():
+    import os
+    pets_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'resources', 'pets',
+    )
+    return sorted(
+        (name, os.path.join(pets_root, name))
+        for name in os.listdir(pets_root)
+        if os.path.isdir(os.path.join(pets_root, name))
+    )
+
+
+def _variant_grid(entry):
+    """按 `layout` / `cols` / `rows` 算出这套动画的每页网格（与引擎同一套规则）。"""
+    frames = int(entry.get('frames') or 1)
+    layout = entry.get('layout') or 'horizontal'
+    cols = int(entry.get('cols') or 0)
+    rows = int(entry.get('rows') or 0)
+    if cols and rows:
+        return cols, rows
+    if cols:
+        return cols, max(1, -(-frames // cols))
+    if rows:
+        return max(1, -(-frames // rows)), rows
+    if layout == 'vertical':
+        return 1, frames
+    return frames, 1
+
+
+def test_builtin_pets_declare_action_size_matching_the_sheet():
+    """★ 内置形象每个动作声明的 `size` 必须与**素材实际单帧比例**一致。
+
+    为什么值得钉住：`size` 填错不会报错，只会让画面被拉伸——人物被横向压扁
+    或拉长，而这种「差一点点」在 259px 高的宠物上肉眼很难判断是素材问题
+    还是渲染问题（`sleep` 那次踩过：627×353 的躺姿被按 384×576 塞进竖框）。
+
+    判据是**比例**而不是像素：允许 1% 误差，因为宽构图动作的单帧宽可能
+    不是整数（`land.png` 是 1809/4 = 452.25，只能声明成 452）。
+    """
+    import json
+    import os
+
+    from PIL import Image
+
+    for pet_id, pet_dir in _builtin_pet_dirs():
+        with open(os.path.join(pet_dir, 'pet.json'), encoding='utf-8') as handle:
+            manifest = json.load(handle)
+        pack_size = manifest.get('size') or {}
+        for action, spec in (manifest.get('animations') or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            variants = spec.get('variants')
+            entries = variants if variants else [spec]
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    continue
+                sheet = entry.get('sheet')
+                if not sheet:
+                    continue
+                cols, rows = _variant_grid(entry)
+                with Image.open(os.path.join(pet_dir, sheet)) as image:
+                    frame_w = image.width / cols
+                    frame_h = image.height / rows
+                declared = entry.get('size') or pack_size
+                ratio_declared = declared['w'] / declared['h']
+                ratio_actual = frame_w / frame_h
+                assert abs(ratio_declared - ratio_actual) / ratio_actual < 0.01, (
+                    f'{pet_id}.{action}'
+                    + (f'[variant {index}]' if variants else '')
+                    + f' 声明的单帧尺寸 {declared["w"]}×{declared["h"]} 与素材比例不符：'
+                    f'素材单帧是 {frame_w:.2f}×{frame_h:.2f}'
+                    f'（{sheet} / {cols}×{rows}），按声明尺寸渲染会把人物拉伸'
+                )
+
+
+def test_builtin_pets_sheet_size_is_divisible_by_the_grid():
+    """★ 素材宽高必须能被网格整除，否则切帧会错位（每帧尺寸算不出来）。
+
+    这条是**素材契约**：引擎按 `cols × rows` 等分 sheet，除不尽时最后一帧
+    会带进下一帧的边缘。素材是按同一高度并排拼的，宽构图动作的单帧宽偶尔
+    会差半像素（`land.png` 1809/4 = 452.25），因此允许 ±0.5px 的余量。
+    """
+    import json
+    import os
+
+    from PIL import Image
+
+    for pet_id, pet_dir in _builtin_pet_dirs():
+        with open(os.path.join(pet_dir, 'pet.json'), encoding='utf-8') as handle:
+            manifest = json.load(handle)
+        for action, spec in (manifest.get('animations') or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            entries = spec.get('variants') or [spec]
+            for entry in entries:
+                if not isinstance(entry, dict) or not entry.get('sheet'):
+                    continue
+                cols, rows = _variant_grid(entry)
+                with Image.open(os.path.join(pet_dir, entry['sheet'])) as image:
+                    for axis, size, count in (
+                        ('宽', image.width, cols), ('高', image.height, rows),
+                    ):
+                        exact = size / count
+                        assert abs(exact - round(exact)) < 0.5, (
+                            f'{pet_id}.{action}: {entry["sheet"]} {axis} {size} '
+                            f'除以 {count} 除不尽，切帧会错位'
+                        )

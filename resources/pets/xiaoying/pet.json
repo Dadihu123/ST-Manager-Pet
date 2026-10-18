@@ -1,0 +1,140 @@
+{
+  "format": 1,
+  "id": "xiaoying",
+  "name": "小映",
+  "author": "官方",
+  "size": {
+    "w": 384,
+    "h": 576
+  },
+  "anchor": {
+    "x": 0.5,
+    "y": 0.9774
+  },
+  "scale": 0.45,
+  "pixelated": false,
+  "still": {
+    "sheet": "idle.png",
+    "frames": 4,
+    "frame": 0
+  },
+  "schedule": {
+    "idle": {
+      "minIntervalMs": 6000,
+      "maxIntervalMs": 18000,
+      "mode": "random",
+      "plays": 1
+    },
+    "roam": {
+      "minIntervalMs": 3000,
+      "maxIntervalMs": 9000
+    },
+    "sleep": {
+      "afterMs": 60000
+    }
+  },
+  "physics": {
+    "gravity": 1800,
+    "walkSpeed": 52,
+    "friction": 0.02,
+    "terminalVelocity": 2400,
+    "bounce": 0.12
+  },
+  "animations": {
+    "idle": {
+      "sheet": "idle.png",
+      "frames": 4,
+      "fps": 1.54,
+      "loop": true,
+      "frameMs": [450, 450, 850, 850],
+      "motion": {
+        "breathe": {
+          "amplitude": 0.01,
+          "periodMs": 3400
+        }
+      }
+    },
+    "walk-left": {
+      "sheet": "walk-left.png",
+      "frames": 4,
+      "fps": 2.86,
+      "loop": true,
+      "frameMs": [380, 320, 380, 320]
+    },
+    "walk-right": {
+      "sheet": "walk-right.png",
+      "frames": 4,
+      "fps": 2.86,
+      "loop": true,
+      "frameMs": [380, 320, 380, 320]
+    },
+    "drag": {
+      "sheet": "drag.png",
+      "frames": 3,
+      "fps": 2.78,
+      "loop": true,
+      "frameMs": [380, 320, 380],
+      "size": {
+        "w": 405,
+        "h": 576
+      }
+    },
+    "fall": {
+      "sheet": "fall.png",
+      "frames": 3,
+      "fps": 3.85,
+      "loop": true,
+      "frameMs": [280, 240, 260],
+      "size": {
+        "w": 422,
+        "h": 576
+      }
+    },
+    "land": {
+      "sheet": "land.png",
+      "frames": 4,
+      "fps": 4.88,
+      "loop": false,
+      "frameMs": [100, 160, 260, 300],
+      "size": {
+        "w": 452,
+        "h": 576
+      }
+    },
+    "click": {
+      "sheet": "click.png",
+      "frames": 4,
+      "fps": 3.39,
+      "loop": false,
+      "frameMs": [140, 220, 520, 300]
+    },
+    "sleep": {
+      "sheet": "sleep.png",
+      "frames": 3,
+      "fps": 0.94,
+      "loop": true,
+      "frameMs": [1100, 1000, 1100]
+    },
+    "happy": {
+      "sheet": "happy.png",
+      "frames": 4,
+      "fps": 2.86,
+      "loop": false,
+      "frameMs": [240, 260, 560, 340]
+    },
+    "sad": {
+      "sheet": "sad.png",
+      "frames": 4,
+      "fps": 1.54,
+      "loop": true,
+      "frameMs": [400, 600, 700, 900]
+    },
+    "angry": {
+      "sheet": "angry.png",
+      "frames": 4,
+      "fps": 2.27,
+      "loop": true,
+      "frameMs": [320, 420, 640, 380]
+    }
+  }
+}

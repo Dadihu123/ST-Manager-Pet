@@ -583,10 +583,12 @@ def test_frontend_required_actions_match_backend():
 
 
 def test_builtin_pets_directory_holds_only_the_shipped_faces():
-    """随包内置形象目录里只应有 `xiaoman` / `xiaoka`。
+    """随包内置形象目录里只应有 `xiaoman` / `xiaoka` / `xiaoying`。
 
     `default-cat` 已随生成脚本一起移除；这条防止它被误加回来
     （它没有对应的生成脚本了，加回来就是一份没人维护的孤儿资源）。
+    同理，往这个目录里塞实验性素材也要**显式**改这条断言——内置形象是
+    随包发布的只读资源，多一个就多一份要长期维护的东西。
     """
     import sys
 
@@ -598,7 +600,7 @@ def test_builtin_pets_directory_holds_only_the_shipped_faces():
         name for name in os.listdir(pets_dir)
         if os.path.isdir(os.path.join(pets_dir, name))
     )
-    assert names == ['xiaoka', 'xiaoman'], f'内置形象目录异常: {names}'
+    assert names == ['xiaoka', 'xiaoman', 'xiaoying'], f'内置形象目录异常: {names}'
     # 默认形象必须是内置的之一，否则首次安装会落到「列表第一个」
     assert DEFAULT_PET_ID in names, f'DEFAULT_PET_ID={DEFAULT_PET_ID} 不在内置形象里'
 
