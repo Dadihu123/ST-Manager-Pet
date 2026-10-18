@@ -60,6 +60,52 @@ function velocityEpsilon(walkSpeed) {
 }
 
 /**
+ * **被拎起来时**，脚底应当落在指针下方多远（像素）。
+ *
+ * 拖拽的语义是「把宠物吊起来」，动画里人物也是双手举过头顶。
+ * 因此指针抓的是**头顶**，整只宠物挂在指针下方；若把脚底对齐指针，
+ * 看起来就成了「从下面托着」，与动画完全对不上。
+ *
+ * 几何推导（与 `petview.js:drawPosition` 同一套坐标）：
+ *
+ * ```
+ * top   = footY - height × anchorY        // 贴图顶边的屏幕 y
+ * grip  = top + height × dragAnchorY      // 抓取点的屏幕 y（自顶向下量）
+ * ```
+ *
+ * 令 `grip === pointerY`，解出脚底：
+ *
+ * ```
+ * footY = pointerY + height × (anchorY - dragAnchorY)
+ * ```
+ *
+ * 返回值就是这个偏移 `height × (anchorY - dragAnchorY)`——
+ * 指针 y 加上它才是脚底 y。
+ *
+ * ⚠️ 它**必须**用「当前动作的显示高度」算，不能用包级 `size`：
+ * 拖拽那一套动画可以自带 `size`（例如小映的 `drag` 是 405×576），
+ * 而抓取点量的是**那一张图**的比例。
+ *
+ * @param {number} height 当前动作单帧的**显示**高度（CSS px，已含倍率）
+ * @param {number} anchorY 包级 `anchor.y`（脚底在贴图里的位置，0~1）
+ * @param {number} dragAnchorY 包级 `anchor.drag`（抓取点，自顶向下 0~1）
+ * @returns {number} 脚底相对指针的纵向偏移（像素，通常为正 = 宠物挂在指针下方）
+ */
+export function dragGripOffset(height, anchorY, dragAnchorY) {
+  const h = Math.max(0, Number(height) || 0);
+  const foot = clamp01(anchorY, 1);
+  const grip = clamp01(dragAnchorY, 0);
+  return h * (foot - grip);
+}
+
+/** 把值夹进 [0, 1]；非法值回落到 `fallback`。 */
+function clamp01(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(Math.max(number, 0), 1);
+}
+
+/**
  * 创建一个宠物物理体。
  *
  * @param {object} options
@@ -281,22 +327,27 @@ export function createPhysics(options = {}) {
      *
      * 任何状态都能被 drag 打断（§4.3 的硬要求）：这里顺手清掉速度，
      * 否则松手后会把拖拽前的惯性一起甩出去，手感很怪。
+     *
+     * ⚠️ **`(footX, footY)` 是脚底的世界坐标，不是指针坐标**——
+     * 指针抓的是头顶，两者差一个 `dragGripOffset()`（见那个函数的说明）。
+     * 换算放在 `petview.js` 里做，因为只有它知道当前动作的显示高度与
+     * 包级锚点；物理层不该知道「锚点」这种渲染概念。
      */
-    beginDrag(pointerX, pointerY) {
+    beginDrag(footX, footY) {
       dragging = true;
       inputActive = false;
       vx = 0;
       vy = 0;
-      x = clampX(pointerX);
-      y = clampY(pointerY);
+      x = clampX(footX);
+      y = clampY(footY);
       return this;
     },
 
-    /** 拖拽中跟手（直接写位置，不走物理）。 */
-    moveDrag(pointerX, pointerY) {
+    /** 拖拽中跟手（直接写位置，不走物理）。坐标同样是**脚底**，见 `beginDrag`。 */
+    moveDrag(footX, footY) {
       if (!dragging) return this;
-      x = clampX(pointerX);
-      y = clampY(pointerY);
+      x = clampX(footX);
+      y = clampY(footY);
       return this;
     },
 

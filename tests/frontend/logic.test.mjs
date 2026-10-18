@@ -16,6 +16,7 @@ import { test } from 'node:test';
 import { createFrameClock, decideThrottle, createIdleGate, MAX_FPS } from '../../frontend/clock.js';
 import {
   createPhysics,
+  dragGripOffset,
   estimateReleaseVelocity,
   hopVelocity,
   DEFAULT_PHYSICS,
@@ -338,6 +339,52 @@ test('物理：拖拽清零旧速度（不会把拖拽前的惯性一起甩出�
   body.beginDrag(300, 300);
   assert.equal(body.vx, 0);
   assert.equal(body.vy, 0);
+});
+
+// ---------------------------------------------- 拖拽的抓取点（「被拎起来」）
+
+test('拖拽：抓取点在头顶时，脚底落在指针下方约一个身高', () => {
+  // 内置形象：高 576×0.45 = 259，anchorY 0.98，anchor.drag 0.03
+  const height = 259;
+  const offset = dragGripOffset(height, 0.98, 0.03);
+  assert.ok(
+    Math.abs(offset - 246) < 3,
+    `偏移应约 246px（= 259 × (0.98 − 0.03)），实际 ${offset}`,
+  );
+  // 语义断言：抓取点在头顶 → 脚底**在指针下方**（偏移为正）
+  assert.ok(offset > 0, '脚底应在指针下方——否则就成了「从下面托着」');
+});
+
+test('拖拽：抓取点越靠下，脚底离指针越近', () => {
+  const height = 300;
+  const top = dragGripOffset(height, 1, 0);
+  const middle = dragGripOffset(height, 1, 0.5);
+  const bottom = dragGripOffset(height, 1, 1);
+  assert.equal(top, 300);
+  assert.equal(middle, 150);
+  assert.equal(bottom, 0, '抓脚底时脚底正对指针（旧行为）');
+});
+
+test('拖拽：抓取点与脚底锚点重合时偏移为 0（等价于旧行为）', () => {
+  assert.equal(dragGripOffset(200, 0.8, 0.8), 0);
+});
+
+test('拖拽：脏锚点被夹进 [0,1]，不产生负偏移', () => {
+  // anchorY 越界 → 夹到 1；dragAnchor 越界 → 夹到 0
+  assert.equal(dragGripOffset(100, 5, -3), 100);
+  // 非数字 → 各自回落到 1 / 0
+  assert.equal(dragGripOffset(100, 'x', 'y'), 100);
+  // 高度缺失 → 0（不抛错）
+  assert.equal(dragGripOffset(undefined, 1, 0), 0);
+});
+
+test('拖拽：脚底坐标由调用方换算，物理层只做夹取', () => {
+  // 抓头顶：指针在 (400, 100) → 脚底 = 100 + 246 = 346
+  const body = physicsAt({ x: 400, y: 600 });
+  const offset = dragGripOffset(259, 0.98, 0.03);
+  body.beginDrag(400, 100 + offset);
+  assert.equal(body.x, 400);
+  assert.ok(Math.abs(body.y - 346) < 2, `脚底应约 346，实际 ${body.y}`);
 });
 
 test('物理：触地标记 justLanded 一次性', () => {

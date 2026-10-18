@@ -2630,8 +2630,8 @@ class PetStore:
         （都带各自的校验与副作用），这个处理**纯数值/布尔**的几个字段，
         统一走 `_patch_manifest`。
 
-        能改的字段见 `pack.PET_PATCH_FIELDS`。`anchor` 传 `{x, y}`（部分更新），
-        其余传标量或 `None`（删除 → 回落默认）。
+        能改的字段见 `pack.PET_PATCH_FIELDS`。`anchor` 传 `{x, y, drag}`
+        （部分更新，三个键都可选），其余传标量或 `None`（删除 → 回落默认）。
         """
         if not isinstance(patch, dict):
             raise PetError(CODE_WRITE_FAILED, '补丁应为对象', user_msg='设置格式不对。')
@@ -2655,7 +2655,7 @@ class PetStore:
                     if not isinstance(node, dict):
                         node = {}
                         manifest['anchor'] = node
-                    for axis in ('x', 'y'):
+                    for axis in ('x', 'y', 'drag'):
                         if axis not in raw:
                             continue
                         value = raw[axis]
@@ -2676,7 +2676,9 @@ class PetStore:
                                 CODE_PACK_FIELD_INVALID,
                                 f'anchor.{axis} 应在 0 ~ 1 之间，实际为 {value}',
                                 user_msg='锚点只能是 0~1 之间的数字。',
-                                hint='0 = 贴左/贴上，1 = 贴右/贴下。',
+                                hint='0 = 贴左/贴上，1 = 贴右/贴下。'
+                                     'drag 是「被拎起来时指针抓在哪」：'
+                                     '0 = 头顶，1 = 脚底。',
                             )
                         node[axis] = number
                     if not node:

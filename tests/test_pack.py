@@ -40,7 +40,7 @@ def test_full_pack_parses_all_fields():
     assert parsed.name == '测试宠物'
     assert parsed.author == 'tests'
     assert parsed.size == {'w': 64, 'h': 64}
-    assert parsed.anchor == {'x': 0.5, 'y': 1.0}
+    assert parsed.anchor == {'x': 0.5, 'y': 1.0, 'drag': 0.03}
     assert parsed.physics['gravity'] == 1800
     assert parsed.physics['friction'] == 0.02
     assert set(parsed.animations) == {
@@ -65,7 +65,7 @@ def test_defaults_filled_when_omitted():
     """省略 size / anchor / physics 时用默认值，而不是报错。"""
     parsed = from_dict({'id': 'x', 'animations': {'idle': 'idle.png'}})
     assert parsed.size == {'w': 64, 'h': 64}
-    assert parsed.anchor == {'x': 0.5, 'y': 1.0}
+    assert parsed.anchor == {'x': 0.5, 'y': 1.0, 'drag': 0.03}
     assert parsed.physics['gravity'] == 1800
     assert parsed.physics['terminalVelocity'] == 2400
 

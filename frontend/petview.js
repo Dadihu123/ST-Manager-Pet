@@ -36,7 +36,7 @@ import {
   walkActionFor,
 } from './direction.js';
 import { createGesture, DEFAULT_HOLD_MS, DEFAULT_SLOP } from './gesture.js';
-import { createPhysics, estimateReleaseVelocity, hopVelocity } from './physics.js';
+import { createPhysics, dragGripOffset, estimateReleaseVelocity, hopVelocity } from './physics.js';
 import { createStateMachine, STATES } from './statemachine.js';
 
 /** 指针采样窗口（毫秒），用于估算甩出速度。 */
@@ -98,6 +98,34 @@ const DRAG_HOLD_MS = DEFAULT_HOLD_MS;
 
 /** 位移超过这么多像素就立刻算拖拽（不必等长按）。 */
 const DRAG_SLOP = DEFAULT_SLOP;
+
+/**
+ * 拖拽起手时，把「抓取点」从**按下处**滑到**头顶**要多久（秒）。
+ *
+ * 抓取点从「脚底对齐指针」改成「头顶对齐指针」之后，起手瞬间人物要整体位移
+ * 约 `身高 × anchorY`（内置形象 259px 高 → 约 254px）。直接跳过去就是一次瞬移。
+ *
+ * ⚠️ 多数情况下**这段缓动看不见**——宠物通常站在屏幕底部，而「头顶对齐指针」
+ * 意味着脚底要落到视口下方，于是被 `applyDragPoint` 的地面夹取吃掉，
+ * 人物原地不动、指针在它身上（详见 `applyDragPoint` 的说明）。
+ * 它真正起作用的是两种情形：
+ *
+ * 1. 宠物**悬空**（正在坠落）时被抓住——那时没有地面夹取，位移会完整发生；
+ * 2. 指针落在**头顶上方**时——人物要被「往上拎」一截才够得着。
+ *
+ * 150ms 取「快到像被拎起、又慢到看得见过程」的中间值：再短（< 80ms）接近
+ * 瞬移，再长（> 250ms）会像在慢慢飘。
+ */
+const DRAG_GRIP_EASE_S = 0.15;
+
+/**
+ * 抓取点（`anchor.drag`）的兜底值。
+ *
+ * 与 `backend/core/pack.py:DEFAULT_ANCHOR['drag']` 必须一致。这里**仍要有**
+ * 一个兜底：手工构造的运行期定义（测试夹具、`fallbackPack()`）可能没有这个键，
+ * 那时按「抓头顶」处理（`0.03` ≈ 内置形象 `drag` 帧的内容顶边）。
+ */
+const DRAG_GRIP_DEFAULT = 0.03;
 
 /**
  * 点击后的小弹跳**高度比例**的兜底（`physics.clickHop` 缺失时用它）。
@@ -183,6 +211,17 @@ export function createPetView(options = {}) {
   let height = Math.max(8, Math.round(baseSize.h * scale));
   const anchorX = Number(pack.anchor?.x ?? 0.5);
   const anchorY = Number(pack.anchor?.y ?? 1);
+  /**
+   * **被拎起来时指针抓在贴图的哪个高度**（自顶向下 0~1，见 `pack.DEFAULT_ANCHOR`）。
+   *
+   * 拖拽语义是「把宠物吊起来」，因此指针落在**头顶/手**上，整只宠物挂在
+   * 指针下方——而不是脚底对齐指针（那看起来像「从下面托着」）。
+   */
+  const dragAnchorY = clamp(
+    Number(pack.anchor?.drag ?? DRAG_GRIP_DEFAULT),
+    0,
+    1,
+  );
 
   /** 用户设的动画速度倍率（越大越慢）。 */
   let animSpeed = clamp(Number(config.animSpeed) || 1, ANIM_SPEED_MIN, ANIM_SPEED_MAX);
@@ -339,6 +378,18 @@ export function createPetView(options = {}) {
   let pointerId = null;
   /** 最近一次指针位置（长按升级成拖拽时要用它作为拖拽起点）。 */
   let lastPointer = null;
+  /**
+   * 拖拽中的「**脚底 − 指针**」纵向偏移（像素）。
+   *
+   * 指针抓的是头顶（`anchor.drag`），所以脚底在指针下方约 `身高 × anchorY` 处。
+   * 起手后的 `DRAG_GRIP_EASE_S` 内它从 `dragOffsetFrom`（按下时的相对偏移，
+   * 保证不跳）缓动到 `dragOffsetTo`（抓头顶的目标值）。
+   */
+  let dragOffset = 0;
+  let dragOffsetFrom = 0;
+  let dragOffsetTo = 0;
+  /** 缓动进度 0~1；`1` = 已到位，不再需要逐帧推进。 */
+  let dragBlend = 1;
   /**
    * 距离下一次漫游的**剩余毫秒**——**仅用于诊断/测试**，不参与调度。
    *
@@ -1004,6 +1055,14 @@ export function createPetView(options = {}) {
     //      两者天然同步，也不会出现「循环停了但长按定时器还在跑」的错位。
     if (gesture.phase === 'pending' && lastPointer) {
       if (gesture.tick(now)) beginDrag(lastPointer);
+    }
+
+    // 2.6) 抓取点缓动（「被拎起来」那 150ms）
+    //
+    //      用户按住不动时没有 `pointermove`，因此这段过渡**必须**由 rAF 推进，
+    //      否则长按拖拽的人物会停在起手位置，永远不滑到指针下方。
+    if (gesture.dragging && lastPointer && advanceDragGrip(dt)) {
+      applyDragPoint(lastPointer);
     }
 
     // 3) 帧推进
@@ -1766,16 +1825,58 @@ export function createPetView(options = {}) {
     event.preventDefault();
   }
 
-  /** 把手势升级成真正的拖拽。 */
+  /**
+   * 把手势升级成真正的拖拽。
+   *
+   * ★ 起手不跳：先按「脚底相对指针的**当前**偏移」把位置续上，再用
+   * `DRAG_GRIP_EASE_S` 把偏移滑到「抓头顶」的目标值（见 `applyDragPoint`）。
+   * 这样按下时人物一动不动，随后被拎到指针下方。
+   */
   function beginDrag(point) {
     machine.beginDrag({ now: performance.now() });
-    physics.beginDrag(point.x, point.y);
+    // 起手瞬间的「脚底 − 指针」偏移：用它保证**没有跳变**
+    // （此刻人物还站在地上，脚底在指针下方约 anchorY×身高处）。
+    dragOffsetFrom = physics.y - point.y;
+    dragOffsetTo = dragGripOffset(height, anchorY, dragAnchorY);
+    dragOffset = dragOffsetFrom;
+    dragBlend = 0;
+    physics.beginDrag(point.x, point.y + dragOffset);
     // 运动期间才加 will-change，停下就摘（常驻会占显存，§4.1）
     root.classList.add('is-moving');
     // 拎在手里时**不呼吸**：宠物被举着还在「喘气」很怪
     // （CSS 侧按这个类把 `animation-play-state` 设为 paused）。
     root.classList.add('is-held');
     wake();
+  }
+
+  /**
+   * 拖拽中：把指针位置换算成**脚底**世界坐标并写进物理。
+   *
+   * 换算 = 指针 y + `dragOffset`，而 `dragOffset` 在起手后的
+   * `DRAG_GRIP_EASE_S` 内从「按下时的相对偏移」缓动到「抓头顶」的目标值。
+   * 缓动只做一次，之后 `dragOffset` 恒定，人物就稳稳挂在指针下方。
+   *
+   * ⚠️ 纵向还要再夹一道：**整只贴图不能越过视口顶边**。
+   * 物理层的 `clampY` 只保证「脚底 y ∈ [0, 视口高]」，而脚底贴着 y=0 时
+   * 人物整个身体都在屏幕上方——用户把宠物拖出屏幕就再也抓不回来了。
+   * 这里按「顶边 ≥ 0」重新夹，即脚底 ≥ 身高 × anchorY。
+   */
+  function applyDragPoint(point) {
+    const offset = dragOffset;
+    const minFootY = height * anchorY;
+    const footY = clamp(point.y + offset, minFootY, physics.bounds.height);
+    physics.moveDrag(point.x, footY);
+    drawPosition();
+  }
+
+  /** 推进「抓取点缓动」。返回是否还在过渡中（供 rAF 决定要不要继续画）。 */
+  function advanceDragGrip(dt) {
+    if (dragBlend >= 1) return false;
+    dragBlend = Math.min(1, dragBlend + dt / DRAG_GRIP_EASE_S);
+    // ease-out：起手快、到位慢——「被拎起来」是猛的，稳下来是缓的
+    const eased = 1 - (1 - dragBlend) * (1 - dragBlend);
+    dragOffset = dragOffsetFrom + (dragOffsetTo - dragOffsetFrom) * eased;
+    return true;
   }
 
   function onPointerMove(event) {
@@ -1788,10 +1889,7 @@ export function createPetView(options = {}) {
     noteInteraction();
 
     if (gesture.move(point.x, point.y, now)) beginDrag(point);
-    if (gesture.dragging) {
-      physics.moveDrag(point.x, point.y);
-      drawPosition();
-    }
+    if (gesture.dragging) applyDragPoint(point);
     event.preventDefault();
   }
 
@@ -1812,6 +1910,9 @@ export function createPetView(options = {}) {
 
     const outcome = gesture.end(point.x, point.y, now);
     lastPointer = null;
+    // 松手：抓取点缓动归位，下一次起手重新从「按下时的相对偏移」开始
+    dragBlend = 1;
+    dragOffset = 0;
     root.classList.remove('is-moving');
     root.classList.remove('is-held');
 

@@ -304,6 +304,14 @@ const HELP_SECTIONS = [
           + '原地不动更自然。走动的间隔在下面「触发时间」里调。',
       },
       {
+        term: '抓取点（被拎起来时）',
+        body: '用鼠标拖宠物时，指针落在贴图的哪个高度上。'
+          + '0 = 头顶，整只宠物挂在指针下方；1 = 脚底，看着像从下面托着。',
+        recommend: '保持默认的 3% 左右即可——拖拽动画里人物双手举过头顶，'
+          + '指针压在手上最自然。只有当你的 `drag` 帧里手举得很低（或宠物是'
+          + '「被叼住后颈」那种画法）时才需要调，原则是让指针落在手所在的位置。',
+      },
+      {
         term: '单帧尺寸（进阶）',
         body: '一张贴图里单帧的像素尺寸，不是整张 spritesheet 的大小。',
         recommend: '一般不用改：新建形象时会自动按你上传的图算出来。'
@@ -2727,7 +2735,7 @@ export function createSettingsPanel({
     const section = renderCollapsible('锚点与单帧尺寸', {
       key: 'anchor',
       badge: '进阶',
-      hint: '脚底在单帧里的相对位置。'
+      hint: '脚底在单帧里的相对位置、被拎起时抓在哪。'
         + '调错的后果一眼就能看出来。',
     });
 
@@ -2754,6 +2762,51 @@ export function createSettingsPanel({
       onInput: (value) => updateLayout({ anchor: { y: value } }),
     }));
     section.body.appendChild(anchorRow);
+
+    // ---- 抓取点（**被拎起来时**指针抓在贴图的哪个高度）
+    //
+    // 用户指出：「拖拽动画的底部中心与鼠标位置重叠……正常我们理解的拖拽
+    // 应该是把这个宠物吊起来，也就是从头顶把人揪起来，现在看起来却像是把
+    // 人物托起来了」。
+    //
+    // 因此指针抓的是**头顶**（`0`）而不是脚底（`1`）。这一项开放给作者：
+    // 不同形象的 `drag` 帧里「手举到哪」不一样，默认 0.03 只适配了
+    // 内置形象那种「双手举过头顶」的画法。
+    const gripField = el('div', 'pet-field');
+    const gripHead = el('div', 'pet-slider-head');
+    gripHead.appendChild(el('span', 'pet-field-label', '抓取点（被拎起时）'));
+    const gripReadout = el(
+      'span',
+      'pet-slider-value',
+      formatGripPercent(Number(anchor.drag)),
+    );
+    gripHead.appendChild(gripReadout);
+    gripField.appendChild(gripHead);
+
+    const gripRow = createSliderRow({
+      min: 0,
+      max: 1,
+      step: 0.01,
+      value: Number.isFinite(Number(anchor.drag)) ? Number(anchor.drag) : 0.03,
+      label: '抓取点',
+      format: (value) => String(value),
+      onInput: (value) => { gripReadout.textContent = formatGripPercent(value); },
+      onCommit: (value) => updateLayout({ anchor: { drag: value } }),
+    });
+    gripRow.slider.dataset.anchorDrag = 'true';
+    gripField.appendChild(gripRow.row);
+    gripField.appendChild(el(
+      'div',
+      'pet-field-hint',
+      '指针抓在贴图的哪个高度：0 = 头顶（默认，整只宠物挂在指针下方），'
+      + '1 = 脚底（从下面托着，一般不该用）。'
+      + '拖拽动画里手举得越高，这个值越该靠 0。',
+    ));
+    const gripRange = el('div', 'pet-slider-range');
+    gripRange.appendChild(el('span', null, '0 头顶'));
+    gripRange.appendChild(el('span', null, '1 脚底'));
+    gripField.appendChild(gripRange);
+    section.body.appendChild(gripField);
 
     const sizeRow = el('div', 'pet-editor-row');
     sizeRow.appendChild(editorNumber({
@@ -3439,6 +3492,20 @@ export function createSettingsPanel({
   function formatScale(value) {
     const number = Number(value) || 1;
     return `${Math.round(number * 100) / 100}×`;
+  }
+
+  /**
+   * 抓取点的百分比读数（`0.03` → `3%（头顶附近）`）。
+   *
+   * 用百分比而不是 0~1 的小数：它是「贴图高度的比例」，
+   * 「3%」比「0.03」更容易对上「手举在头顶往上一点点」这个画面。
+   */
+  function formatGripPercent(value) {
+    const number = Number(value);
+    const percent = Math.round((Number.isFinite(number) ? number : 0.03) * 100);
+    if (percent <= 5) return `${percent}%（头顶）`;
+    if (percent >= 95) return `${percent}%（脚底）`;
+    return `${percent}%`;
   }
 
   /**
