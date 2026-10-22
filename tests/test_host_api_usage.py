@@ -218,23 +218,29 @@ def test_all_frontend_modules_are_valid_esm():
     assert 'ok' in result.stdout
 
 
-def test_manifest_declares_settings_entry_and_no_ambient_surface():
-    """manifest 里的入口声明要符合宿主契约。"""
+def test_manifest_declares_settings_entry_and_no_ambient_menu():
+    """manifest 里的贡献声明要符合 v3 宿主契约。"""
     import json
 
     with open(os.path.join(REPO_ROOT, 'manifest.json'), encoding='utf-8') as handle:
         manifest = json.load(handle)
 
-    entries = manifest['frontend']['entries']
-    assert len(entries) >= 1
-    settings = [entry for entry in entries if entry['kind'] == 'settings']
-    assert settings, '需要 settings 入口来承载形象管理面板'
+    assert manifest['api_version'] == 3
+    assert manifest['manifest_version'] == 3
+    frontend = manifest['frontend']
+    assert 'entries' not in frontend, 'v3 已删除 frontend.entries[]'
+    menus = (frontend.get('contributions') or {}).get('menus') or []
+    assert menus, 'v3 入口声明在 frontend.contributions.menus'
 
-    # `entries[]` 是「用户可见入口」，而 ambient 注册即挂载、没有入口 ——
-    # 在 manifest 里写 type: ambient 会被宿主丢弃并 warning（§2.6 / §8 陷阱 6）
-    for entry in entries:
-        surface = entry.get('surface') or {}
-        assert surface.get('type') != 'ambient', (
-            f'入口 {entry["id"]} 声明了 ambient；宿主只允许 panel/modal/page/sheet'
+    settings = [node for node in menus if node.get('placement') == 'settings.nav']
+    assert settings, '需要 settings.nav 入口来承载形象管理面板'
+    docks = [node for node in menus if node.get('placement') == 'dock']
+    assert docks, '需要 dock 入口（坞里也能进）'
+
+    # `ambient` 是 surface 注册时的 type，不是菜单落点 / action 类型：
+    # 在 manifest 里声明它会被宿主丢弃并 warning（§2.6 / §8 陷阱 6）。
+    for node in menus:
+        action = node.get('action') or {}
+        assert action.get('type') in ('surface', 'command', 'url'), (
+            f'入口 {node.get("id")} 的 action.type 非法: {action.get("type")!r}'
         )
-        assert surface.get('type') in ('panel', 'modal', 'page', 'sheet')

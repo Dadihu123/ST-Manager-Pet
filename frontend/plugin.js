@@ -4,6 +4,12 @@
  * 契约：导出 `activate(api)`，可选导出 `deactivate(api)`；`activate` 的返回值
  * 被宿主记为插件级 disposer（§2.9）。
  *
+ * 契约 v3（`manifest_version: 3` / `api_version: 3`）：入口不再由 manifest 的
+ * `frontend.entries[]` 描述，而是 `frontend.contributions.menus` 声明 `dock` 与
+ * `settings.nav` 两个菜单节点（都打开 `pet-settings` surface）；自绘的常驻宠物用
+ * `render_mode: "custom"` + `ui.custom` 能力位披露。前端**不调用** `api.entries.*`
+ * （v3 已删除），界面结构全部来自静态声明。
+ *
  * 本插件只做三类事：
  * 1. 注册一个 `ambient` surface，在里面养一只宠物（**不自绘 fixed 浮层**）；
  * 2. 订阅核心事件与宿主状态，驱动宠物的反应与省电；
@@ -29,7 +35,7 @@ import { createAnnouncer } from './announce.js';
  * （宿主自己的 192 个图标有 176 个用不了），插件资源路径一律被**静默丢弃**——
  * 因此当时只能退化成宿主通用的 `check`。
  *
- * 现在 toast 与 `entries[].icon` / `api.ui.icon()` 走**同一套** `resolveIcon()`：
+ * 现在 toast 与贡献菜单节点的 `icon` / `api.ui.icon()` 走**同一套** `resolveIcon()`：
  * - 不含 `/` 与 `.` → 宿主图标名 → `<use href="/static/icons/...">`
  * - 含 `/` → 插件资源路径 → CSS mask（填充式图形不能塞进 `<use>`）
  *

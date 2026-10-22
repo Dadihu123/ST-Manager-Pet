@@ -4,6 +4,24 @@
 
 ## [未发布]
 
+### 变更
+
+**迁移到插件契约 v3（`api_version` / `manifest_version` = 3）**
+
+- `manifest.json` 的 `permissions` → `capabilities`（本插件只声明 `ui.custom`，
+  表示自绘常驻形象；依旧不读卡片、不读世界书、不联网）。
+- `frontend.entries[]` → `frontend.contributions`：坞入口 `pet-dock`
+  （`placement: "dock"`）与设置导航项 `pet-settings`（`placement: "settings.nav"`）
+  都声明 `action: {type: "surface", id: "pet-settings"}`。
+- `frontend.render_mode: "custom"`：常驻形象由插件自绘，能力声明如实反映。
+- 测试迁移：`tests/test_manifest_entries.py` → `tests/test_manifest_contributions.py`，
+  `test_host_api_usage.py` / `test_icon_contracts.py` 改读 `contributions`。
+- 新增 `scripts/stm_plugin_check.py`（从主程序生成并复制的独立严格校验器）与
+  `.github/workflows/plugin-check.yml`（CI 按 `manifest.id` 摊目录后跑严格校验）。
+- 版本 `0.4.0`。
+
+## [未发布]
+
 ### 修复
 
 **拖拽变成了「从下面托着」——指针该抓头顶，不该对脚底**

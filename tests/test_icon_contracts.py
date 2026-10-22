@@ -165,15 +165,18 @@ def test_icon_has_no_hardcoded_absolute_size(icon_source):
 # ------------------------------------------------------------------ 接入点
 
 
-def test_manifest_entry_references_the_icon():
-    """`entries[].icon` 必须是插件内资源路径（宿主会解析成 /api/plugins/<id>/assets/…）。"""
+def test_manifest_contribution_icons_reference_the_plugin_icon():
+    """贡献菜单节点的 `icon` 必须是插件内资源路径（宿主会解析成 /api/plugins/<id>/assets/…）。"""
     import json
 
     with open(os.path.join(REPO_ROOT, 'manifest.json'), encoding='utf-8') as handle:
         manifest = json.load(handle)
-    icons = [entry.get('icon') for entry in manifest['frontend']['entries']]
+
+    menus = (manifest['frontend'].get('contributions') or {}).get('menus') or []
+    icons = [node.get('icon') for node in menus]
+    assert icons, 'manifest 菜单节点未声明图标'
     assert any(icon == 'frontend/assets/icon.svg' for icon in icons), (
-        f'设置入口没有引用插件图标: {icons}'
+        f'设置/坞入口没有引用插件图标: {icons}'
     )
 
 
@@ -243,8 +246,9 @@ def test_icon_url_is_reachable_from_manifest_path():
 
     with open(os.path.join(REPO_ROOT, 'manifest.json'), encoding='utf-8') as handle:
         manifest = json.load(handle)
-    for entry in manifest['frontend']['entries']:
-        icon = entry.get('icon')
+    menus = (manifest['frontend'].get('contributions') or {}).get('menus') or []
+    for node in menus:
+        icon = node.get('icon')
         if not icon:
             continue
         assert os.path.isfile(os.path.join(REPO_ROOT, icon)), f'manifest 里的图标不存在: {icon}'

@@ -6,8 +6,9 @@ ST-Manager 官方插件：一只常驻在界面上的桌面宠物。它会随宿
 不想看到它时还能**一键关闭**（不必卸载插件）。
 
 - 插件 id：`stm-pet`
-- `api_version`：2
-- 权限：**不声明任何权限**（不读卡片、不读世界书、不联网）
+- `api_version` / `manifest_version`：3
+- 能力（`capabilities`）：只有 `ui.custom` —— 本插件自绘常驻形象（需要一个自己
+  控制的绝对定位层），但**不读卡片、不读世界书、不联网**
 
 ---
 
@@ -1622,6 +1623,15 @@ python -m pytest -q
 node --test "tests/frontend/*.test.mjs"
 ```
 
+插件契约 v3 的**独立严格校验**（`scripts/stm_plugin_check.py` 从主程序生成并复制，
+不 import 宿主仓库，CI 的 `plugin-check` 工作流跑的就是它）：
+
+```bash
+# 契约要求 manifest.id 等于插件目录名，因此先摊到同名临时目录
+mkdir -p /tmp/stm-pet && rsync -a --exclude .git ./ /tmp/stm-pet/
+python scripts/stm_plugin_check.py /tmp/stm-pet
+```
+
 ### 真实浏览器验收
 
 阶段 0 与阶段 2–5 的判定项都在**真实 Chrome** 里验过。用法：
@@ -1767,9 +1777,9 @@ Windows 终端默认 GBK，中文会乱码，所以报告建议写文件（§8 �
 
 ### 插件图标
 
-图标由 `frontend/assets/icon.svg` 提供，用在四处：**右侧坞入口**（`entries[].icon`，
-`kind: "dock"`）、设置入口（`kind: "settings"`）、设置面板标题、插件总览，
-以及宿主轻提示（toast）。
+图标由 `frontend/assets/icon.svg` 提供，用在四处：**右侧坞入口**（
+`contributions.menus[]` 里 `placement: "dock"` 的节点 icon）、**设置导航项**（
+`placement: "settings.nav"`）、设置面板标题、插件总览，以及宿主轻提示（toast）。
 
 **宿主的渲染方式决定了它必须是「单色剪影」**（`static/css/modules/icons.css`）：
 
@@ -1801,22 +1811,25 @@ python tools/crop_icon.py             # 重新生成 + 输出各尺寸对照图
 
 ### 坞入口与图标大小
 
-`entries[]` 里声明了**两个**入口：
+`frontend.contributions.menus` 里声明了**两个**菜单节点：
 
-| id | kind | 作用 |
+| id | placement | 作用 |
 |---|---|---|
-| `pet-dock` | `dock` | 右侧坞里的图标，点击打开设置面板 |
-| `pet-settings` | `settings` | 「设置 → 插件」里的条目 |
+| `pet-dock` | `dock` | 右侧坞里的图标，`action: surface pet-settings`，点击打开设置面板 |
+| `pet-settings` | `settings.nav` | 「设置 → 插件」里的条目，打开同一个 surface |
 
 几条容易静默失效的规则（都已加测试）：
 
-- **坞槽位有限**：全局 8 个、单插件最多 2 个（`core/plugins/entries.py`）。
-- **社区插件默认不进坞**：`entryRegistry.js` 的 `isPinned()` 默认值是
+- **坞槽位有限**：全局 8 个、单插件最多 2 个（v3 由
+  `core/plugins/contributions.py` 钉住；`tools/stm_plugin_check.py` 严格校验）。
+- **社区插件默认不进坞**：贡献注册表的 `isPinned()` 默认值是
   `tier !== "community"` —— 未在 catalog 登记时 `tier` 回落为 `community`，
-  入口会进**溢出菜单**而不是坞。本插件在 catalog 里是 `official`。
-- **`surface.id` 必须真的注册过**，否则点了没反应（宿主会退化成派发事件，
+  节点会进**溢出菜单**而不是坞。本插件在 catalog 里是 `official`。
+- **`action.surface.id` 必须真的注册过**，否则点了没反应（宿主会退化成派发事件，
   插件不监听就静默无响应）。测试用源码交叉验证这一点。
 - 坞槽位**只显示图标**，名称靠 `title`/`aria-label` —— 所以 `label` 是必需的。
+- v3 运行期结构**只能静态声明**：`api.contributions.update(id, patch)` 只能改
+  status / badge / progress / busy，不能再注册或搬动节点。
 
 **图标大小是量出来的，不是算出来的。** 坞槽位是 26px 正方形
 （`--dock-icon-size: 1.625rem`，窄屏 24px），图标以 `contain` 缩放，

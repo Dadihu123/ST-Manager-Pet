@@ -1,9 +1,9 @@
 {
   "id": "stm-pet",
   "name": "桌面宠物",
-  "version": "0.3.0",
-  "api_version": 2,
-  "manifest_version": 2,
+  "version": "0.4.0",
+  "api_version": 3,
+  "manifest_version": 3,
   "author": "ST-Manager",
   "description": "常驻桌面的宠物：跟随宿主状态活动、可拖动、会下坠与行走、长时间没互动会睡着；支持自己新建形象（可署名作者、指定标准图像、调触发节奏）、导入形象包、按形象调整大小与渲染方式，并在设置页直接预览每个动作的动画效果；不想看到它时可以一键关闭，不必卸载插件。",
   "license": "MIT",
@@ -19,34 +19,43 @@
     "styles": [
       "frontend/plugin.css"
     ],
-    "entries": [
-      {
-        "id": "pet-dock",
-        "kind": "dock",
-        "label": "桌面宠物",
-        "description": "打开桌面宠物设置：显示开关、形象管理、作者署名、标准图像、触发时间、播报与勿扰。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "pet-settings",
-          "type": "modal"
+    "render_mode": "custom",
+    "contributions": {
+      "menus": [
+        {
+          "id": "pet-dock",
+          "placement": "dock",
+          "type": "item",
+          "label": "桌面宠物",
+          "description": "打开桌面宠物设置：显示开关、形象管理、作者署名、标准图像、触发时间、播报与勿扰。",
+          "icon": "frontend/assets/icon.svg",
+          "order": 45,
+          "action": {
+            "type": "surface",
+            "id": "pet-settings"
+          }
         },
-        "priority": 45
-      },
-      {
-        "id": "pet-settings",
-        "kind": "settings",
-        "label": "桌面宠物设置",
-        "description": "显示开关、形象管理与导入、作者署名、标准图像、触发时间、播报与勿扰。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
+        {
           "id": "pet-settings",
-          "type": "modal",
-          "size": "lg"
-        },
-        "priority": 80
-      }
-    ]
+          "placement": "settings.nav",
+          "type": "item",
+          "label": "桌面宠物设置",
+          "description": "显示开关、形象管理与导入、作者署名、标准图像、触发时间、播报与勿扰。",
+          "icon": "frontend/assets/icon.svg",
+          "order": 80,
+          "action": {
+            "type": "surface",
+            "id": "pet-settings"
+          }
+        }
+      ],
+      "slots": [],
+      "commands": []
+    }
   },
+  "capabilities": [
+    "ui.custom"
+  ],
   "config_schema": {
     "type": "object",
     "properties": {
