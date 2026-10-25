@@ -8,7 +8,12 @@ artifacts/
 tmp/
 
 # 提示词 / 方案书
-docs/
+# 用 docs/*（而不是 docs/）：排除目录本身会让 git 根本不进这个目录，
+# 下面那条 ! 例外就永远没机会生效
+docs/*
+# 例外：agent 技能配置随仓库走（issue tracker / 标签词汇 / 域文档布局），
+# 团队与换机器后都要用；docs/ 下其余内容仍被忽略
+!docs/agents/
 
 # 图像生成工作台的产物（本地临时图，不属于插件资源）
 dsh-image-gen/
