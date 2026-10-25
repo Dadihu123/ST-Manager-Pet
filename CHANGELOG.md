@@ -2,7 +2,7 @@
 
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.4.0] - 2026-10-25
 
 ### 变更
 
@@ -19,8 +19,6 @@
 - 新增 `scripts/stm_plugin_check.py`（从主程序生成并复制的独立严格校验器）与
   `.github/workflows/plugin-check.yml`（CI 按 `manifest.id` 摊目录后跑严格校验）。
 - 版本 `0.4.0`。
-
-## [未发布]
 
 ### 修复
 
